@@ -45,6 +45,27 @@ fixture-worker test; the in-process split test needs nothing external):
 ./gradlew :plugin:test
 ```
 
+**Sqllogictest conformance** (`plugin/src/test/.../conformance/`): runs the
+*actual* `.test` files from `~/Development/vgi/test/sql/integration/` — parsed
+by a small in-repo sqllogictest reader, not hand-ported equivalents — with
+their `ATTACH` rewritten to this connector's catalog and their real expected
+output compared against a real query result. Most of the 327-file suite can't
+run against Trino at all, for two reasons neither of which this connector can
+fix alone: ~119 files use DuckDB-only introspection (`duckdb_tables()`,
+`duckdb_databases()`, `CALL enable_logging`, DuckDB's own `EXPLAIN (FORMAT
+JSON)` shape) with no Trino equivalent, and ~161 use table-function CALL
+syntax, which needs Trino's `ConnectorTableFunction` SPI (not implemented —
+see Scope). `table/rowid.test` is the first ported file — 8 of its 16 records
+are portable declarative-table `SELECT`s; the rest are skipped with a reported
+reason (`DESCRIBE`, struct-typed rowid access, the `rowid_sequence(...)` calls
+at the bottom). Running it against a real worker is exactly what caught a real
+bug: this connector was resolving a table's backing scan function in the
+table's OWN schema, but VGI doesn't guarantee that — the fixture's
+`data.rowid_first` scans via `main.rowid_sequence`, a different schema
+entirely — fixed by passing no schema hint and letting the worker's own
+dispatcher search by name, matching vgi-python's own schema-less `Client`
+fallback.
+
 **Local Trino, fast dev loop** (downloads/caches the Trino server tarball once):
 
 ```bash

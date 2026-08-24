@@ -78,7 +78,15 @@ public final class VgiSplitManager implements ConnectorSplitManager {
                     false,          // resolved_secrets_provided
                     null, null,     // at_unit / at_value — Phase 8 (time travel)
                     null, null,     // copy_from / copy_to
-                    handle.schemaName());
+                    // NOT handle.schemaName(): catalog_table_scan_function_get
+                    // resolves a table's backing scan function, but doesn't say
+                    // which schema that function itself is registered in — it
+                    // can differ from the table's own schema (e.g. the
+                    // reference fixture's data.rowid_first scans via
+                    // main.rowid_sequence). null lets the worker's dispatcher
+                    // search every schema by name, which is exactly the
+                    // fallback vgi-python's own schema-less Client uses.
+                    null);
             BindResponse bound = a.service().bind(bindRequest, null);
             byte[] serializedBindCall = RecordCodec.serializeToBytes(bindRequest);
             return new VgiSplitSource(client, config, serializedBindCall, bound.opaque_data(), projectionIds);

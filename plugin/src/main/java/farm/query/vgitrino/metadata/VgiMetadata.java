@@ -11,6 +11,7 @@ import farm.query.vgi.protocol.TableScanFunctionGetResponse;
 import farm.query.vgirpc.marshal.RecordCodec;
 import farm.query.vgitrino.client.VgiWorkerClient;
 import farm.query.vgitrino.types.ArrowSchemaCodec;
+import farm.query.vgitrino.types.VgiColumnNames;
 import farm.query.vgitrino.types.VgiTypeMapping;
 import io.trino.spi.connector.ColumnHandle;
 import io.trino.spi.connector.ColumnMetadata;
@@ -124,7 +125,7 @@ public final class VgiMetadata implements ConnectorMetadata {
         }
         List<ColumnMetadata> columns = new ArrayList<>(schema.getFields().size());
         for (Field field : schema.getFields()) {
-            columns.add(new ColumnMetadata(field.getName(), VgiTypeMapping.toTrinoType(field)));
+            columns.add(columnMetadataFor(field));
         }
         return new ConnectorTableMetadata(
                 new SchemaTableName(handle.schemaName(), handle.tableName()), columns);
@@ -137,9 +138,22 @@ public final class VgiMetadata implements ConnectorMetadata {
         Map<String, ColumnHandle> out = new LinkedHashMap<>();
         List<Field> fields = schema == null ? List.of() : schema.getFields();
         for (int i = 0; i < fields.size(); i++) {
-            out.put(fields.get(i).getName(), new VgiColumnHandle(fields.get(i).getName(), i));
+            // The map key is the SQL-facing name — VgiColumnNames.displayName()
+            // renames VGI's is_row_id-tagged field to DuckDB's own "rowid"
+            // pseudo-column name — while the handle keeps the WIRE name
+            // (fields.get(i).getName()) for looking the column up in an
+            // actual returned batch.
+            out.put(VgiColumnNames.displayName(fields.get(i)), new VgiColumnHandle(fields.get(i).getName(), i));
         }
         return out;
+    }
+
+    private static ColumnMetadata columnMetadataFor(Field field) {
+        return ColumnMetadata.builder()
+                .setName(VgiColumnNames.displayName(field))
+                .setType(VgiTypeMapping.toTrinoType(field))
+                .setHidden(VgiColumnNames.isRowId(field))
+                .build();
     }
 
     @Override
@@ -165,6 +179,6 @@ public final class VgiMetadata implements ConnectorMetadata {
         VgiColumnHandle columnHandle = (VgiColumnHandle) column;
         Schema schema = ArrowSchemaCodec.deserializeSchema(handle.outputSchema());
         Field field = schema.getFields().get(columnHandle.ordinal());
-        return new ColumnMetadata(field.getName(), VgiTypeMapping.toTrinoType(field));
+        return columnMetadataFor(field);
     }
 }
