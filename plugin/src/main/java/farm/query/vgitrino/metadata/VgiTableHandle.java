@@ -21,11 +21,16 @@ import io.trino.spi.connector.ConnectorTableHandle;
  *        re-encoded as {@code BindRequest.arguments} bytes (see
  *        {@code farm.query.vgi.client.ScanFunctionArguments#toBindArguments})
  * @param outputSchema the table's full (unprojected) Arrow schema, IPC-encoded
+ * @param cardinalityEstimate the worker's own row-count estimate
+ *        ({@code TableInfo.cardinality_estimate}), or {@code null} if it
+ *        offered none — fed straight to {@code getTableStatistics} with no
+ *        extra RPC, since {@code catalog_table_get} already returned it
  */
 public record VgiTableHandle(
         String schemaName,
         String tableName,
         String scanFunctionName,
         byte[] scanFunctionArguments,
-        byte[] outputSchema) implements ConnectorTableHandle {
+        byte[] outputSchema,
+        Long cardinalityEstimate) implements ConnectorTableHandle {
 }

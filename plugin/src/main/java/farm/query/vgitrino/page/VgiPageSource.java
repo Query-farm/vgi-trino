@@ -69,11 +69,14 @@ public final class VgiPageSource implements ConnectorPageSource {
         this.connection = client.borrow();
         boolean ok = false;
         try {
+            // Same projection Trino already told the split source, sourced the
+            // same way — the columns this page source's own caller passed in.
+            List<Integer> projectionIds = columns.stream().map(VgiColumnHandle::ordinal).sorted().toList();
             InitRequest initRequest = new InitRequest(
                     split.bindCall(),
                     tableOutputSchema,
                     split.bindOpaqueData(),
-                    null,           // projection_ids — Phase 4
+                    projectionIds,
                     null,           // pushdown_filters — Phase 4
                     null,           // join_keys
                     null,           // phase (producer mode)

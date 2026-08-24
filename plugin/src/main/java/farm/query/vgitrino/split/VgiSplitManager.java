@@ -7,6 +7,7 @@ import farm.query.vgi.protocol.BindResponse;
 import farm.query.vgirpc.marshal.RecordCodec;
 import farm.query.vgitrino.VgiConfig;
 import farm.query.vgitrino.client.VgiWorkerClient;
+import farm.query.vgitrino.metadata.VgiColumnHandle;
 import farm.query.vgitrino.metadata.VgiTableHandle;
 import io.trino.spi.connector.ColumnHandle;
 import io.trino.spi.connector.Constraint;
@@ -16,6 +17,7 @@ import io.trino.spi.connector.ConnectorSplitSource;
 import io.trino.spi.connector.ConnectorTableHandle;
 import io.trino.spi.connector.ConnectorTransactionHandle;
 
+import java.util.List;
 import java.util.Set;
 
 /**
@@ -55,6 +57,14 @@ public final class VgiSplitManager implements ConnectorSplitManager {
             Set<ColumnHandle> desiredColumns,
             Constraint constraint) {
         VgiTableHandle handle = (VgiTableHandle) table;
+        // Trino already tells us exactly which columns this query needs here —
+        // no applyProjection plumbing required to push that through as
+        // table_function_plan/init's projection_ids. An empty set is itself
+        // meaningful (e.g. SELECT count(*)): zero columns, not "unrestricted".
+        List<Integer> projectionIds = desiredColumns.stream()
+                .map(c -> ((VgiColumnHandle) c).ordinal())
+                .sorted()
+                .toList();
         return client.withConnection(a -> {
             BindRequest bindRequest = new BindRequest(
                     handle.scanFunctionName(),
@@ -71,7 +81,7 @@ public final class VgiSplitManager implements ConnectorSplitManager {
                     handle.schemaName());
             BindResponse bound = a.service().bind(bindRequest, null);
             byte[] serializedBindCall = RecordCodec.serializeToBytes(bindRequest);
-            return new VgiSplitSource(client, config, serializedBindCall, bound.opaque_data());
+            return new VgiSplitSource(client, config, serializedBindCall, bound.opaque_data(), projectionIds);
         });
     }
 }

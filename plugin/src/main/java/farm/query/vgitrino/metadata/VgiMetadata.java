@@ -21,6 +21,8 @@ import io.trino.spi.connector.ConnectorTableMetadata;
 import io.trino.spi.connector.ConnectorTableVersion;
 import io.trino.spi.connector.SchemaTableName;
 import io.trino.spi.connector.TableNotFoundException;
+import io.trino.spi.statistics.Estimate;
+import io.trino.spi.statistics.TableStatistics;
 import org.apache.arrow.vector.types.pojo.Field;
 import org.apache.arrow.vector.types.pojo.Schema;
 
@@ -109,7 +111,7 @@ public final class VgiMetadata implements ConnectorMetadata {
             byte[] bindArguments = ScanFunctionArguments.toBindArguments(scan.arguments());
 
             return new VgiTableHandle(info.schema_name(), info.name(),
-                    scan.function_name(), bindArguments, info.columns());
+                    scan.function_name(), bindArguments, info.columns(), info.cardinality_estimate());
         });
     }
 
@@ -138,6 +140,22 @@ public final class VgiMetadata implements ConnectorMetadata {
             out.put(fields.get(i).getName(), new VgiColumnHandle(fields.get(i).getName(), i));
         }
         return out;
+    }
+
+    @Override
+    public TableStatistics getTableStatistics(ConnectorSession session, ConnectorTableHandle table) {
+        // Row count only for v1 — the worker's own cardinality_estimate from
+        // catalog_table_get, at no extra RPC cost. Per-column statistics
+        // (table_function_statistics / catalog_table_column_statistics_get,
+        // both already decodable client-side via ColumnStatisticsDecoder) are
+        // a documented follow-up, not wired up here yet.
+        VgiTableHandle handle = (VgiTableHandle) table;
+        if (handle.cardinalityEstimate() == null) {
+            return TableStatistics.empty();
+        }
+        return TableStatistics.builder()
+                .setRowCount(Estimate.of(handle.cardinalityEstimate()))
+                .build();
     }
 
     @Override

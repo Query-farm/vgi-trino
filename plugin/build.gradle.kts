@@ -41,3 +41,23 @@ configurations.testRuntimeClasspath {
         force("io.netty:netty-buffer:4.1.114.Final")
     }
 }
+
+// Assemble this connector's jar plus its runtime dependencies (Arrow, Netty,
+// Jackson, ...) into build/plugin/vgi/ — the flat-directory-of-jars layout
+// Trino's PluginManager expects at plugin/vgi/ under its installation. Every
+// plugin gets its own isolated classloader built from exactly this directory
+// (never a flat classpath shared with Trino's own dependencies or another
+// plugin's), which is also why the Netty version clash the test suite works
+// around never occurs in a real deployment. trino-spi is compileOnly and so
+// is correctly absent here — Trino serves it from its own shared classloader.
+tasks.register<Copy>("assemblePluginDir") {
+    group = "distribution"
+    description = "Assemble the connector into build/plugin/vgi/, the layout Trino's plugin loader expects."
+    from(tasks.named("jar"))
+    from(configurations.runtimeClasspath)
+    into(layout.buildDirectory.dir("plugin/vgi"))
+}
+
+tasks.named("assemble") {
+    dependsOn("assemblePluginDir")
+}

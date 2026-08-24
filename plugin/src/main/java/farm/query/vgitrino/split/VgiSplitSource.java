@@ -36,6 +36,7 @@ public final class VgiSplitSource implements ConnectorSplitSource {
     private final VgiConfig config;
     private final byte[] bindCall;
     private final byte[] bindOpaqueData;
+    private final List<Integer> projectionIds;
 
     private byte[] cursor;
     private volatile boolean finished;
@@ -45,12 +46,19 @@ public final class VgiSplitSource implements ConnectorSplitSource {
      * @param config this catalog's configuration (sizing knobs)
      * @param bindCall the serialised {@code BindRequest} this scan was bound with
      * @param bindOpaqueData the matching {@code BindResponse.opaque_data}, or {@code null}
+     * @param projectionIds the columns this scan actually reads (their ordinals
+     *        in the table's bind-time Arrow schema), or {@code null} for all of
+     *        them. Sourced from whatever Trino already told
+     *        {@link VgiSplitManager#getSplits} it needed — no
+     *        {@code applyProjection} plumbing required to get this far
      */
-    public VgiSplitSource(VgiWorkerClient client, VgiConfig config, byte[] bindCall, byte[] bindOpaqueData) {
+    public VgiSplitSource(VgiWorkerClient client, VgiConfig config, byte[] bindCall, byte[] bindOpaqueData,
+            List<Integer> projectionIds) {
         this.client = client;
         this.config = config;
         this.bindCall = bindCall;
         this.bindOpaqueData = bindOpaqueData;
+        this.projectionIds = projectionIds;
     }
 
     @Override
@@ -62,7 +70,7 @@ public final class VgiSplitSource implements ConnectorSplitSource {
         int cap = Math.min(Math.max(1, maxSize), Math.max(1, config.maxSplitsPerResponse()));
         TableFunctionPlanRequest request = new TableFunctionPlanRequest(
                 bindCall, bindOpaqueData,
-                null,                       // projection_ids — Phase 4
+                projectionIds,
                 null,                       // pushdown_filters — Phase 4
                 null,                       // join_keys
                 null,                       // row_limit

@@ -1,0 +1,50 @@
+# Copyright 2026 Query Farm LLC - https://query.farm
+#
+# Worked example: Trino + this connector + the reference Python fixture
+# worker, all as separate containers — the scenario that specifically needs
+# a transport that crosses container boundaries (subprocess doesn't; tcp://
+# does, and is what's configured below).
+#
+# Build the plugin dir first, from the repo root:
+#   ./gradlew :plugin:assemblePluginDir
+#   docker compose -f docker/docker-compose.yml up --build
+#
+# Then, from a Trino CLI connected to this compose network (or via the
+# exposed 8080 port on the host):
+#   ATTACH is implicit in the catalog config below — just query it:
+#   SELECT * FROM vgi_example.data.numbers;
+#
+# NOTE: this compose file has not been exercised end to end as part of this
+# change — it's written to the same conventions as the Dockerfile and the
+# dev/run-local-trino.sh script, both of which have. Treat it as a starting
+# point, not a verified artifact, until someone runs it.
+
+services:
+  vgi-worker:
+    image: ghcr.io/astral-sh/uv:python3.13-bookworm-slim
+    # Mounts the vgi-python checkout from the host rather than baking it into
+    # an image, so this compose file tracks whatever checkout the operator
+    # has — matches how the connector's own tests locate it.
+    volumes:
+      - ${VGI_PYTHON_DIR:-../../vgi-python}:/vgi-python:ro
+    working_dir: /vgi-python
+    command: ["uv", "run", "--project", "/vgi-python", "vgi-fixture-worker", "--tcp", "0.0.0.0:8765"]
+    expose:
+      - "8765"
+
+  trino:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    depends_on:
+      - vgi-worker
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./catalog:/etc/trino/catalog:ro
+
+# ./catalog/vgi_example.properties (create alongside this file):
+#   connector.name=vgi
+#   vgi.location=tcp://vgi-worker:8765
+#   vgi.catalog-name=example
+#   vgi.connections=4
