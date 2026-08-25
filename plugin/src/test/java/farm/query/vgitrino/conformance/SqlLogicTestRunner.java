@@ -3,6 +3,8 @@
 package farm.query.vgitrino.conformance;
 
 import io.trino.Session;
+import io.trino.spi.type.RowType;
+import io.trino.spi.type.Type;
 import io.trino.testing.DistributedQueryRunner;
 import io.trino.testing.MaterializedResult;
 import io.trino.testing.MaterializedRow;
@@ -11,6 +13,9 @@ import java.io.IOException;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+import java.util.Set;
 
 /**
  * Replays a real {@code .test} file's {@link SqlLogicTestFile.Record}s against
@@ -68,7 +73,7 @@ final class SqlLogicTestRunner {
                 continue;
             }
 
-            String trinoSql = sql.replace(vgiCatalogRef, trinoCatalog + ".").strip();
+            String trinoSql = replaceOutsideStrings(sql, vgiCatalogRef, trinoCatalog + ".").strip();
             trinoSql = trinoSql.endsWith(";") ? trinoSql.substring(0, trinoSql.length() - 1) : trinoSql;
             trinoSql = rewriteDuckDbOnlySyntax(trinoSql, trinoCatalog);
             retainedRecords.add(record);
@@ -85,16 +90,16 @@ final class SqlLogicTestRunner {
                 switch (record.kind()) {
                     case QUERY -> {
                         MaterializedResult result = runner.execute(session, trinoSql);
+                        List<Type> types = result.getTypes();
                         List<List<String>> actual = new ArrayList<>();
                         for (MaterializedRow row : result.getMaterializedRows()) {
                             List<String> cells = new ArrayList<>(row.getFieldCount());
                             for (int i = 0; i < row.getFieldCount(); i++) {
-                                Object v = row.getField(i);
-                                cells.add(v == null ? "NULL" : v.toString());
+                                cells.add(formatCell(types.get(i), row.getField(i)));
                             }
                             actual.add(cells);
                         }
-                        if (!actual.equals(record.expectedRows())) {
+                        if (!rowsMatch(actual, record.expectedRows())) {
                             failures.add("QUERY mismatch for:\n" + trinoSql
                                     + "\nexpected: " + record.expectedRows()
                                     + "\nactual:   " + actual);
@@ -125,6 +130,136 @@ final class SqlLogicTestRunner {
         }
         return new Result(executed, skipped, List.copyOf(failures));
     }
+
+    /**
+     * Replaces every occurrence of {@code target} with {@code replacement}, except inside a
+     * single-quoted string literal (with {@code ''} as the escaped-quote form) — the catalog-name
+     * rewrite this guards used to be a blind {@link String#replace}, which happily mangled a
+     * string literal's own CONTENTS whenever they happened to contain the substring being
+     * replaced: {@code upper_case('test@example.com')} silently became {@code
+     * upper_case('test@vgi_example.com')}, a real, confirmed test-harness bug (found via a
+     * genuine {@code QUERY mismatch} sample, not suspected) that has nothing to do with the
+     * connector under test.
+     */
+    static String replaceOutsideStrings(String sql, String target, String replacement) {
+        StringBuilder out = new StringBuilder();
+        int i = 0;
+        int n = sql.length();
+        boolean inString = false;
+        while (i < n) {
+            char c = sql.charAt(i);
+            if (inString) {
+                out.append(c);
+                if (c == '\'') {
+                    if (i + 1 < n && sql.charAt(i + 1) == '\'') { out.append(sql.charAt(i + 1)); i += 2; continue; }
+                    inString = false;
+                }
+                i++;
+                continue;
+            }
+            if (c == '\'') { inString = true; out.append(c); i++; continue; }
+            if (sql.startsWith(target, i)) {
+                out.append(replacement);
+                i += target.length();
+                continue;
+            }
+            out.append(c);
+            i++;
+        }
+        return out.toString();
+    }
+
+    /**
+     * Format one result cell to compare against the {@code .test} file's own tab-separated
+     * expected-row text — not a bare {@code Object.toString()}, which gets several real DuckDB
+     * sqllogictest conventions wrong:
+     * <ul>
+     *   <li>{@code null} — the literal token {@code NULL} (unchanged from before).</li>
+     *   <li>An empty string — DuckDB's convention represents this as the literal token {@code
+     *       (empty)}, not the zero-length text itself (confirmed against a real mismatch: {@code
+     *       upper_case('')} expected {@code (empty)}, and this harness produced a blank cell that
+     *       compared unequal to it despite being the semantically identical result).</li>
+     *   <li>{@code byte[]} (VARBINARY) — {@code Object.toString()} on a raw array produces Java's
+     *       useless {@code [B@70bae186]} identity string; DuckDB prints {@code \xHH\xHH...} per
+     *       byte, confirmed against a real {@code TO_HEX}-independent mismatch on a plain
+     *       VARBINARY column.</li>
+     *   <li>A {@link RowType} value — {@code Type.getObjectValue} returns a plain {@link List}
+     *       with no field names (Trino's own generic representation for any row), which prints as
+     *       {@code [3.0, 4.0]}; DuckDB prints a struct as {@code {'field': value, ...}}. Only the
+     *       top-level column's type is threaded through here (matching what the real mismatches
+     *       needed — {@code geo_centroid_struct}/{@code geo_centroid_list} both return a bare
+     *       two-field struct) — a struct nested inside an array/another struct falls back to the
+     *       plain {@code List} rendering, a known, narrower gap than fixing every nesting depth
+     *       would need.</li>
+     * </ul>
+     */
+    static String formatCell(Type type, Object value) {
+        if (value == null) return "NULL";
+        if (value instanceof byte[] bytes) {
+            StringBuilder hex = new StringBuilder(bytes.length * 4);
+            for (byte b : bytes) hex.append("\\x").append(String.format(Locale.ROOT, "%02X", b));
+            return hex.toString();
+        }
+        if (value instanceof String s) {
+            return s.isEmpty() ? "(empty)" : s;
+        }
+        if (type instanceof RowType rowType && value instanceof List<?> fieldValues) {
+            List<RowType.Field> fields = rowType.getFields();
+            StringBuilder struct = new StringBuilder("{");
+            for (int i = 0; i < fields.size() && i < fieldValues.size(); i++) {
+                if (i > 0) struct.append(", ");
+                String fieldName = fields.get(i).getName().orElse("field" + i);
+                Object fieldValue = fieldValues.get(i);
+                String fieldText = fieldValue instanceof String s ? "'" + s + "'" : String.valueOf(fieldValue);
+                struct.append('\'').append(fieldName).append("': ").append(fieldText);
+            }
+            return struct.append('}').toString();
+        }
+        return value.toString();
+    }
+
+    /** Row-by-row, cell-by-cell comparison via {@link #cellsMatch} rather than a bare {@link
+     *  List#equals}, so a DuckDB/Trino type-NAME difference (see {@link #cellsMatch}) doesn't fail
+     *  an otherwise-correct result. */
+    static boolean rowsMatch(List<List<String>> actual, List<List<String>> expected) {
+        if (actual.size() != expected.size()) return false;
+        for (int r = 0; r < actual.size(); r++) {
+            List<String> actualRow = actual.get(r);
+            List<String> expectedRow = expected.get(r);
+            if (actualRow.size() != expectedRow.size()) return false;
+            for (int c = 0; c < actualRow.size(); c++) {
+                if (!cellsMatch(actualRow.get(c), expectedRow.get(c))) return false;
+            }
+        }
+        return true;
+    }
+
+    /**
+     * DuckDB's {@code TYPEOF(...)} (and similar introspection) returns an UPPERCASE type name
+     * ({@code VARCHAR}, {@code BLOB}); Trino's returns lowercase ({@code varchar}) and sometimes a
+     * genuinely different name for the same concept ({@code varbinary} vs {@code BLOB}) — real,
+     * confirmed mismatches sampled from the census, not a hypothetical. Falls back to a
+     * case-insensitive, alias-normalized comparison ONLY when the EXPECTED cell is itself a
+     * recognized DuckDB type-name token (see {@link #DUCKDB_TYPE_NAMES}) — deliberately not a
+     * blanket case-insensitive comparison, which would risk silently masking a genuine casing bug
+     * in actual string DATA (e.g. a broken {@code upper_case()} returning wrong-case text).
+     */
+    static boolean cellsMatch(String actual, String expected) {
+        if (actual.equals(expected)) return true;
+        String expectedUpper = expected.toUpperCase(Locale.ROOT);
+        if (!DUCKDB_TYPE_NAMES.contains(expectedUpper)) return false;
+        String actualUpper = TRINO_TO_DUCKDB_TYPE_ALIAS.getOrDefault(
+                actual.toUpperCase(Locale.ROOT), actual.toUpperCase(Locale.ROOT));
+        return actualUpper.equals(expectedUpper);
+    }
+
+    private static final Set<String> DUCKDB_TYPE_NAMES = Set.of(
+            "VARCHAR", "BIGINT", "INTEGER", "SMALLINT", "TINYINT", "DOUBLE", "FLOAT", "BOOLEAN",
+            "DATE", "TIMESTAMP", "TIMESTAMP WITH TIME ZONE", "BLOB", "DECIMAL", "HUGEINT",
+            "UBIGINT", "UINTEGER", "USMALLINT", "UTINYINT", "JSON", "STRUCT", "MAP");
+
+    private static final Map<String, String> TRINO_TO_DUCKDB_TYPE_ALIAS = Map.of(
+            "VARBINARY", "BLOB", "ROW", "STRUCT");
 
     /**
      * Rewrites the two DuckDB-only syntax forms that dominate the sqllogictest census's

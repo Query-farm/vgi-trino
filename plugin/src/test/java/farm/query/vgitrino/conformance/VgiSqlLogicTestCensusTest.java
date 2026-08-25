@@ -64,7 +64,14 @@ final class VgiSqlLogicTestCensusTest {
     private static final List<String> NON_PORTABLE_MARKERS = List.of(
             "ATTACH ", "DETACH", "DESCRIBE",
             "duckdb_tables(", "duckdb_databases(", "duckdb_constraints(", "duckdb_logs(",
-            "duckdb_functions(", "enable_logging", "EXPLAIN (FORMAT JSON)", "QUALIFY");
+            "duckdb_functions(", "enable_logging", "QUALIFY",
+            // DuckDB's EXPLAIN plan format (node names like EMPTY_RESULT/VGI_TABLE_SCAN) has zero
+            // correspondence to Trino's own EXPLAIN output shape — confirmed by a real sample
+            // (table/column_statistics.test) comparing a DuckDB plan-node regex against Trino's
+            // actual physical-plan text, which obviously never matches. Not a connector bug to fix;
+            // a structurally different feature between the two engines, matching the "EXPLAIN
+            // (FORMAT JSON)" case this broader marker now subsumes.
+            "EXPLAIN ");
 
     private VgiWorkerHarness.Handle worker;
     private DistributedQueryRunner runner;
@@ -108,6 +115,7 @@ final class VgiSqlLogicTestCensusTest {
         Map<String, Integer> failureBuckets = new TreeMap<>();
         Map<String, Integer> reasonCounts = new HashMap<>();
         List<String> worstFiles = new ArrayList<>();
+        List<String> queryMismatchSamples = new ArrayList<>();
 
         for (Path file : files) {
             SqlLogicTestRunner.Result result;
@@ -128,6 +136,9 @@ final class VgiSqlLogicTestCensusTest {
                 for (String failure : result.failures()) {
                     failureBuckets.merge(classify(failure), 1, Integer::sum);
                     reasonCounts.merge(reasonKey(failure), 1, Integer::sum);
+                    if (failure.startsWith("QUERY mismatch") && queryMismatchSamples.size() < 200) {
+                        queryMismatchSamples.add(INTEGRATION_ROOT.relativize(file) + ":\n" + failure);
+                    }
                 }
             }
         }
@@ -146,6 +157,8 @@ final class VgiSqlLogicTestCensusTest {
                 .sorted(Map.Entry.<String, Integer>comparingByValue().reversed())
                 .limit(30)
                 .forEach(e -> report.append(String.format("%6d  %s%n", e.getValue(), e.getKey())));
+        report.append("--- QUERY_MISMATCH samples (").append(queryMismatchSamples.size()).append(") ---\n");
+        queryMismatchSamples.forEach(s -> report.append(s).append("\n---\n"));
         report.append("--- files with failures (").append(worstFiles.size()).append(") ---\n");
         worstFiles.forEach(f -> report.append(f).append('\n'));
         System.out.println(report);
