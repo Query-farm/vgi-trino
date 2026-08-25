@@ -90,7 +90,7 @@ public final class VgiSplitManager implements ConnectorSplitManager {
                     a.handle(),     // attach_opaque_data
                     null,           // transaction_opaque_data
                     false,          // resolved_secrets_provided
-                    null, null,     // at_unit / at_value — Phase 8 (time travel)
+                    handle.atUnit(), handle.atValue(),     // AS OF, resolved at getTableHandle time
                     null, null,     // copy_from / copy_to
                     // NOT handle.schemaName(): catalog_table_scan_function_get
                     // resolves a table's backing scan function, but doesn't say

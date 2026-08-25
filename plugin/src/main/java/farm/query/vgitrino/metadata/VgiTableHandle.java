@@ -30,6 +30,11 @@ import io.trino.spi.predicate.TupleDomain;
  *        (informational only — never declared exactly applied, so Trino
  *        always re-checks every row regardless of what the worker did with
  *        it; see {@code farm.query.vgitrino.filter.VgiFilterTranslator})
+ * @param atUnit the resolved {@code FOR VERSION/TIMESTAMP AS OF} clause's unit
+ *        ({@code "VERSION"}/{@code "TIMESTAMP"}), or {@code null} for a plain
+ *        (non-time-travel) read — see {@code VgiTimeTravel}
+ * @param atValue the resolved AT clause's value, or {@code null} exactly when
+ *        {@code atUnit} is {@code null} (VGI requires both or neither)
  */
 public record VgiTableHandle(
         String schemaName,
@@ -38,5 +43,7 @@ public record VgiTableHandle(
         byte[] scanFunctionArguments,
         byte[] outputSchema,
         Long cardinalityEstimate,
-        TupleDomain<VgiColumnHandle> constraint) implements ConnectorTableHandle {
+        TupleDomain<VgiColumnHandle> constraint,
+        String atUnit,
+        String atValue) implements ConnectorTableHandle {
 }

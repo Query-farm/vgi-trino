@@ -455,6 +455,31 @@ desired columns" as an explicit `projection_ids=[]` — which this table's real
 columns," not "no restriction, return everything." Fixed in both places by
 treating an empty desired-columns set as `projection_ids=null` instead.
 
+### Time travel
+
+`FOR VERSION AS OF <expr>` / `FOR TIMESTAMP AS OF <expr>` on a plain declarative table works, backed
+entirely by VGI's own `at_unit`/`at_value` wire fields — already present on `BindRequest` and on
+`catalog_table_get`/`catalog_table_scan_function_get` before this connector ever used them.
+`VgiMetadata.getTableHandle` converts Trino's `ConnectorTableVersion` (`VgiTimeTravel`) into that pair —
+`PointerType.TARGET_ID` → `at_unit="VERSION"` (accepting any integer-family literal or a `VARCHAR` ref
+name — Trino types a bare small-integer literal like `FOR VERSION AS OF 1` as `INTEGER`, not `BIGINT`,
+confirmed by running it, not assumed) and `PointerType.TEMPORAL` → `at_unit="TIMESTAMP"` (accepting
+`DATE`/`TIMESTAMP`/`TIMESTAMP WITH TIME ZONE`, formatted as an ISO-8601 string) — modeled on Trino's own
+Iceberg connector's real conversion logic (fetched from its source; this repo has no local Iceberg/Delta
+connector to crib from directly) since there's no `getTableVersionType`-style declaration hook in this
+Trino version to lean on instead.
+
+Scoped narrower than Trino's SPI signature allows: only `endVersion` is supported (VGI's `at_unit`/
+`at_value` is a single point, not a range — `startVersion` present is a clean `TrinoException`, not a
+silently-wrong answer), and only plain table scans — `FOR ... AS OF` is a table-*reference* clause with no
+syntax position on a `TABLE(catalog.schema.fn(...))` call, so table functions are unaffected.
+
+Verified end to end (`VgiTimeTravelTest`) against the real reference fixture's own time-travel table,
+`data.versioned_data` — not a fixture built for this connector, the same one every SDK's own conformance
+suite already exercises — whose schema genuinely evolves across versions (`{id}` → `{id, name, score,
+active}` → `{id, score}`), proving the resolved AT clause reaches both the schema-discovery RPCs and the
+scan itself consistently, not just one or the other.
+
 ### Dynamic filtering
 
 A join's build-side values reach a VGI scan the same way a literal `WHERE`
@@ -524,9 +549,11 @@ the same boundary on static predicate pushdown).
   TABLE-input argument — see *Table functions* above for why these are
   skipped rather than registered wrong.
 - **Write support**, **multi-branch tables** (`catalog_table_scan_branches_get`),
-  **time travel**, **transactions**, **views** — VGI supports all five; none
-  are wired up here (write support matches vgi-java's own worker-SDK scope,
-  which is read-only today).
+  **transactions**, **views** — VGI supports all four; none are wired up here
+  (write support matches vgi-java's own worker-SDK scope, which is read-only
+  today). Time travel *was* on this list — see *Time travel* below for why it
+  turned out to be a real, buildable feature rather than a genuine gap, once
+  actually checked instead of assumed.
 - **Custom ATTACH-time options.** `VgiWorkerClient.openAndAttach()` always
   calls `catalog_attach` with `null` options/init-opaque-data — a worker whose
   `catalog_attach` validates or depends on caller-supplied options (VGI's

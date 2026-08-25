@@ -102,24 +102,22 @@ public final class VgiMetadata implements ConnectorMetadata {
             SchemaTableName tableName,
             Optional<ConnectorTableVersion> startVersion,
             Optional<ConnectorTableVersion> endVersion) {
-        if (startVersion.isPresent() || endVersion.isPresent()) {
-            // Time travel maps onto BindRequest.at_unit/at_value, which VGI
-            // supports — just not wired up in this v1 slice yet.
-            throw new UnsupportedOperationException("VGI connector does not yet support time travel (FOR VERSION/TIMESTAMP AS OF)");
-        }
+        Optional<VgiTimeTravel.AtClause> at = VgiTimeTravel.resolve(startVersion, endVersion);
+        String atUnit = at.map(VgiTimeTravel.AtClause::atUnit).orElse(null);
+        String atValue = at.map(VgiTimeTravel.AtClause::atValue).orElse(null);
         return client.withConnection(a -> {
             ItemsResponse tableResp = a.service().catalog_table_get(
-                    a.handle(), tableName.getSchemaName(), tableName.getTableName(), null, null, null, null);
+                    a.handle(), tableName.getSchemaName(), tableName.getTableName(), atUnit, atValue, null, null);
             if (tableResp.items().isEmpty()) return null;
             TableInfo info = TableInfoDecoder.decode(tableResp.items().get(0));
 
             TableScanFunctionGetResponse scan = a.service().catalog_table_scan_function_get(
-                    a.handle(), tableName.getSchemaName(), tableName.getTableName(), null, null, null, null);
+                    a.handle(), tableName.getSchemaName(), tableName.getTableName(), atUnit, atValue, null, null);
             byte[] bindArguments = ScanFunctionArguments.toBindArguments(scan.arguments());
 
             return new VgiTableHandle(info.schema_name(), info.name(),
                     scan.function_name(), bindArguments, info.columns(), info.cardinality_estimate(),
-                    TupleDomain.all());
+                    TupleDomain.all(), atUnit, atValue);
         });
     }
 
@@ -252,7 +250,7 @@ public final class VgiMetadata implements ConnectorMetadata {
         }
         VgiTableHandle newHandle = new VgiTableHandle(handle.schemaName(), handle.tableName(),
                 handle.scanFunctionName(), handle.scanFunctionArguments(), handle.outputSchema(),
-                handle.cardinalityEstimate(), merged);
+                handle.cardinalityEstimate(), merged, handle.atUnit(), handle.atValue());
         // remainingFilter is the SAME summary we were just given, unchanged:
         // this connector never declares a filter exactly applied (see
         // VgiFilterTranslator's javadoc for why), so Trino must still check
