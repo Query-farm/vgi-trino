@@ -77,6 +77,15 @@ public final class VgiFunctionProvider implements FunctionProvider {
      * actually requested at this call site, the same pattern real connectors
      * (Iceberg, AI functions) use. Arrow already represents every value as
      * nullable, so handling nulls ourselves this way is the natural fit.
+     *
+     * <p>{@code supportsSession=true} (and the session-carrying raw handle,
+     * {@link VgiScalarFunctions#methodHandle}) is used ONLY for a function that
+     * actually declares {@code required_settings}/{@code required_secrets} —
+     * every other function uses {@link VgiScalarFunctions#methodHandleNoSession}
+     * with {@code supportsSession=false}, deliberately avoiding a real Trino
+     * 483 bytecode-generation bug in the combination of {@code
+     * supportsSession=true} with an adapted argument convention; see that
+     * method's own javadoc for what was actually observed.
      */
     @Override
     public ScalarFunctionImplementation getScalarFunctionImplementation(
@@ -91,11 +100,14 @@ public final class VgiFunctionProvider implements FunctionProvider {
         VgiScalarFunctions.CallConfig callConfig =
                 VgiScalarFunctions.buildCallConfig(entry, argumentTypes, returnType);
 
-        MethodHandle rawHandle = VgiScalarFunctions.methodHandle(argumentTypes.size());
+        boolean needsSession = !entry.requiredSettings().isEmpty() || !entry.requiredSecrets().isEmpty();
+        MethodHandle rawHandle = needsSession
+                ? VgiScalarFunctions.methodHandle(argumentTypes.size())
+                : VgiScalarFunctions.methodHandleNoSession(argumentTypes.size());
         MethodHandle instanceFactory = VgiScalarFunctions.instanceFactory(client, callConfig, bindCache);
 
         InvocationConvention actualConvention = new InvocationConvention(
-                nCopies(argumentTypes.size(), BOXED_NULLABLE), NULLABLE_RETURN, false, true);
+                nCopies(argumentTypes.size(), BOXED_NULLABLE), NULLABLE_RETURN, needsSession, true);
         MethodHandle adapted = ScalarFunctionAdapter.adapt(
                 rawHandle, returnType, argumentTypes, actualConvention, invocationConvention);
 

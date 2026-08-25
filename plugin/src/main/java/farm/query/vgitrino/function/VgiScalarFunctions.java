@@ -5,11 +5,13 @@ package farm.query.vgitrino.function;
 import farm.query.vgi.protocol.BindRequest;
 import farm.query.vgi.protocol.BindResponse;
 import farm.query.vgi.protocol.FunctionInfo;
+import farm.query.vgi.protocol.FunctionRequiredSecret;
 import farm.query.vgi.protocol.InitRequest;
 import farm.query.vgi.protocol.ItemsResponse;
 import farm.query.vgi.protocol.SchemaInfo;
 import farm.query.vgi.client.ArgumentsEncoder;
 import farm.query.vgi.client.ScalarValue;
+import farm.query.vgi.client.SettingsEncoder;
 import farm.query.vgirpc.AnnotatedBatch;
 import farm.query.vgirpc.ClientStreamSession;
 import farm.query.vgirpc.RpcStream;
@@ -20,6 +22,7 @@ import farm.query.vgitrino.client.VgiWorkerClient;
 import farm.query.vgitrino.types.ArrowSchemaCodec;
 import farm.query.vgitrino.types.VgiTypeMapping;
 import io.airlift.log.Logger;
+import io.trino.spi.connector.ConnectorSession;
 import io.trino.spi.function.FunctionId;
 import io.trino.spi.function.FunctionMetadata;
 import io.trino.spi.function.Signature;
@@ -37,10 +40,12 @@ import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
 
 import static io.trino.spi.type.TypeTemplates.typeVariable;
 
@@ -83,8 +88,18 @@ import static io.trino.spi.type.TypeTemplates.typeVariable;
  *       {@code concat_values} are excluded only because their return type is separately dynamic —
  *       see below — not because of their varargs shape; {@code geo_centroid_struct} combines
  *       varargs with struct arguments and a struct return).</li>
- *   <li>Settings/secrets/auth-context arguments — skipped at discovery. See the README's own
- *       design note on how these could map onto Trino session properties / extra credentials.</li>
+ *   <li>Settings ({@code required_settings}) map onto Trino session properties (declared via
+ *       {@code VgiConnector.getSessionProperties()}), and secrets ({@code required_secrets}) onto
+ *       {@code ConnectorIdentity.getExtraCredentials()} (a {@code vgi_secret.<key>.<field>=value}
+ *       convention — see {@link BindCache}'s own javadoc for the one honest limitation this
+ *       leaves) — both delivered via a {@code ConnectorSession} threaded through {@code
+ *       supportsSession} (see {@link #methodHandle}/{@link #methodHandleNoSession}). Auth-context
+ *       arguments need no support at all — confirmed invisible on the wire entirely (verified via
+ *       {@code whoami}, callable exactly like any other one-argument function). One real, narrow
+ *       gap remains: a settings/secrets-using function combined with a genuine per-row COLUMN
+ *       argument hits a real Trino 483 columnar-bytecode-generation bug — see {@link
+ *       #methodHandleNoSession}'s own javadoc for what was actually observed, and why every OTHER
+ *       function is deliberately kept off the {@code supportsSession} path entirely.</li>
  *   <li>A dynamic (bind-time-computed) return type — VGI's {@code on_bind}
  *       can compute a NEW output type from the argument's actual type (e.g.
  *       {@code double}'s int8 -> int64 promotion); Trino resolves a function's
@@ -146,9 +161,22 @@ public final class VgiScalarFunctions {
      *        exact (no representable value is lost) — used only to break a same-Trino-{@code
      *        Signature} overload collision in favor of the more faithful registration; see
      *        {@link #discover}
+     * @param requiredSettings session-settings names this function needs — {@code
+     *        FunctionInfo.required_settings} verbatim. Unlike a const/row argument, a setting is
+     *        never part of the Trino {@link Signature}: it's a compute()-only out-of-band
+     *        parameter with no corresponding {@code arguments} schema field at all (confirmed
+     *        against the real fixture's {@code multiply_by_setting(value)} — one Signature
+     *        argument, {@code value}, with {@code multiplier} supplied entirely via {@code
+     *        BindRequest.settings}). Mapped onto Trino session properties — see
+     *        {@link VgiConnector#getSessionProperties()}.
+     * @param requiredSecrets secrets this function needs — {@code FunctionInfo.required_secrets}
+     *        verbatim, same out-of-band treatment as settings. Mapped onto Trino's {@code
+     *        ConnectorIdentity.getExtraCredentials()} — see {@link BindCache}'s own note on the
+     *        credential-key convention and its one real limitation.
      */
     record Entry(FunctionId functionId, String schemaName, String functionName,
-            FunctionMetadata metadata, List<ScalarArg> args, Type declaredReturnType, boolean losslessMapping) {}
+            FunctionMetadata metadata, List<ScalarArg> args, Type declaredReturnType, boolean losslessMapping,
+            List<String> requiredSettings, List<FunctionRequiredSecret> requiredSecrets) {}
 
     /**
      * Every VGI scalar function this connector can support, discovered once at
@@ -162,10 +190,14 @@ public final class VgiScalarFunctions {
     public static final class Registry {
         private final Map<FunctionId, Entry> byId;
         private final Map<String, List<Entry>> byName;
+        private final Set<String> requiredSettingNames;
 
         private Registry(Map<FunctionId, Entry> byId, Map<String, List<Entry>> byName) {
             this.byId = byId;
             this.byName = byName;
+            Set<String> names = new HashSet<>();
+            for (Entry entry : byId.values()) names.addAll(entry.requiredSettings());
+            this.requiredSettingNames = Set.copyOf(names);
         }
 
         /** @return every overload registered under {@code (schemaName, functionName)}, or empty */
@@ -173,6 +205,15 @@ public final class VgiScalarFunctions {
             List<Entry> entries = byName.get(nameKey(schemaName, functionName));
             if (entries == null) return List.of();
             return entries.stream().map(Entry::metadata).toList();
+        }
+
+        /**
+         * @return the union of every registered function's {@code required_settings} names — what
+         *         {@link VgiConnector#getSessionProperties()} declares as this catalog's Trino
+         *         session properties
+         */
+        public Set<String> requiredSettingNames() {
+            return requiredSettingNames;
         }
 
         /** @return the {@link FunctionMetadata} for a previously-handed-out {@link FunctionId}, or {@code null} */
@@ -327,6 +368,8 @@ public final class VgiScalarFunctions {
 
         int overloadIndex = overloadCounters.merge(schemaName + ":" + info.name(), 1, Integer::sum) - 1;
         FunctionId functionId = new FunctionId("vgi:" + schemaName + ":" + info.name() + ":" + overloadIndex);
+        List<String> requiredSettings = info.required_settings() == null ? List.of() : info.required_settings();
+        List<FunctionRequiredSecret> requiredSecrets = info.required_secrets() == null ? List.of() : info.required_secrets();
 
         FunctionMetadata.Builder metadataBuilder = FunctionMetadata.scalarBuilder(info.name())
                 .signature(signature)
@@ -335,15 +378,24 @@ public final class VgiScalarFunctions {
                 .nullable()
                 .description(info.description() == null ? "" : info.description());
         // CONSISTENT is VGI's default; anything else (VOLATILE, CONSISTENT_WITHIN_QUERY) means
-        // Trino must not constant-fold or otherwise assume repeated calls agree.
-        if (info.stability() != null && !"CONSISTENT".equals(info.stability())) {
+        // Trino must not constant-fold or otherwise assume repeated calls agree. A function
+        // reading settings/secrets ALSO must not be constant-folded, for a different but equally
+        // real reason: its result depends on session/identity state entirely outside its
+        // Signature arguments, and Trino's own IR constant-folding (EvaluateCall, gated on
+        // exactly this deterministic flag) evaluates a call with all-literal arguments using a
+        // session that isn't yet bound to this catalog — confirmed the hard way against the real
+        // fixture's multiply_by_setting: without this, ConnectorSession.getProperty throws
+        // "Session property 'null.multiplier' does not exist" at PLAN time, not execution time.
+        if ((info.stability() != null && !"CONSISTENT".equals(info.stability()))
+                || !requiredSettings.isEmpty() || !requiredSecrets.isEmpty()) {
             metadataBuilder.nondeterministic();
         }
         FunctionMetadata metadata = metadataBuilder.build();
 
         boolean losslessMapping = args.stream().allMatch(a -> isLosslessMapping(a.arrowHint()))
                 && isLosslessMapping(outField);
-        return new Entry(functionId, schemaName, info.name(), metadata, args, returnType, losslessMapping);
+        return new Entry(functionId, schemaName, info.name(), metadata, args, returnType, losslessMapping,
+                requiredSettings, requiredSecrets);
     }
 
     /**
@@ -480,14 +532,15 @@ public final class VgiScalarFunctions {
     /** One cached {@code bind()} result: replayable at {@code init()} time on any connection. */
     record BindEntry(byte[] bindCallBytes, byte[] outputSchemaBytes, byte[] opaqueData) {}
 
-    private record CacheKey(FunctionId functionId, List<Object> constArgValues) {}
+    private record CacheKey(FunctionId functionId, List<Object> constArgValues,
+            Map<String, String> resolvedSettings, Map<String, String> resolvedSecretFields) {}
 
     /**
-     * Caches {@code bind()} results keyed by {@code (function, observed const-argument values)},
-     * so a query whose "constant" argument really is constant across every row pays exactly one
-     * {@code bind()} RPC no matter how many rows are processed — every {@code init()}+{@code
-     * exchange()} after the first replays the same cached {@code bind_call} bytes on whatever
-     * connection happens to be free.
+     * Caches {@code bind()} results keyed by {@code (function, observed const-argument values,
+     * resolved settings, resolved secret fields)}, so a query whose "constant" argument really is
+     * constant across every row pays exactly one {@code bind()} RPC no matter how many rows are
+     * processed — every {@code init()}+{@code exchange()} after the first replays the same cached
+     * {@code bind_call} bytes on whatever connection happens to be free.
      *
      * <p>Trino's {@code FunctionProvider} has no channel to receive a constant argument's actual
      * VALUE ahead of invocation ({@code BoundSignature} carries only types) — a {@code vgi_const}
@@ -498,12 +551,41 @@ public final class VgiScalarFunctions {
      * per row degrades to "no caching benefit" (a fresh {@code bind()} every call) — never wrong
      * results, just no speedup; see the README's honest accounting of this.
      *
-     * <p>Bounded (simple LRU) so a workload with many distinct const-argument values can't grow
-     * this without limit; a concurrent miss on the same key may bind twice — both computed binds
-     * are equivalent, so this loses nothing but an occasional redundant RPC.
+     * <p>Settings and secrets are session-scoped, not query-argument-scoped, but this cache is
+     * shared across every session/query on the catalog — so their resolved values must ALSO be
+     * part of the key, or two sessions with different {@code SET SESSION}/{@code
+     * --extra-credential} values would incorrectly share one query's bind.
+     *
+     * <h2>The secrets credential-key convention, and its one real limitation</h2>
+     *
+     * <p>A required secret (VGI's {@code FunctionRequiredSecret(secret_type, scope, secret_name)})
+     * is looked up in {@code ConnectorIdentity.getExtraCredentials()} — a flat, client-supplied
+     * {@code Map<String, String>} (populated e.g. via the JDBC/CLI {@code --extra-credential}
+     * flag) — by scanning for keys of the form {@code vgi_secret.<secretKey>.<fieldName>}, where
+     * {@code secretKey} is {@code secret_name} if present, else {@code secret_type}. Every
+     * matching key becomes one field of that secret's struct (confirmed against the real
+     * fixture's {@code secret_field()}, whose {@code vgi_example} secret needs TWO fields, {@code
+     * port} and {@code secret_string} — a flat single credential value could not represent this).
+     *
+     * <p>This sends whatever fields the CALLER happens to supply via {@code --extra-credential},
+     * proactively, on the first {@code bind()} ({@code resolved_secrets_provided=true} whenever
+     * any secret data was found) — it does NOT replicate VGI's own two-phase secret-resolution
+     * dance ({@code BindResponse.lookup_secret_types}/{@code lookup_scopes}/{@code lookup_names}
+     * triggering a second bind pass), since Trino has no per-query "ask the client for a
+     * credential" round trip once a query is already running. A missing field is simply absent
+     * from the sent struct — whatever the worker does with an incomplete secret (VGI's own
+     * {@code dict.get}-style field access, in the reference fixture, silently substitutes an
+     * empty value rather than failing) is what a caller sees, not a clean "missing credential"
+     * error from this connector.
+     *
+     * <p>Bounded (simple LRU) so a workload with many distinct const-argument/settings/secret
+     * combinations can't grow this without limit; a concurrent miss on the same key may bind
+     * twice — both computed binds are equivalent, so this loses nothing but an occasional
+     * redundant RPC.
      */
     public static final class BindCache {
         private static final int MAX_ENTRIES = 256;
+        private static final String SECRET_CREDENTIAL_PREFIX = "vgi_secret.";
 
         private final Map<CacheKey, BindEntry> map = Collections.synchronizedMap(
                 new LinkedHashMap<>(16, 0.75f, true) {
@@ -513,34 +595,91 @@ public final class VgiScalarFunctions {
                     }
                 });
 
-        BindEntry getOrBind(VgiWorkerClient client, CallConfig cfg, List<Object> constValues) {
-            CacheKey key = new CacheKey(cfg.entry().functionId(), constValues);
+        BindEntry getOrBind(VgiWorkerClient client, CallConfig cfg, List<Object> constValues,
+                ConnectorSession session) {
+            Map<String, String> resolvedSettings = resolveSettings(cfg.entry(), session);
+            Map<String, String> resolvedSecretFields = resolveSecretFields(cfg.entry(), session);
+            CacheKey key = new CacheKey(cfg.entry().functionId(), constValues, resolvedSettings, resolvedSecretFields);
             BindEntry cached = map.get(key);
             if (cached != null) return cached;
-            BindEntry fresh = client.withConnection(a -> doBind(a, cfg, constValues));
+            BindEntry fresh = client.withConnection(
+                    a -> doBind(a, cfg, constValues, resolvedSettings, resolvedSecretFields));
             map.putIfAbsent(key, fresh);
             return map.get(key);
         }
 
-        private static BindEntry doBind(VgiWorkerClient.Attached a, CallConfig cfg, List<Object> constValues) {
+        private static BindEntry doBind(VgiWorkerClient.Attached a, CallConfig cfg, List<Object> constValues,
+                Map<String, String> resolvedSettings, Map<String, String> resolvedSecretFields) {
             byte[] argumentsBytes = encodeConstArgs(cfg, constValues);
             byte[] inputSchemaBytes = ArrowSchemaCodec.serializeSchema(cfg.rowInputSchema());
+            byte[] settingsBytes = resolvedSettings.isEmpty() ? null : SettingsEncoder.of(resolvedSettings);
+            byte[] secretsBytes = encodeSecrets(resolvedSecretFields);
             BindRequest bindRequest = new BindRequest(
                     cfg.entry().functionName(),
                     argumentsBytes,
                     "SCALAR",
                     inputSchemaBytes,
-                    null,           // settings — deferred, see class javadoc
-                    null,           // secrets — deferred, see class javadoc
-                    a.handle(),     // attach_opaque_data
-                    null,           // transaction_opaque_data
-                    false,          // resolved_secrets_provided
-                    null, null,     // at_unit / at_value — not applicable to scalars
-                    null, null,     // copy_from / copy_to
+                    settingsBytes,
+                    secretsBytes,
+                    a.handle(),           // attach_opaque_data
+                    null,                 // transaction_opaque_data
+                    secretsBytes != null, // resolved_secrets_provided — see class javadoc's caveat
+                    null, null,           // at_unit / at_value — not applicable to scalars
+                    null, null,           // copy_from / copy_to
                     cfg.entry().schemaName());
             BindResponse bound = a.service().bind(bindRequest, null);
             byte[] bindCallBytes = RecordCodec.serializeToBytes(bindRequest);
             return new BindEntry(bindCallBytes, bound.output_schema(), bound.opaque_data());
+        }
+
+        /** {@code required_settings} names with a non-null current session-property value. */
+        private static Map<String, String> resolveSettings(Entry entry, ConnectorSession session) {
+            if (entry.requiredSettings().isEmpty()) return Map.of();
+            Map<String, String> resolved = new LinkedHashMap<>();
+            for (String name : entry.requiredSettings()) {
+                String value = session.getProperty(name, String.class);
+                if (value != null) resolved.put(name, value);
+            }
+            return resolved;
+        }
+
+        /**
+         * {@code required_secrets} fields found in {@code ConnectorIdentity.getExtraCredentials()}
+         * — see the class javadoc for the {@code vgi_secret.<secretKey>.<fieldName>} convention.
+         * Flattened as {@code "<secretKey>.<fieldName>" -> value} (rather than a nested map) so it
+         * can sit directly in {@link CacheKey}, itself a plain record.
+         */
+        private static Map<String, String> resolveSecretFields(Entry entry, ConnectorSession session) {
+            if (entry.requiredSecrets().isEmpty()) return Map.of();
+            Map<String, String> credentials = session.getIdentity().getExtraCredentials();
+            Map<String, String> resolved = new LinkedHashMap<>();
+            for (FunctionRequiredSecret required : entry.requiredSecrets()) {
+                String secretKey = required.secret_name() != null ? required.secret_name() : required.secret_type();
+                String prefix = SECRET_CREDENTIAL_PREFIX + secretKey + ".";
+                for (Map.Entry<String, String> credential : credentials.entrySet()) {
+                    if (credential.getKey().startsWith(prefix)) {
+                        resolved.put(secretKey + "." + credential.getKey().substring(prefix.length()),
+                                credential.getValue());
+                    }
+                }
+            }
+            return resolved;
+        }
+
+        /** Un-flattens {@link #resolveSecretFields}'s map back into one struct-valued setting per secret. */
+        private static byte[] encodeSecrets(Map<String, String> resolvedSecretFields) {
+            if (resolvedSecretFields.isEmpty()) return null;
+            Map<String, Map<String, Object>> bySecret = new LinkedHashMap<>();
+            for (Map.Entry<String, String> field : resolvedSecretFields.entrySet()) {
+                int dot = field.getKey().indexOf('.');
+                String secretKey = field.getKey().substring(0, dot);
+                String fieldName = field.getKey().substring(dot + 1);
+                bySecret.computeIfAbsent(secretKey, k -> new LinkedHashMap<>()).put(fieldName, field.getValue());
+            }
+            // Same wire shape as BindRequest.settings — a one-row batch, one Struct-typed column
+            // per secret name — which is exactly what SettingsEncoder already builds given a
+            // Map-valued setting; no separate SecretsEncoder exists (or is needed).
+            return SettingsEncoder.of(bySecret);
         }
 
         private static byte[] encodeConstArgs(CallConfig cfg, List<Object> constValues) {
@@ -590,12 +729,15 @@ public final class VgiScalarFunctions {
 
     private static final MethodHandle NEW_INVOKER;
     private static final MethodHandle INVOKE_GENERIC;
+    private static final MethodHandle INVOKE_NO_SESSION;
 
     static {
         try {
             NEW_INVOKER = LOOKUP.findStatic(VgiScalarFunctions.class, "newInvoker",
                     MethodType.methodType(Invoker.class, VgiWorkerClient.class, CallConfig.class, BindCache.class));
             INVOKE_GENERIC = LOOKUP.findStatic(VgiScalarFunctions.class, "invoke",
+                    MethodType.methodType(Object.class, Invoker.class, ConnectorSession.class, Object[].class));
+            INVOKE_NO_SESSION = LOOKUP.findStatic(VgiScalarFunctions.class, "invokeNoSession",
                     MethodType.methodType(Object.class, Invoker.class, Object[].class));
         } catch (ReflectiveOperationException e) {
             throw new AssertionError(e);
@@ -611,18 +753,53 @@ public final class VgiScalarFunctions {
         return MethodHandles.insertArguments(NEW_INVOKER, 0, client, config, bindCache);
     }
 
-    /** {@code (Invoker, Object, Object, ..., Object) -> Object}, {@code arity} trailing boxed arguments. */
+    /**
+     * {@code (Invoker, ConnectorSession, Object, Object, ..., Object) -> Object}, {@code arity}
+     * trailing boxed arguments. The {@code ConnectorSession} parameter is what lets {@link #invoke}
+     * read session properties ({@code required_settings}) and extra credentials ({@code
+     * required_secrets}) — Trino supplies the query's real session here itself, once {@link
+     * VgiFunctionProvider} declares {@code supportsSession} in the invocation convention it hands
+     * {@code ScalarFunctionAdapter.adapt}; this class never constructs one.
+     *
+     * <p>Use only for a function that actually declares {@code required_settings}/{@code
+     * required_secrets} — see {@link #methodHandleNoSession} for why every other function uses a
+     * plain, session-free handle instead of this one unconditionally.
+     */
     public static MethodHandle methodHandle(int arity) {
         return INVOKE_GENERIC.asCollector(Object[].class, arity);
     }
 
+    /**
+     * {@code (Invoker, Object, Object, ..., Object) -> Object} — the session-free counterpart of
+     * {@link #methodHandle}, for the vast majority of functions that read no settings/secrets.
+     *
+     * <p>Not just a minor optimization: Trino 483's columnar {@code PageProjectionWork} bytecode
+     * generator has a real bug in the combination of {@code supportsSession=true} with an adapted
+     * argument convention (confirmed by reading the actual generated bytecode against the real
+     * fixture's {@code multiply_by_setting}/{@code scale_by_setting} — a missing unbox before an
+     * {@code LSTORE}, and separately a raw {@code Block}/{@code int} descriptor mismatch,
+     * depending on the requested convention) — it does NOT reproduce for a session-declaring
+     * function with zero regular arguments ({@code secret_field()}, verified working end to end).
+     * Declaring {@code supportsSession} only for the functions that truly need it keeps every
+     * other function on the already-proven, session-free path, unaffected by this gap — see the
+     * README's own note on the one real limitation this leaves.
+     */
+    public static MethodHandle methodHandleNoSession(int arity) {
+        return INVOKE_NO_SESSION.asCollector(Object[].class, arity);
+    }
+
+    /** {@link #invoke} for a function with no {@code required_settings}/{@code required_secrets} at all. */
+    private static Object invokeNoSession(Invoker invoker, Object[] args) {
+        return invoke(invoker, null, args);
+    }
+
     /** One invocation: split const vs. per-row args, resolve/reuse the bind, one exchange turn. */
-    private static Object invoke(Invoker invoker, Object[] args) {
+    private static Object invoke(Invoker invoker, ConnectorSession session, Object[] args) {
         CallConfig cfg = invoker.config();
         int[] constIdx = cfg.constArgIndices();
         List<Object> constValues = new ArrayList<>(constIdx.length);
         for (int i : constIdx) constValues.add(args[i]);
-        BindEntry bind = invoker.bindCache().getOrBind(invoker.client(), cfg, constValues);
+        BindEntry bind = invoker.bindCache().getOrBind(invoker.client(), cfg, constValues, session);
 
         return invoker.client().withConnection(a -> {
             try (VectorSchemaRoot input = VectorSchemaRoot.create(cfg.rowInputSchema(), Allocators.root())) {
@@ -643,12 +820,12 @@ public final class VgiScalarFunctions {
                         null, null,
                         null, null, null, null);
                 RpcStream<? extends StreamState> stream = a.service().init(initRequest, null);
-                ClientStreamSession<?> session = (ClientStreamSession<?>) stream;
-                AnnotatedBatch out = session.exchange(new AnnotatedBatch(input, null));
+                ClientStreamSession<?> exchangeSession = (ClientStreamSession<?>) stream;
+                AnnotatedBatch out = exchangeSession.exchange(new AnnotatedBatch(input, null));
                 // Every VGI scalar function's output schema has exactly one column, named "result".
                 FieldVector resultVector = out.root().getVector("result");
                 Object result = VgiTypeMapping.readValue(cfg.returnType(), resultVector, 0);
-                session.close();
+                exchangeSession.close();
                 return result;
             }
         });

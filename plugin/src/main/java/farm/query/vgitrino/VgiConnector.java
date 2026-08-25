@@ -16,10 +16,13 @@ import io.trino.spi.connector.ConnectorSplitManager;
 import io.trino.spi.connector.ConnectorTransactionHandle;
 import io.trino.spi.function.FunctionProvider;
 import io.trino.spi.function.table.ConnectorTableFunction;
+import io.trino.spi.session.PropertyMetadata;
 import io.trino.spi.transaction.IsolationLevel;
 
+import java.util.List;
 import java.util.Optional;
 import java.util.Set;
+import java.util.stream.Collectors;
 
 /**
  * Wires one attached VGI catalog's {@link VgiWorkerClient} to Trino's
@@ -79,6 +82,21 @@ public final class VgiConnector implements Connector {
     @Override
     public Set<ConnectorTableFunction> getTableFunctions() {
         return tableFunctions;
+    }
+
+    /**
+     * One nullable, unhidden string session property per distinct {@code required_settings} name
+     * across every discovered scalar function — {@code SET SESSION <catalog>.<name> = '<value>'}
+     * is how a query supplies a VGI setting a function needs (see {@code
+     * VgiScalarFunctions.BindCache}'s own note on why session-scoped values, not connector-startup
+     * ones, are the right Trino analog for VGI's per-call settings).
+     */
+    @Override
+    public List<PropertyMetadata<?>> getSessionProperties() {
+        return scalarFunctions.requiredSettingNames().stream()
+                .map(name -> PropertyMetadata.stringProperty(name, "VGI scalar-function setting '" + name + "'",
+                        null, false))
+                .collect(Collectors.toList());
     }
 
     @Override

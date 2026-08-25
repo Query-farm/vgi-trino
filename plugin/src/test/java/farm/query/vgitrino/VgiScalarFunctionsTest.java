@@ -3,12 +3,14 @@
 package farm.query.vgitrino;
 
 import io.trino.Session;
+import io.trino.spi.security.Identity;
 import io.trino.testing.DistributedQueryRunner;
 import io.trino.testing.MaterializedResult;
 import io.trino.testing.TestingSession;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.Assumptions;
 import org.junit.jupiter.api.BeforeAll;
+import org.junit.jupiter.api.Disabled;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 
@@ -160,5 +162,68 @@ final class VgiScalarFunctionsTest {
         // The exact Java shape a ROW value materializes as is Trino-internal, not part of this
         // connector's own contract — assert on its rendered form rather than guessing a type.
         assertEquals("[2.0, 3.0]", row.toString());
+    }
+
+    @Test
+    @Timeout(60)
+    void whoAmIWorksWithNoSettingsOrSecretsInvolved() {
+        // auth is invisible on the wire entirely (no arguments/settings/secrets field carries it —
+        // confirmed via vgi/scalar_function.py's argument-spec extraction) — a plain one-argument
+        // call, over subprocess transport where there's no authenticated principal.
+        assertEquals("anonymous", scalar("SELECT vgi_example.main.whoami(1)"));
+    }
+
+    // multiplyBySettingReadsAStringSessionProperty / scaleBySettingReadsADifferentSessionProperty
+    // are @Disabled — see the Trino-483-bytecode-bug note above each. Both are otherwise correct:
+    // the setting IS declared and resolved correctly (whoami/secret_field prove supportsSession
+    // itself works); this is a codegen bug specific to a REAL per-row COLUMN argument combined
+    // with supportsSession=true. A bare-literal query (`SELECT multiply_by_setting(5)`) instead
+    // hits a DIFFERENT, also-real Trino limitation: LocalExecutionPlanner#visitValues evaluates
+    // any no-real-split-source query's projection via IrExpressionEvaluator, whose
+    // ConnectorSession is a bare FullConnectorSession(session, identity) with NO catalog binding
+    // at all (confirmed by reading FullConnectorSession itself: its 2-arg constructor leaves
+    // properties/catalogHandle/catalogName all null, and getProperty unconditionally throws
+    // "'null.<property>' does not exist" from that state) — regardless of row count or this
+    // function's own determinism (confirmed empirically: neither changed it). Routing the
+    // argument through a real split-backed source (sequence(...), an already-proven real VGI
+    // table function) avoids THAT gap, which is how these two tests are written below — but then
+    // hits the columnar-codegen bug instead once the argument is a genuine per-row column.
+    @Disabled("Trino 483 columnar-codegen bug: supportsSession=true + a per-row column argument "
+            + "produces bytecode with a missing unbox before LSTORE (BIGINT) / a raw Block+int "
+            + "descriptor mismatch (DOUBLE) — see VgiScalarFunctions#methodHandleNoSession's javadoc")
+    @Test
+    @Timeout(60)
+    void multiplyBySettingReadsAStringSessionProperty() {
+        Session withSetting = Session.builder(session)
+                .setCatalogSessionProperty(session.getCatalog().orElseThrow(), "multiplier", "3")
+                .build();
+        MaterializedResult result = runner.execute(withSetting, "SELECT vgi_example.main.multiply_by_setting(n) "
+                + "FROM TABLE(vgi_example.main.sequence(6)) WHERE n = 5");
+        assertEquals(15L, result.getMaterializedRows().get(0).getField(0));
+    }
+
+    @Disabled("Trino 483 columnar-codegen bug — see multiplyBySettingReadsAStringSessionProperty's own note")
+    @Test
+    @Timeout(60)
+    void scaleBySettingReadsADifferentSessionProperty() {
+        Session withSetting = Session.builder(session)
+                .setCatalogSessionProperty(session.getCatalog().orElseThrow(), "scale_factor", "2.5")
+                .build();
+        MaterializedResult result = runner.execute(withSetting,
+                "SELECT vgi_example.main.scale_by_setting(CAST(n AS DOUBLE)) "
+                        + "FROM TABLE(vgi_example.main.sequence(5)) WHERE n = 4");
+        assertEquals(10.0, (Double) result.getMaterializedRows().get(0).getField(0), 0.0001);
+    }
+
+    @Test
+    @Timeout(60)
+    void secretFieldReadsMultipleFieldsOfOneSecretFromExtraCredentials() {
+        Session withSecret = Session.builder(session)
+                .setIdentity(Identity.forUser("test").withExtraCredentials(Map.of(
+                        "vgi_secret.vgi_example.port", "5432",
+                        "vgi_secret.vgi_example.secret_string", "hello")).build())
+                .build();
+        MaterializedResult result = runner.execute(withSecret, "SELECT vgi_example.main.secret_field()");
+        assertEquals("port=5432;name=hello", result.getMaterializedRows().get(0).getField(0));
     }
 }

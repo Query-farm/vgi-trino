@@ -565,27 +565,52 @@ struct arguments, returning a struct — all three new capabilities at once).
   `type_info` overload set, three of whose signatures collide this way. Only the first-discovered
   overload per distinct Trino `Signature` is registered; a colliding later one is unreachable from
   Trino, not silently wrong. Also a ceiling, not a scope choice.
-- **A `FixedSizeList` argument, on write.** Reading one (a worker's return value, or a table column) is
-  fully supported. Writing one — building a scalar function's per-row `input_schema` from a Trino
-  `ARRAY` argument — always produces an Arrow `List`, never a `FixedSizeList`: Trino's `ArrayType` carries
-  no fixed-length information to produce one from. Untested against the reference fixture's own
-  `geo_distance_fixed`/`geo_centroid_fixed` (which declare a `FixedSizeList`-typed parameter) — whether
-  the worker's own argument validation accepts a `List` in a `FixedSizeList`'s place is an open,
-  real question, not yet answered against real infrastructure.
 - **128-bit decimal arguments/return**, in the Trino → Arrow (scalar) direction specifically. Trino's
   `BOXED_NULLABLE` representation for a decimal is a raw `Long` (short) or `Int128` (long) unscaled
   value, not a `BigDecimal` — bridging that correctly needs real, separately-verified `Int128` handling.
   `toTrinoType`'s read direction (declarative table columns) already supports it.
-- **Settings- and secrets-backed arguments** (`multiply_by_setting`, `secret_field`, `whoami`) — the same
-  already-noted gap as table functions (see *Scope* below): nothing on the scalar bind path sends
-  settings or secrets today.
+
+**Settings and secrets are supported, with one real, narrow gap.** `required_settings` maps onto Trino
+session properties (`VgiConnector.getSessionProperties()` declares one nullable string property per
+distinct setting name across every registered function; `SET SESSION <catalog>.<name> = '<value>'`
+supplies it). `required_secrets` maps onto `ConnectorIdentity.getExtraCredentials()` — a flat,
+client-supplied `Map<String, String>` (e.g. the JDBC/CLI `--extra-credential` flag) — via a
+`vgi_secret.<secretKey>.<fieldName>=value` convention, letting one secret carry multiple fields
+(confirmed necessary and working against the real fixture's `secret_field()`, whose `vgi_example` secret
+needs both `port` and `secret_string`). Both are delivered into `VgiScalarFunctions.invoke` via a real
+`ConnectorSession`, threaded through Trino's `supportsSession` invocation-convention flag — the same
+mechanism Trino's own built-in `current_user()`/`current_path()` use, just reached from a
+connector-defined function via `ScalarFunctionAdapter.adapt` instead of hand-written bytecode. A
+function reading either is also marked non-deterministic (its result depends on session/identity state
+outside its `Signature` arguments — discovered the hard way: without this, Trino's IR constant-folding
+evaluated `multiply_by_setting(5)` at *plan* time, before a real per-catalog session existed).
+Auth-context arguments (`whoami`) need no support at all — confirmed invisible on the wire entirely.
+
+The one real gap: a settings/secrets-using function combined with a genuine per-row **column**
+argument hits an actual Trino 483 columnar-bytecode-generation bug in the combination of
+`supportsSession=true` with an adapted argument convention — confirmed by reading the generated
+bytecode against the real fixture's `multiply_by_setting`/`scale_by_setting` (a missing unbox before an
+`LSTORE` for a `BIGINT` return; a raw `Block`/`int` descriptor mismatch for a `DOUBLE` return). It does
+**not** reproduce for a session-declaring function with zero regular arguments (`secret_field()`,
+verified working end to end) or one whose argument comes from Trino's early constant-evaluation path
+rather than a real column. Every function that doesn't itself need `supportsSession` is deliberately
+kept off that path entirely (`VgiScalarFunctions.methodHandleNoSession`), so this bug cannot affect the
+vast majority of functions — but `multiply_by_setting`/`scale_by_setting` called against a real column
+are untested-and-known-broken today (`VgiScalarFunctionsTest`'s two `@Disabled` tests document exactly
+this), pending either a Trino fix or a different bridging strategy this connector hasn't found yet.
+
+- **A `FixedSizeList` argument, on write, IS supported** — `VgiTypeMapping#toArrowField`'s `hint`
+  parameter carries the argument's original discovery-time Arrow field forward so a worker-declared
+  `FixedSizeList` width survives round-tripping through Trino's width-erasing `ArrayType` (verified
+  against the real fixture's `geo_distance_fixed`).
 - **A colliding overload set is pruned, not fully exposed.** VGI's own Arrow type system distinguishes
   overloads (e.g. `int64` vs. `uint32`/`uint64`) that `VgiTypeMapping` widens onto the *same* Trino type
   (`BIGINT` — Trino has no unsigned integer type). Registering all of them would make every call
   ambiguous ("Could not choose a best candidate operator") — confirmed against the real fixture's 5-way
-  `type_info` overload set, three of whose signatures collide this way. Only the first-discovered
-  overload per distinct Trino `Signature` is registered; a colliding later one is unreachable from Trino,
-  not silently wrong.
+  `type_info` overload set, three of whose signatures collide this way. The registration prefers a
+  lossless Arrow → Trino mapping over a lossy one when both collide (see *Scalar functions*' own
+  discovery-time WARN logging above), falling back to first-discovered only when both are equally
+  (non-)lossless.
 
 ### Dynamic filtering
 
@@ -656,11 +681,13 @@ the same boundary on static predicate pushdown).
   TABLE-input argument — see *Table functions* above for why these are
   skipped rather than registered wrong.
 - **Scalar functions with a dynamic (bind-time-computed) return type, a
-  colliding overload set, a `FixedSizeList` argument (on write), a 128-bit
-  decimal argument/return, or settings/secrets-backed arguments** — see
+  colliding overload set, or a 128-bit decimal argument/return** — see
   *Scalar functions* above for why each is skipped rather than registered
-  wrong. The `TABLE(...)`-argument/batch-path question for scalar functions
-  (an entirely separate design, not this connector's row-at-a-time dispatch)
+  wrong. Settings/secrets ARE supported now, except for the one narrow,
+  real Trino-483-bytecode-bug gap documented there (a settings/secrets
+  function called with a genuine per-row column argument). The
+  `TABLE(...)`-argument/batch-path question for scalar functions (an
+  entirely separate design, not this connector's row-at-a-time dispatch)
   is also still undecided.
 - **Write support**, **multi-branch tables** (`catalog_table_scan_branches_get`),
   **transactions**, **views** — VGI supports all four; none are wired up here
@@ -674,13 +701,11 @@ the same boundary on static predicate pushdown).
   attach-options mechanism) has no way to receive any from this connector
   today. `vgi.catalog-name` is the only per-attach parameter this connector
   threads through.
-- **Per-query settings and secrets.** `table_function_plan`/`init()` and the
-  scalar-function bind path all always send `null`/`false` for
-  `settings`/`secrets`/`resolved_secrets_provided` — settings-aware and
-  secret-scoped worker functions have no path to receive either from this
-  connector. Trino has no automatic SET-style pass-through, but its
-  per-session/catalog properties could plausibly be wired to VGI settings;
-  that's unbuilt, not merely untested.
+- **Per-query settings and secrets for table functions.** `table_function_plan`/`init()`
+  still always send `null`/`false` for `settings`/`secrets`/`resolved_secrets_provided` —
+  this gap is now closed for *scalar* functions only (session properties / extra
+  credentials — see *Scalar functions* above), not yet for table functions, which would
+  need the equivalent wiring on the `plan()`/`init()` call sites instead.
 
 ## License
 
