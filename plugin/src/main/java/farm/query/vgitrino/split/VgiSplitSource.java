@@ -129,7 +129,10 @@ public final class VgiSplitSource implements ConnectorSplitSource {
 
     @Override
     public CompletableFuture<List<ConnectorSplit>> getNextBatch(int maxSize, DynamicFilterSnapshot dynamicFilter) {
-        return CompletableFuture.supplyAsync(() -> fetchNextBatch(maxSize, dynamicFilter));
+        // client.executor(), NOT the default (the JVM-wide common ForkJoinPool)
+        // — see that field's own javadoc for why a connector-private pool is
+        // worth using regardless of what runs on it.
+        return CompletableFuture.supplyAsync(() -> fetchNextBatch(maxSize, dynamicFilter), client.executor());
     }
 
     private List<ConnectorSplit> fetchNextBatch(int maxSize, DynamicFilterSnapshot dynamicFilter) {

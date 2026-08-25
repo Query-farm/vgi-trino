@@ -14,30 +14,62 @@
 #   ATTACH is implicit in the catalog config below — just query it:
 #   SELECT * FROM vgi_example.data.numbers;
 #
-# NOTE: this compose file has not been exercised end to end as part of this
-# change — it's written to the same conventions as the Dockerfile and the
-# dev/run-local-trino.sh script, both of which have. Treat it as a starting
-# point, not a verified artifact, until someone runs it.
+# Verified end to end 2026-08-25 against a locally built plugin dir + the
+# reference Python fixture worker: `docker compose -f docker/docker-compose.yml
+# up --build`, then `SELECT * FROM vgi_example.data.numbers` over the exposed
+# 8080 port. Two real bugs turned up along the way, both fixed here and
+# explained where they bite:
+#   - Arrow's off-heap memory access needs `--add-opens`/`--add-modules` JVM
+#     flags this connector's own jars can't add for themselves (see the
+#     Dockerfile) — Trino's coordinator crashed at the FIRST catalog load
+#     without them, every time, not a flake.
+#   - Trino loads every catalog EAGERLY and FATALLY at startup
+#     (`StaticCatalogManager.loadInitialCatalogs`) — a `depends_on` with no
+#     healthcheck only waits for the worker CONTAINER to start, not for `uv
+#     run` to finish downloading Python + syncing dependencies and actually
+#     bind its port, so Trino would try to ATTACH before anything was
+#     listening and exit immediately. The healthcheck below is what makes
+#     `trino`'s `depends_on: condition: service_healthy` actually wait long
+#     enough.
 
 services:
   vgi-worker:
     image: ghcr.io/astral-sh/uv:python3.13-bookworm-slim
     # Mounts the vgi-python checkout from the host rather than baking it into
     # an image, so this compose file tracks whatever checkout the operator
-    # has — matches how the connector's own tests locate it.
+    # has — matches how the connector's own tests locate it. Mounted `:ro`:
+    # `uv run --project` otherwise creates/syncs `.venv` INSIDE the project
+    # directory, which would be a container writing into the host's live dev
+    # checkout (and fails outright here, since it's read-only). Pointing
+    # UV_PROJECT_ENVIRONMENT at a path outside the mount keeps the venv
+    # entirely inside the container instead, so the source stays read-only.
     volumes:
       - ${VGI_PYTHON_DIR:-../../vgi-python}:/vgi-python:ro
     working_dir: /vgi-python
+    environment:
+      UV_PROJECT_ENVIRONMENT: /opt/vgi-python-venv
     command: ["uv", "run", "--project", "/vgi-python", "vgi-fixture-worker", "--tcp", "0.0.0.0:8765"]
     expose:
       - "8765"
+    # The image's own bundled `python3` (distinct from the project's `uv`-
+    # managed interpreter, which may still be downloading) is available from
+    # container start, so this can probe the real listening socket well
+    # before `uv run` itself has finished syncing dependencies.
+    healthcheck:
+      test: ["CMD", "python3", "-c",
+             "import socket; socket.create_connection(('127.0.0.1', 8765), timeout=2).close()"]
+      interval: 2s
+      timeout: 3s
+      retries: 60
+      start_period: 60s
 
   trino:
     build:
       context: ..
       dockerfile: docker/Dockerfile
     depends_on:
-      - vgi-worker
+      vgi-worker:
+        condition: service_healthy
     ports:
       - "8080:8080"
     volumes:

@@ -24,6 +24,8 @@ import java.util.List;
 import java.util.Queue;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
@@ -74,6 +76,33 @@ public final class VgiWorkerClient implements AutoCloseable {
     // produces. Concurrent because release() (many splits, many threads) and
     // close() (one, at shutdown) touch it independently of the pool queue.
     private final Queue<Attached> all = new ConcurrentLinkedQueue<>();
+    // A dedicated pool for VgiSplitSource's async getNextBatch — deliberately
+    // NOT CompletableFuture.supplyAsync's default (the JVM-wide common
+    // ForkJoinPool). That pool is shared across the ENTIRE JVM, including
+    // whatever else Trino's own internals use it for; a plugin submitting
+    // its own work onto it — however briefly — has no way to guarantee its
+    // own classloader never ends up as a common-pool worker thread's context
+    // classloader in some way that outlives this one call (a plain Thread
+    // copies its creator's context classloader once, at creation, and
+    // nothing resets it on later reuse for unrelated work). A connector-
+    // private pool makes that categorically impossible: nothing but this
+    // connector's own work ever runs on these threads. (The specific crash
+    // that motivated auditing this — `ClassNotFoundException: com.fasterxml.
+    // jackson.module.blackbird.deser.CreatorOptimizer`, reproduced against a
+    // real `trinodb/trino:483` image, see docker/docker-compose.yml — turned
+    // out to have a different, unrelated root cause: Trino's own task-update
+    // wire protocol needing blackbird resolvable from THIS plugin's
+    // classloader to deserialize this connector's own SPI types, fixed via
+    // the plugin/build.gradle.kts dependency + version-alignment comments.
+    // This executor is still worth keeping on its own merits — depending on
+    // the JVM-wide common pool from connector code is a latent risk
+    // regardless of whether it was the cause here.)
+    private final ExecutorService executor = Executors.newCachedThreadPool(
+            runnable -> {
+                Thread t = new Thread(runnable, "vgi-trino-split-source");
+                t.setDaemon(true);
+                return t;
+            });
 
     /**
      * Spawn/connect {@link VgiConfig#connections()} independent connections and
@@ -100,6 +129,13 @@ public final class VgiWorkerClient implements AutoCloseable {
 
     /** @return this client's configuration */
     public VgiConfig config() { return config; }
+
+    /**
+     * @return the dedicated executor {@link farm.query.vgitrino.split.VgiSplitSource}
+     *         must use for its async {@code getNextBatch} — never the JVM-wide
+     *         common {@code ForkJoinPool} (see this field's own javadoc for why)
+     */
+    public ExecutorService executor() { return executor; }
 
     /**
      * Borrow a connection, run {@code fn} against it, and return it to the
@@ -258,5 +294,6 @@ public final class VgiWorkerClient implements AutoCloseable {
     @Override
     public void close() {
         for (Attached a : all) closeQuietly(a);
+        executor.shutdownNow();
     }
 }
