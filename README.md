@@ -38,10 +38,12 @@ Set per catalog in `etc/catalog/<name>.properties`:
 | `connector.name` | yes | `vgi` |
 | `vgi.location` | yes | The worker to attach: a bare shell command (subprocess transport), `unix:///path/to.sock`, or `tcp://host:port`. `http(s)://` is not yet implemented. |
 | `vgi.catalog-name` | yes | The VGI-side catalog to attach — one of the names the worker's `catalog_catalogs()` advertises (e.g. `example` for the reference fixture worker). **Not** the Trino catalog name (the properties filename) — that's a purely local alias the worker never sees, the same split DuckDB's own `ATTACH 'name' AS alias` makes. |
-| `vgi.connections` | no (default 4) | Size of the pooled-connection set. VGI's RPC is lockstep per connection — one call in flight at a time — so this also caps how many splits can be redeemed concurrently against this catalog. |
+| `vgi.connections` | no (default 4) | Size of the pooled-connection set. VGI's RPC is lockstep per connection — one call in flight at a time — so this also caps how many splits can be redeemed concurrently against this catalog. Size it to comfortably exceed the concurrency Trino actually schedules for a split-heavy scan, not just the parallelism you want — Trino may schedule more concurrent splits than this allows (e.g. a `LIMIT` it can satisfy from the first few splits still starts redeeming others in parallel before it notices), and the excess queues behind `vgi.connection-acquire-timeout-millis` rather than being throttled proactively. |
+| `vgi.connection-acquire-timeout-millis` | no (default 30000) | How long a caller waits for a pooled connection before failing. Bounds what would otherwise be an unlimited wait — see `VgiWorkerClient.borrow`'s javadoc. |
 | `vgi.target-split-size-bytes` | no | Passed to `table_function_plan` as `target_split_bytes`. |
 | `vgi.min-splits` | no | Passed as `min_splits`. |
 | `vgi.max-splits-per-response` | no (default 1000) | Pagination cap per `table_function_plan` call — Trino's own `getNextBatch(maxSize)` further clamps this per call. |
+| `vgi.dynamic-filtering-wait-timeout-millis` | no (default 1000) | How long `VgiSplitSource` asks Trino to hold its first `getNextBatch` call so a join's dynamic filter can arrive before any split is planned. `0` disables waiting. |
 
 ## Running it
 
@@ -77,6 +79,50 @@ Trino equivalent, ever. The ~161 files using table-function CALL syntax are a
 different story now that `ConnectorTableFunction` support exists (see *Table
 functions* below) — porting those needs a DuckDB-`:=`-to-Trino-`=>` syntax
 translation this harness doesn't do yet, not new connector functionality.
+
+**`splits/*.test` fixture conformance** (`VgiSplitsFixtureConformanceTest`):
+13 of the 20 files in that category hand-ported (not parsed — DuckDB's `:=`
+call syntax isn't valid Trino SQL) into `TABLE(...)` calls against the SAME
+reference Python fixture worker functions every other SDK's conformance suite
+runs against (`split_sequence`, `split_paginated`, `split_fail_at`, ...). The
+class's own javadoc lists exactly which 7 files were left out and why (three
+categories: no Trino-side equivalent exists at all — DuckDB extension
+settings like `vgi_split_scans`/`vgi_split_token_min_ttl_seconds`, or the
+result cache; PTF predicate pushdown is architecturally impossible per the
+*Table functions*/*Predicate pushdown* sections above; or the file's DuckDB
+transaction-scope premise doesn't translate to `trino-testing`'s
+single-statement-per-`Session.execute()` harness).
+
+Running these against real infrastructure — not the DuckDB dialect this time,
+Trino's own split-scheduling behavior — found two real, load-bearing bugs in
+`VgiWorkerClient`'s connection pool, both fixed:
+
+- **The pool never self-healed.** A connection a call failed against was
+  evicted and never replaced — fine for one bad connection, but N cumulative
+  failures over a catalog's *lifetime* (not per-query) drained a
+  `vgi.connections=N` pool to zero, after which every subsequent `borrow()`
+  blocked forever. Found by porting `poisoned_conn.test`/`errors.test`, whose
+  whole point is deliberately failing one split and then asserting the next
+  query is unaffected. Fixed: `release` now mints a fresh replacement in
+  place of an evicted connection, so the pool's *size* is stable across a
+  transient failure.
+- **`borrow()` had no timeout at all.** Trino may schedule more concurrent
+  splits than `vgi.connections` allows — a `LIMIT` satisfiable from the very
+  first split still starts redeeming others in parallel before the engine
+  notices it has enough — and the excess legitimately queue behind whichever
+  connections are already busy. But queuing forever, on the Trino engine's
+  own thread, is a different thing: once enough threads are stuck the same
+  way, nothing is left to notice the `LIMIT` was already satisfied and cancel
+  the rest, wedging the whole query (and everything sharing that thread
+  pool). Found by porting `cancel_midsplit.test`'s abandonment shape (adapted
+  as `abandonedScanLeavesThePoolUsable`, since its actual assertions are all
+  DuckDB result-cache-specific). Fixed with a bounded, configurable acquire
+  timeout (`vgi.connection-acquire-timeout-millis`) — the fully correct fix is
+  non-blocking, future-based acquisition using the SPI's own async escape
+  hatches (`ConnectorPageSource.isBlocked()`,
+  `TableFunctionProcessorState.Blocked`), which this connector doesn't use
+  yet; the bounded wait is the floor that keeps a stuck case a clear, timed
+  failure instead of an indefinite hang, not a replacement for that.
 
 **Local Trino, fast dev loop** (downloads/caches the Trino server tarball once):
 
@@ -319,3 +365,14 @@ the same boundary on static predicate pushdown).
   **time travel**, **transactions** — VGI supports all four; none are wired
   up here (write support matches vgi-java's own worker-SDK scope, which is
   read-only today).
+- **Non-blocking connection acquisition.** `VgiPageSource`/`VgiTableFunctionSplitProcessor`
+  construction calls `VgiWorkerClient.borrow()` synchronously rather than
+  using the SPI's async escape hatches (`ConnectorPageSource.isBlocked()`,
+  `TableFunctionProcessorState.Blocked`) — real, if bounded, contention when
+  Trino schedules more concurrent splits than `vgi.connections` allows (see
+  the splits-conformance section above); the correct fix is future-based
+  acquisition, not just a generous timeout.
+- **A page-count guard on runaway `table_function_plan` pagination.** A
+  worker that never stops cursoring makes `VgiSplitSource` follow it forever
+  — the analogue of the C++ extension's `vgi_split_plan_max_pages` doesn't
+  exist here (`splits/plan_bounds.test`, not ported for exactly this reason).

@@ -37,6 +37,17 @@ import java.util.Map;
  *        {@code ConnectorSplitSource.getRequestedDynamicFilterWaitTimeoutMillis}.
  *        {@code 0} disables waiting (Trino calls back immediately with
  *        whatever it has, which may be nothing yet)
+ * @param connectionAcquireTimeoutMillis how long {@code VgiWorkerClient.borrow()}
+ *        waits for a pooled connection before giving up. Trino may schedule
+ *        more concurrent splits than {@link #connections} allows — e.g. a
+ *        {@code LIMIT} the engine can satisfy from the first few splits still
+ *        eagerly starts redeeming others in parallel — and those extras
+ *        legitimately queue behind the ones already running. A generous but
+ *        FINITE bound turns a connector or worker that's genuinely stuck
+ *        (every connection wedged, nothing left to ever free one) into a
+ *        clear, diagnosable failure instead of hanging the calling Trino
+ *        engine thread — and, by extension, every query sharing whatever
+ *        thread pool that thread came from — forever
  */
 public record VgiConfig(
         String location,
@@ -45,7 +56,8 @@ public record VgiConfig(
         Long targetSplitBytes,
         Long minSplits,
         int maxSplitsPerResponse,
-        long dynamicFilteringWaitTimeoutMillis) {
+        long dynamicFilteringWaitTimeoutMillis,
+        long connectionAcquireTimeoutMillis) {
 
     /** Default connection-pool size when {@code vgi.connections} is unset. */
     public static final int DEFAULT_CONNECTIONS = 4;
@@ -55,6 +67,9 @@ public record VgiConfig(
 
     /** Default dynamic-filtering wait, when {@code vgi.dynamic-filtering-wait-timeout-millis} is unset. */
     public static final long DEFAULT_DYNAMIC_FILTERING_WAIT_TIMEOUT_MILLIS = 1000L;
+
+    /** Default connection-acquire wait, when {@code vgi.connection-acquire-timeout-millis} is unset. */
+    public static final long DEFAULT_CONNECTION_ACQUIRE_TIMEOUT_MILLIS = 30_000L;
 
     /**
      * Parse the catalog properties map Trino provides.
@@ -83,8 +98,11 @@ public record VgiConfig(
         long dynamicFilteringWaitTimeoutMillis = parseLong(
                 properties.get("vgi.dynamic-filtering-wait-timeout-millis"),
                 DEFAULT_DYNAMIC_FILTERING_WAIT_TIMEOUT_MILLIS);
+        long connectionAcquireTimeoutMillis = parseLong(
+                properties.get("vgi.connection-acquire-timeout-millis"),
+                DEFAULT_CONNECTION_ACQUIRE_TIMEOUT_MILLIS);
         return new VgiConfig(location, catalogName, connections, targetSplitBytes, minSplits,
-                maxSplitsPerResponse, dynamicFilteringWaitTimeoutMillis);
+                maxSplitsPerResponse, dynamicFilteringWaitTimeoutMillis, connectionAcquireTimeoutMillis);
     }
 
     private static int parseInt(String value, int fallback) {

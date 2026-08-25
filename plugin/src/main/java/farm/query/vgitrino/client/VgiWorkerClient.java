@@ -21,9 +21,12 @@ import java.net.UnixDomainSocketAddress;
 import java.nio.channels.SocketChannel;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Queue;
 import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.function.Function;
 
 /**
@@ -37,12 +40,23 @@ import java.util.function.Function;
  * {@link VgiConfig#connections()} of them at construction (each doing its own
  * {@code catalog_attach}) and hands them out via {@link #withConnection}.
  *
- * <p>A connection that throws is evicted rather than returned to the pool —
- * VGI's lockstep framing means a call that failed mid-stream may have left the
- * wire in an indeterminate state, and reusing it would corrupt the next call
- * rather than merely fail it. v1 does not respawn evicted connections; a
- * worker that crashes repeatedly will shrink the pool towards zero rather than
- * self-heal. Tracked as a follow-up, not a v1 blocker.
+ * <p>A connection that throws is never returned to the pool as-is — VGI's
+ * lockstep framing means a call that failed mid-stream may have left the wire
+ * in an indeterminate state, and reusing it would corrupt the next call
+ * rather than merely fail it. {@link #release} closes it and immediately
+ * opens+attaches a fresh replacement in its place, so the POOL SIZE is
+ * self-healing rather than monotonically shrinking. Not doing this was v1's
+ * original design (evict and never replace) — found, by porting the VGI C++
+ * suite's own {@code splits/poisoned_conn.test}/{@code errors.test} against
+ * this connector, to be a real, silent deadlock rather than a mere throughput
+ * degradation: with {@code connections=N}, N cumulative connection failures
+ * over the catalog attachment's LIFETIME (not per-query) drained the pool to
+ * zero, and every subsequent {@link #borrow} — on a completely unrelated,
+ * otherwise-healthy query — blocked forever on an empty queue that nothing
+ * would ever refill. A worker that is genuinely down still degrades honestly:
+ * if the replacement attach itself fails, that one slot is lost (logged
+ * failures compound instead of manufacturing fake capacity), rather than
+ * retried in a loop that could itself hang {@link #release}.
  */
 public final class VgiWorkerClient implements AutoCloseable {
 
@@ -54,7 +68,12 @@ public final class VgiWorkerClient implements AutoCloseable {
 
     private final VgiConfig config;
     private final BlockingQueue<Attached> pool = new LinkedBlockingQueue<>();
-    private final List<Attached> all;
+    // Every live connection this client has ever opened, for close() to shut
+    // down — including self-healing replacements minted by release(), which
+    // is why this can't be the fixed List.copyOf snapshot construction alone
+    // produces. Concurrent because release() (many splits, many threads) and
+    // close() (one, at shutdown) touch it independently of the pool queue.
+    private final Queue<Attached> all = new ConcurrentLinkedQueue<>();
 
     /**
      * Spawn/connect {@link VgiConfig#connections()} independent connections and
@@ -76,7 +95,7 @@ public final class VgiWorkerClient implements AutoCloseable {
             for (Attached a : opened) closeQuietly(a);
             throw e;
         }
-        this.all = List.copyOf(opened);
+        all.addAll(opened);
     }
 
     /** @return this client's configuration */
@@ -110,11 +129,37 @@ public final class VgiWorkerClient implements AutoCloseable {
      * Borrow a connection for the caller to hold across multiple operations.
      * Must be paired with exactly one {@link #release} call.
      *
-     * @return a connection from the pool, blocking until one is available
+     * <p>Blocks up to {@link VgiConfig#connectionAcquireTimeoutMillis()}, not
+     * forever. Trino's split-processor/page-source construction is expected
+     * to be cheap and non-blocking (the SPI's own async escape hatches —
+     * {@code ConnectorPageSource.isBlocked()},
+     * {@code TableFunctionProcessorState.Blocked} — exist for exactly the
+     * case this connector doesn't yet use them for), so it may legitimately
+     * schedule more concurrent splits than {@link VgiConfig#connections()}
+     * allows — e.g. a {@code LIMIT} satisfiable from the very first split
+     * still starts redeeming others in parallel before the engine notices it
+     * has enough. Those extras block here, behind whichever connections are
+     * already busy, exactly as intended — a bounded wait is what keeps a
+     * connector or worker that's genuinely stuck (nothing left that will ever
+     * free one) from hanging the calling Trino engine thread, and every other
+     * query sharing whatever thread pool that thread came from, forever.
+     *
+     * @return a connection from the pool
+     * @throws RuntimeException if none becomes available within the
+     *         configured timeout, or the wait is interrupted
      */
     public Attached borrow() {
         try {
-            return pool.take();
+            Attached a = pool.poll(config.connectionAcquireTimeoutMillis(), TimeUnit.MILLISECONDS);
+            if (a == null) {
+                throw new RuntimeException(new TimeoutException(
+                        "timed out after " + config.connectionAcquireTimeoutMillis()
+                                + "ms waiting for a pooled VGI worker connection ("
+                                + "vgi.connections=" + config.connections() + " may be too small for how many "
+                                + "splits this query redeems concurrently, or the worker may be stuck — raise "
+                                + "vgi.connection-acquire-timeout-millis or vgi.connections if this is expected)"));
+            }
+            return a;
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             throw new RuntimeException("interrupted waiting for a VGI worker connection", e);
@@ -122,10 +167,20 @@ public final class VgiWorkerClient implements AutoCloseable {
     }
 
     /**
-     * Return a borrowed connection: to the pool if {@code healthy}, or evict
-     * and close it otherwise (VGI's lockstep framing means a connection a call
-     * failed against may be left in an indeterminate wire state — reusing it
-     * would corrupt the next call rather than merely fail it).
+     * Return a borrowed connection: to the pool if {@code healthy}, or evict,
+     * close it, and mint a fresh replacement otherwise (VGI's lockstep framing
+     * means a connection a call failed against may be left in an indeterminate
+     * wire state — reusing it would corrupt the next call rather than merely
+     * fail it).
+     *
+     * <p>The replacement is what keeps the pool's SIZE stable across a
+     * transient failure — a fixture or worker bug that fails one split's
+     * {@code init()} must not cost every later query on this catalog a
+     * permanent slot; enough of those over the catalog's lifetime would
+     * otherwise drain the pool to zero and hang every subsequent
+     * {@link #borrow}. If re-attaching itself fails, the worker is presumably
+     * genuinely unreachable — that slot is honestly lost rather than retried
+     * in a loop that could hang this call.
      *
      * @param a the connection {@link #borrow} returned
      * @param healthy whether every call made against it completed cleanly
@@ -133,8 +188,21 @@ public final class VgiWorkerClient implements AutoCloseable {
     public void release(Attached a, boolean healthy) {
         if (healthy) {
             pool.offer(a);
-        } else {
-            closeQuietly(a);
+            return;
+        }
+        closeQuietly(a);
+        all.remove(a);
+        try {
+            Attached replacement = openAndAttach();
+            all.add(replacement);
+            pool.offer(replacement);
+        } catch (RuntimeException e) {
+            // The worker looks genuinely down: nothing to put back. Losing
+            // one pool slot here is an honest degradation (this catalog now
+            // has one fewer connection to redeem splits with), not a hang —
+            // unlike silently coming up short forever, later borrow() calls
+            // still succeed against the remaining connections and only run
+            // out if EVERY one of them has failed the same way.
         }
     }
 
