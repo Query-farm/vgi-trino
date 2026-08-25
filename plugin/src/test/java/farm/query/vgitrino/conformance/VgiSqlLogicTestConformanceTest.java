@@ -4,6 +4,7 @@ package farm.query.vgitrino.conformance;
 
 import farm.query.vgitrino.VgiConnectorFactory;
 import farm.query.vgitrino.VgiPlugin;
+import farm.query.vgitrino.testing.VgiWorkerHarness;
 import io.trino.Session;
 import io.trino.testing.DistributedQueryRunner;
 import io.trino.testing.MaterializedResult;
@@ -57,21 +58,33 @@ import static org.junit.jupiter.api.Assertions.fail;
  * at the end of this test is that the skip count is exactly what's expected
  * and every record this connector's functionality covers actually runs and
  * passes.
+ *
+ * <p>Abstract: {@link #startWorker} is the one thing that varies per
+ * transport — concrete subclasses (one per transport {@link
+ * VgiWorkerHarness} supports) each start the real fixture worker their own
+ * way and hand back a {@code vgi.location}; every {@code @Test} method below
+ * is inherited unchanged.
  */
 @TestInstance(TestInstance.Lifecycle.PER_CLASS)
-final class VgiSqlLogicTestConformanceTest {
+abstract class VgiSqlLogicTestConformanceTest {
+
+    static final File VGI_PYTHON = new File(System.getProperty("user.home"), "Development/vgi-python");
 
     private static final String TRINO_CATALOG = "vgi_example";
     private static final String VGI_CATALOG_NAME = "example";
 
+    private VgiWorkerHarness.Handle worker;
     private DistributedQueryRunner runner;
     private Session session;
 
+    /** Starts the real fixture worker this transport's subclass tests, and returns its {@code vgi.location}. */
+    abstract VgiWorkerHarness.Handle startWorker() throws Exception;
+
     @BeforeAll
     void start() throws Exception {
-        File vgiPython = new File(System.getProperty("user.home"), "Development/vgi-python");
-        Assumptions.assumeTrue(vgiPython.isDirectory(),
+        Assumptions.assumeTrue(VGI_PYTHON.isDirectory(),
                 "~/Development/vgi-python not present — skipping sqllogictest conformance run");
+        worker = startWorker();
 
         session = TestingSession.testSessionBuilder()
                 .setCatalog(TRINO_CATALOG)
@@ -80,14 +93,15 @@ final class VgiSqlLogicTestConformanceTest {
         runner = DistributedQueryRunner.builder(session).setWorkerCount(1).build();
         runner.installPlugin(new VgiPlugin());
         runner.createCatalog(TRINO_CATALOG, VgiConnectorFactory.NAME, Map.of(
-                "vgi.location", "uv run --project " + vgiPython.getAbsolutePath() + " vgi-fixture-worker",
+                "vgi.location", worker.location(),
                 "vgi.catalog-name", VGI_CATALOG_NAME,
                 "vgi.connections", "2"));
     }
 
     @AfterAll
-    void stop() {
+    void stop() throws Exception {
         if (runner != null) runner.close();
+        if (worker != null) worker.teardown().close();
     }
 
     /**

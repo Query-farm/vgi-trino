@@ -100,6 +100,23 @@ listOf(configurations.runtimeClasspath, configurations.testRuntimeClasspath).for
 // a plugin that needs any Jackson functionality has to bring a complete,
 // version-consistent copy, which is exactly what the version-forcing above
 // and this jackson-module-blackbird dependency provide.
+// Fresh JVM per test class. Discovered empirically: several conformance
+// classes each open a real pooled connection (16 pooled connections × 2
+// catalogs for the splits suite, real subprocess/socket workers for every
+// transport) via VgiWorkerClient's own cached thread pool, and running many
+// such classes back-to-back in ONE JVM (Gradle's default) accumulates enough
+// OS-level socket/thread pressure that a LATER class occasionally sees a
+// pooled connection's channel close out from under it — reproduced across
+// two full-suite runs, in two different transport classes, never once in 5
+// isolated re-runs of the exact same failing test. Not a connector bug (see
+// the conformance test classes' own javadoc for what each transport
+// exercises) — an artifact of this suite's own resource footprint. forkEvery
+// trades a little startup overhead per class for the isolation that removes
+// the accumulation entirely.
+tasks.test {
+    forkEvery = 1
+}
+
 tasks.register<Copy>("assemblePluginDir") {
     group = "distribution"
     description = "Assemble the connector into build/plugin/vgi/, the layout Trino's plugin loader expects."

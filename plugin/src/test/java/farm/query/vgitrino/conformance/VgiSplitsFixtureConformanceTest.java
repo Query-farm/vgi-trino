@@ -4,6 +4,7 @@ package farm.query.vgitrino.conformance;
 
 import farm.query.vgitrino.VgiConnectorFactory;
 import farm.query.vgitrino.VgiPlugin;
+import farm.query.vgitrino.testing.VgiWorkerHarness;
 import io.trino.Session;
 import io.trino.testing.DistributedQueryRunner;
 import io.trino.testing.MaterializedResult;
@@ -41,6 +42,13 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
  * and EXPECTED VALUES below are transcribed from the real files, not
  * reinvented — see each method's javadoc for which file it ports and what
  * (if anything) was intentionally dropped.
+ *
+ * <p>Abstract: {@link #startWorker} is the one thing that varies per
+ * transport — {@link #startWorker}'s concrete subclasses (one per transport
+ * {@link VgiWorkerHarness} supports) each start the real fixture worker their
+ * own way and hand back a {@code vgi.location}; every {@code @Test} method
+ * below is inherited unchanged and runs against whichever transport the
+ * concrete subclass under execution actually started.
  *
  * <h2>Files NOT ported, and why</h2>
  * <ul>
@@ -86,21 +94,27 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
  * </ul>
  */
 @TestInstance(TestInstance.Lifecycle.PER_CLASS)
-final class VgiSplitsFixtureConformanceTest {
+abstract class VgiSplitsFixtureConformanceTest {
+
+    static final File VGI_PYTHON = new File(System.getProperty("user.home"), "Development/vgi-python");
 
     private static final String CATALOG = "vgi_splits";
     private static final String PAGED_CATALOG = "vgi_splits_paged";
 
+    private VgiWorkerHarness.Handle worker;
     private DistributedQueryRunner runner;
     private Session session;
     private Session pagedSession;
 
+    /** Starts the real fixture worker this transport's subclass tests, and returns its {@code vgi.location}. */
+    abstract VgiWorkerHarness.Handle startWorker() throws Exception;
+
     @BeforeAll
     void start() throws Exception {
-        File vgiPython = new File(System.getProperty("user.home"), "Development/vgi-python");
-        Assumptions.assumeTrue(vgiPython.isDirectory(),
+        Assumptions.assumeTrue(VGI_PYTHON.isDirectory(),
                 "~/Development/vgi-python not present — skipping splits fixture conformance run");
-        String location = "uv run --project " + vgiPython.getAbsolutePath() + " vgi-fixture-worker";
+        worker = startWorker();
+        String location = worker.location();
 
         session = TestingSession.testSessionBuilder().setCatalog(CATALOG).setSchema("main").build();
         pagedSession = TestingSession.testSessionBuilder().setCatalog(PAGED_CATALOG).setSchema("main").build();
@@ -122,8 +136,9 @@ final class VgiSplitsFixtureConformanceTest {
     }
 
     @AfterAll
-    void stop() {
+    void stop() throws Exception {
         if (runner != null) runner.close();
+        if (worker != null) worker.teardown().close();
     }
 
     private long scalarLong(Session s, String sql) {

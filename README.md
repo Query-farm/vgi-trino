@@ -283,6 +283,20 @@ spawned per connection): a plain table scan, a filtered scan, a `TABLE(...)`
 call, and a self-join proving multiple pooled connections all independently
 attach successfully.
 
+**Conformance coverage across transports.** The ported sqllogictest-derived
+suites (`VgiSqlLogicTestConformanceTest`, `VgiSplitsFixtureConformanceTest`)
+run their same assertions over all four transports above —
+`VgiWorkerHarness` starts the real reference worker each transport's way
+(subprocess unchanged; `unix://`/`tcp://` spawn it directly and block-read
+its `UNIX:`/`TCP:` stdout discovery line; `http://` reuses the port-file
+pattern) and four thin subclasses per suite supply it via one `startWorker()`
+hook, so the same ~15 assertions per suite run for real over every transport
+rather than only subprocess. `unix://`/`tcp://`'s pooled 16-connection
+catalogs are, by construction, the first exercise anywhere in this test tree
+of one real worker process serving many concurrent pooled clients — proven
+sound, not merely assumed. `launch:` (the shared-warm-worker transport) has
+no coverage here because it isn't implemented — see Scope.
+
 ### Type mapping
 
 `VgiTypeMapping` covers what VGI's own type helpers and most declarative
@@ -495,6 +509,9 @@ the same boundary on static predicate pushdown).
   attach-options mechanism) has no way to receive any from this connector
   today. `vgi.catalog-name` is the only per-attach parameter this connector
   threads through.
+- **`launch:` transport** (the shared-warm-worker/launcher protocol) — not implemented; `openTransport`
+  doesn't recognize the scheme at all. A from-scratch implementation (canonical-JSON tuple hashing,
+  `flock(2)`-based coordination, spawn-if-needed discovery) belongs in `vgi-rpc-java`, not here.
 - **Per-query settings and secrets.** `table_function_plan`/`init()` always
   send `null`/`false` for `settings`/`secrets`/`resolved_secrets_provided` —
   settings-aware and secret-scoped worker functions have no path to receive
