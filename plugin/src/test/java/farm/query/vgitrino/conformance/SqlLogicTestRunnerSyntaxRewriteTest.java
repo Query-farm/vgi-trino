@@ -110,6 +110,33 @@ final class SqlLogicTestRunnerSyntaxRewriteTest {
     }
 
     @Test
+    void insertsTheDefaultSchemaForATwoPartFunctionCall() {
+        assertEquals(
+                "SELECT vgi_example.main.double(3)",
+                SqlLogicTestRunner.rewriteDuckDbOnlySyntax("SELECT vgi_example.double(3)", CATALOG));
+    }
+
+    @Test
+    void leavesAnAlreadyThreePartCallAlone() {
+        String sql = "SELECT vgi_example.main.double(3)";
+        assertEquals(sql, SqlLogicTestRunner.rewriteDuckDbOnlySyntax(sql, CATALOG));
+    }
+
+    @Test
+    void insertsTheDefaultSchemaInsideAnAggregateCallTooNotJustAfterFrom() {
+        assertEquals(
+                "SELECT sum(vgi_example.main.double(v)) FROM t",
+                SqlLogicTestRunner.rewriteDuckDbOnlySyntax("SELECT sum(vgi_example.double(v)) FROM t", CATALOG));
+    }
+
+    @Test
+    void doesNotTouchATwoPartReferenceWithNoFollowingParen() {
+        // Not a function call at all — out of scope (see insertDefaultSchema's own javadoc).
+        String sql = "SELECT vgi_example.somecolumn FROM t";
+        assertEquals(sql, SqlLogicTestRunner.rewriteDuckDbOnlySyntax(sql, CATALOG));
+    }
+
+    @Test
     void leavesAThreeArgRangeCallAlone() {
         // Not observed in the real corpus, and the explicit-step arithmetic is genuinely harder
         // to get right (DuckDB's step-aware exclusive-stop boundary isn't just "stop - step" in

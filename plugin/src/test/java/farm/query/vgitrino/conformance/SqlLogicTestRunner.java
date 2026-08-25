@@ -146,6 +146,14 @@ final class SqlLogicTestRunner {
      *       range} is exclusive-stop, like Python's; Trino's {@code sequence} is inclusive-stop
      *       and, worse, silently auto-detects ascending-vs-descending when no step is given —
      *       both need correcting, not just the call syntax).</li>
+     *   <li>A VGI function called with only {@code catalog.function(args)} (two dotted parts) —
+     *       DuckDB resolves a function by name against its own search path with no schema
+     *       qualification required; Trino always needs the full {@code catalog.schema.function}
+     *       (three parts) to reach a connector-defined function at all, or the call fails with
+     *       {@code Function 'catalog.function' not registered} rather than a parse error (a real,
+     *       common failure mode found by sampling the census's {@code UNSUPPORTED} bucket — {@code
+     *       example.double(...)}, {@code example.sum_values(...)}, and others). See {@link
+     *       #insertDefaultSchema} for the {@code DEFAULT_SCHEMA} assumption this rewrite makes.</li>
      * </ul>
      *
      * <p>This is a best-effort textual rewrite, not a SQL parser: it only recognizes a table
@@ -157,9 +165,65 @@ final class SqlLogicTestRunner {
      * robustly.
      */
     static String rewriteDuckDbOnlySyntax(String sql, String trinoCatalog) {
-        String rewritten = wrapBareTableFunctionCalls(sql, trinoCatalog);
+        String rewritten = insertDefaultSchema(sql, trinoCatalog);
+        rewritten = wrapBareTableFunctionCalls(rewritten, trinoCatalog);
         rewritten = rewriteRangeCalls(rewritten);
         return rewritten.replace(":=", "=>");
+    }
+
+    /**
+     * Every real fixture function this harness exercises lives in the {@code main} schema —
+     * confirmed by every three-part call already in the corpus ({@code example.main.multiply(...)},
+     * etc.); a two-part {@code catalog.function(args)} call is DuckDB relying on its own
+     * schema-less resolution against exactly that same fixture worker, so inserting {@code main}
+     * unconditionally (rather than trying to discover the "real" schema per function) is the
+     * correct fix for THIS harness's one fixture worker, not a generally-safe assumption a
+     * different corpus/worker could reuse as-is.
+     *
+     * <p>Runs first, before the other rewrites, so a two-part call used as a table reference
+     * (e.g. {@code FROM catalog.function(args)}) is already three-part by the time {@link
+     * #wrapBareTableFunctionCalls} looks for one immediately after {@code FROM}/{@code JOIN}.
+     */
+    private static final String DEFAULT_SCHEMA = "main";
+
+    private static String insertDefaultSchema(String sql, String trinoCatalog) {
+        StringBuilder out = new StringBuilder();
+        String prefix = trinoCatalog + ".";
+        int i = 0;
+        int n = sql.length();
+        boolean inString = false;
+        while (i < n) {
+            char c = sql.charAt(i);
+            if (inString) {
+                out.append(c);
+                if (c == '\'') {
+                    if (i + 1 < n && sql.charAt(i + 1) == '\'') { out.append(sql.charAt(i + 1)); i += 2; continue; }
+                    inString = false;
+                }
+                i++;
+                continue;
+            }
+            if (c == '\'') { inString = true; out.append(c); i++; continue; }
+
+            if (sql.startsWith(prefix, i) && (i == 0 || !isIdentChar(sql.charAt(i - 1)))) {
+                int identStart = i + prefix.length();
+                int p = identStart;
+                while (p < n && isIdentChar(sql.charAt(p))) p++;
+                if (p > identStart && p < n && sql.charAt(p) == '(') {
+                    // catalog.ident( with no schema segment in between — a two-part function call.
+                    out.append(prefix).append(DEFAULT_SCHEMA).append('.').append(sql, identStart, p);
+                    i = p;
+                    continue;
+                }
+                // Either not a call at all (no following '(') or already three-part
+                // (catalog.schema.ident...) — fall through and copy character-by-character; the
+                // next iteration re-attempts the match one position later, which naturally never
+                // re-matches inside an already-qualified reference.
+            }
+            out.append(c);
+            i++;
+        }
+        return out.toString();
     }
 
     /**
