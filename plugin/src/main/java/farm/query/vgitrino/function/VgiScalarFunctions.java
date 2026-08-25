@@ -19,6 +19,7 @@ import farm.query.vgirpc.wire.Allocators;
 import farm.query.vgitrino.client.VgiWorkerClient;
 import farm.query.vgitrino.types.ArrowSchemaCodec;
 import farm.query.vgitrino.types.VgiTypeMapping;
+import io.airlift.log.Logger;
 import io.trino.spi.function.FunctionId;
 import io.trino.spi.function.FunctionMetadata;
 import io.trino.spi.function.Signature;
@@ -74,12 +75,16 @@ import static io.trino.spi.type.TypeTemplates.typeVariable;
  * <h2>Deferred, named explicitly (see the README's "Scalar functions" section)</h2>
  *
  * <ul>
- *   <li>{@code Struct}/{@code List}/{@code FixedSizeList} arguments/return
- *       ({@code geo_*}, {@code binary_packet}) — {@link VgiTypeMapping} covers
- *       core types only in the Trino -> Arrow direction.</li>
- *   <li>Varargs ({@code sum_values}, {@code concat_values}) — a real, separate
- *       marshaling design, skipped at discovery.</li>
- *   <li>Settings/secrets/auth-context arguments — skipped at discovery.</li>
+ *   <li>{@code Struct}/{@code List}/{@code FixedSizeList} arguments and return values ARE
+ *       supported ({@code geo_*}, {@code binary_packet}), recursively, in both directions —
+ *       {@link VgiTypeMapping#toArrowField(Type, String, Field)}'s {@code hint} parameter is what
+ *       lets a {@code FixedSizeList} argument's exact width survive round-tripping through
+ *       Trino's width-erasing {@code ArrayType}. Varargs ARE supported too ({@code sum_values},
+ *       {@code concat_values} are excluded only because their return type is separately dynamic —
+ *       see below — not because of their varargs shape; {@code geo_centroid_struct} combines
+ *       varargs with struct arguments and a struct return).</li>
+ *   <li>Settings/secrets/auth-context arguments — skipped at discovery. See the README's own
+ *       design note on how these could map onto Trino session properties / extra credentials.</li>
  *   <li>A dynamic (bind-time-computed) return type — VGI's {@code on_bind}
  *       can compute a NEW output type from the argument's actual type (e.g.
  *       {@code double}'s int8 -> int64 promotion); Trino resolves a function's
@@ -88,15 +93,27 @@ import static io.trino.spi.type.TypeTemplates.typeVariable;
  *       discovery (detected via the {@code vgi:any} output-field metadata
  *       {@code ScalarFunction.catalog_output_schema} emits for it — note the
  *       colon, a different key than the argument-side {@code vgi_type=any}).
+ *       This is a real ceiling of Trino's function-resolution model, not a
+ *       scope choice.
  *       An {@code any}-typed ARGUMENT with a static, concrete return type
  *       (e.g. {@code any_mixed}) is fully supported via {@code
  *       Signature.typeVariable} — each such argument gets its own independent
  *       type variable; this class does not attempt to unify one with the
  *       return type, since the one fixture needing that ({@code double}) is
  *       exactly the dynamic-return case above and is already excluded.</li>
+ *   <li>A colliding overload set (two VGI overloads whose Arrow argument types both map onto the
+ *       identical Trino {@link Signature} — Trino has no unsigned integer type, so e.g. {@code
+ *       int64} and {@code uint64} overloads of the same name collide on {@code BIGINT}) is
+ *       pruned to one registration, preferring a lossless Arrow -> Trino mapping over a lossy one
+ *       — see {@link #discover}'s own comment. Also a ceiling, not a scope choice.</li>
  * </ul>
+ *
+ * <p>Every discovery-time skip and overload-collision decision logs a {@code WARN} — nothing here
+ * silently drops a function or silently prefers one overload over another with no visible trace.</p>
  */
 public final class VgiScalarFunctions {
+
+    private static final Logger LOG = Logger.get(VgiScalarFunctions.class);
 
     private VgiScalarFunctions() {}
 
@@ -112,13 +129,26 @@ public final class VgiScalarFunctions {
      *        is skipped at discovery, see {@link #tryBuildEntry}); consumes every resolved
      *        argument position from here to the end of a specific call site's bound arity (see
      *        {@link #effectiveArgs})
+     * @param arrowHint this argument's original discovery-time Arrow field, or {@code null} for
+     *        an {@code any}-typed argument (whose concrete type is only known at a specific call
+     *        site, via {@code BoundSignature}, with no discovery-time Arrow shape to hint from).
+     *        Threaded through to {@link VgiTypeMapping#toArrowField(Type, String, Field)} so a
+     *        {@code FixedSizeList} argument's exact width survives round-tripping through
+     *        Trino's width-erasing {@code ArrayType} — see that method's own javadoc.
      */
     record ScalarArg(String name, boolean positional, boolean constArg, boolean anyType,
-            Type concreteType, String typeVarName, boolean varargs) {}
+            Type concreteType, String typeVarName, boolean varargs, Field arrowHint) {}
 
-    /** One registered overload: static discovery-time info plus the Trino {@link FunctionMetadata}. */
+    /**
+     * One registered overload: static discovery-time info plus the Trino {@link FunctionMetadata}.
+     *
+     * @param losslessMapping whether every argument's and the return's Arrow -> Trino mapping is
+     *        exact (no representable value is lost) — used only to break a same-Trino-{@code
+     *        Signature} overload collision in favor of the more faithful registration; see
+     *        {@link #discover}
+     */
     record Entry(FunctionId functionId, String schemaName, String functionName,
-            FunctionMetadata metadata, List<ScalarArg> args, Type declaredReturnType) {}
+            FunctionMetadata metadata, List<ScalarArg> args, Type declaredReturnType, boolean losslessMapping) {}
 
     /**
      * Every VGI scalar function this connector can support, discovered once at
@@ -186,19 +216,46 @@ public final class VgiScalarFunctions {
                 for (byte[] item : functions.items()) {
                     FunctionInfo info = RecordCodec.deserializeFromBytes(item, FunctionInfo.class);
                     Entry entry = tryBuildEntry(schemaName, info, overloadCounters);
-                    if (entry == null) continue; // unsupported shape — see class javadoc
+                    if (entry == null) continue; // unsupported shape — see class javadoc, and the WARN already logged
                     List<Entry> overloads = byName.computeIfAbsent(nameKey(schemaName, info.name()), k -> new ArrayList<>());
                     // VGI's own Arrow type system can distinguish two overloads (e.g. int64 vs.
                     // uint32/uint64, all of which VgiTypeMapping widens to BIGINT — VarcharType has
                     // no unsigned counterpart) that collapse onto the IDENTICAL Trino Signature.
                     // Registering both would make every call ambiguous ("Could not choose a best
                     // candidate operator") — confirmed against the real fixture's 5-way `type_info`
-                    // overload set, three of whose signatures collide this way. Keep the
-                    // first-discovered overload per distinct Signature; a colliding later one is
-                    // simply unreachable from Trino, not silently wrong.
-                    boolean collides = overloads.stream()
-                            .anyMatch(existing -> existing.metadata().getSignature().equals(entry.metadata().getSignature()));
-                    if (collides) continue;
+                    // overload set, three of whose signatures collide this way. Only one can ever be
+                    // registered; prefer whichever mapping is LOSSLESS (an exact Arrow<->Trino value
+                    // round trip) over one that could silently misrepresent a value (e.g. an unsigned
+                    // 64-bit argument above Long.MAX_VALUE, widened onto signed BIGINT) — this is
+                    // "Trino intelligence" about the collision, not an arbitrary discovery-order
+                    // pick. Between two equally (non-)lossless candidates, the first discovered wins,
+                    // for a stable, deterministic result.
+                    Entry colliding = overloads.stream()
+                            .filter(existing -> existing.metadata().getSignature().equals(entry.metadata().getSignature()))
+                            .findFirst().orElse(null);
+                    if (colliding != null) {
+                        if (entry.losslessMapping() && !colliding.losslessMapping()) {
+                            overloads.remove(colliding);
+                            byId.remove(colliding.functionId());
+                            overloads.add(entry);
+                            byId.put(entry.functionId(), entry);
+                            LOG.warn("VGI scalar function %s.%s: overload %s and %s collapse to the identical "
+                                            + "Trino signature %s (Trino cannot distinguish them) — keeping %s, "
+                                            + "the LOSSLESS Arrow -> Trino mapping, over %s, which can silently "
+                                            + "misrepresent a value",
+                                    schemaName, info.name(), colliding.functionId(), entry.functionId(),
+                                    entry.metadata().getSignature(), entry.functionId(), colliding.functionId());
+                        } else {
+                            LOG.warn("VGI scalar function %s.%s: overload %s collapses to the identical Trino "
+                                            + "signature %s as already-registered %s (Trino cannot distinguish "
+                                            + "them) — skipping it; %s",
+                                    schemaName, info.name(), entry.functionId(), entry.metadata().getSignature(),
+                                    colliding.functionId(), colliding.losslessMapping()
+                                            ? "the registered one is already a lossless mapping"
+                                            : "both are lossy Arrow -> Trino mappings; keeping the one discovered first");
+                        }
+                        continue;
+                    }
                     overloads.add(entry);
                     byId.put(entry.functionId(), entry);
                 }
@@ -208,12 +265,13 @@ public final class VgiScalarFunctions {
     }
 
     private static Entry tryBuildEntry(String schemaName, FunctionInfo info, Map<String, Integer> overloadCounters) {
+        String context = schemaName + "." + info.name();
         Schema argsSchema = ArrowSchemaCodec.deserializeSchema(info.arguments());
         List<ScalarArg> args = new ArrayList<>();
         int anyIndex = 0;
         for (Field field : argsSchema == null ? List.<Field>of() : argsSchema.getFields()) {
-            ScalarArg arg = decodeScalarArg(field, anyIndex);
-            if (arg == null) return null; // table-typed / const-vararg / unsupported concrete type
+            ScalarArg arg = decodeScalarArg(context, field, anyIndex);
+            if (arg == null) return null; // reason already logged by decodeScalarArg
             if (arg.anyType()) anyIndex++;
             args.add(arg);
         }
@@ -221,20 +279,35 @@ public final class VgiScalarFunctions {
         // declared argument type repeats," which has no representation for a vararg group
         // followed by more fixed arguments.
         for (int i = 0; i < args.size() - 1; i++) {
-            if (args.get(i).varargs()) return null;
+            if (args.get(i).varargs()) {
+                LOG.warn("VGI scalar function %s: skipping registration — argument '%s' is vgi_varargs but "
+                                + "isn't the LAST argument; Trino's variable-arity signature only supports a "
+                                + "repeating trailing argument", context, args.get(i).name());
+                return null;
+            }
         }
 
         Schema outSchema = ArrowSchemaCodec.deserializeSchema(info.output_schema());
-        if (outSchema == null || outSchema.getFields().size() != 1) return null;
+        if (outSchema == null || outSchema.getFields().size() != 1) {
+            LOG.warn("VGI scalar function %s: skipping registration — expected exactly one output column, got %s",
+                    context, outSchema == null ? "none" : outSchema.getFields().size());
+            return null;
+        }
         Field outField = outSchema.getFields().get(0);
         Map<String, String> outMeta = outField.getMetadata();
         boolean dynamicReturn = (outMeta != null && "true".equals(outMeta.get("vgi:any")))
                 || outField.getType().getTypeID() == ArrowType.ArrowTypeID.Null;
-        if (dynamicReturn) return null; // bind-time-computed return type — see class javadoc
+        if (dynamicReturn) {
+            LOG.warn("VGI scalar function %s: skipping registration — its return type is computed dynamically "
+                            + "at bind time (on_bind), which has no Trino representation (a function's return "
+                            + "type is resolved from its static Signature before any RPC happens)", context);
+            return null;
+        }
         Type returnType;
         try {
             returnType = VgiTypeMapping.toTrinoType(outField);
         } catch (UnsupportedOperationException e) {
+            LOG.warn(e, "VGI scalar function %s: skipping registration — unsupported return type", context);
             return null;
         }
 
@@ -268,30 +341,61 @@ public final class VgiScalarFunctions {
         }
         FunctionMetadata metadata = metadataBuilder.build();
 
-        return new Entry(functionId, schemaName, info.name(), metadata, args, returnType);
+        boolean losslessMapping = args.stream().allMatch(a -> isLosslessMapping(a.arrowHint()))
+                && isLosslessMapping(outField);
+        return new Entry(functionId, schemaName, info.name(), metadata, args, returnType, losslessMapping);
     }
 
-    private static ScalarArg decodeScalarArg(Field field, int anyIndex) {
+    /**
+     * Whether {@code field}'s Arrow type maps to its resolved Trino type with no possible loss
+     * of a representable value. The one known lossy case in {@link VgiTypeMapping#toTrinoType}:
+     * an unsigned 64-bit integer widens to (signed) {@code BIGINT}, which cannot represent a
+     * value above {@code Long.MAX_VALUE} without wrapping negative. Used only to prefer one
+     * overload over another when both collapse to the same Trino {@link Signature} — see
+     * {@link #discover}.
+     *
+     * @param field the argument/return's discovery-time Arrow field, or {@code null} for an
+     *        {@code any}-typed argument (no concrete Arrow type to lose fidelity from)
+     */
+    private static boolean isLosslessMapping(Field field) {
+        if (field == null) return true;
+        if (field.getType() instanceof ArrowType.Int i) {
+            return i.getBitWidth() != 64 || i.getIsSigned();
+        }
+        return true;
+    }
+
+    private static ScalarArg decodeScalarArg(String context, Field field, int anyIndex) {
         Map<String, String> metadata = field.getMetadata();
         String vgiType = metadata == null ? null : metadata.get("vgi_type");
-        if ("table".equals(vgiType)) return null; // not a scalar argument at all
+        if ("table".equals(vgiType)) {
+            LOG.warn("VGI scalar function %s: skipping registration — argument '%s' is TABLE-typed, "
+                    + "not a scalar argument", context, field.getName());
+            return null;
+        }
         boolean positional = metadata == null || !"named".equals(metadata.get("vgi_arg"));
         boolean constArg = metadata != null && "true".equals(metadata.get("vgi_const"));
         boolean varargs = metadata != null && "true".equals(metadata.get("vgi_varargs"));
         // A constant vararg has no real fixture and no clear wire meaning (ArgumentsEncoder's
         // bind-time constants and a varargs row-column group are two different channels) —
         // skip rather than guess.
-        if (varargs && constArg) return null;
+        if (varargs && constArg) {
+            LOG.warn("VGI scalar function %s: skipping registration — argument '%s' is both vgi_const and "
+                    + "vgi_varargs, a combination with no clear wire meaning", context, field.getName());
+            return null;
+        }
         if ("any".equals(vgiType)) {
-            return new ScalarArg(field.getName(), positional, constArg, true, null, "T" + anyIndex, varargs);
+            return new ScalarArg(field.getName(), positional, constArg, true, null, "T" + anyIndex, varargs, null);
         }
         Type type;
         try {
             type = VgiTypeMapping.toTrinoType(field);
         } catch (UnsupportedOperationException e) {
-            return null; // unsupported concrete type — see class javadoc
+            LOG.warn(e, "VGI scalar function %s: skipping registration — unsupported type for argument '%s'",
+                    context, field.getName());
+            return null;
         }
-        return new ScalarArg(field.getName(), positional, constArg, false, type, null, varargs);
+        return new ScalarArg(field.getName(), positional, constArg, false, type, null, varargs, field);
     }
 
     // ------------------------------------------------------------------
@@ -341,7 +445,7 @@ public final class VgiScalarFunctions {
                 constIdx.add(i);
             } else {
                 rowIdx.add(i);
-                rowFields.add(VgiTypeMapping.toArrowField(argumentTypes.get(i), spec.name()));
+                rowFields.add(VgiTypeMapping.toArrowField(argumentTypes.get(i), spec.name(), spec.arrowHint()));
             }
         }
         return new CallConfig(entry, argumentTypes, returnType, new Schema(rowFields),
@@ -364,7 +468,7 @@ public final class VgiScalarFunctions {
         for (int i = 0; i < repeatCount; i++) {
             effective.add(new ScalarArg(varargSpec.name() + "_" + i, varargSpec.positional(),
                     varargSpec.constArg(), varargSpec.anyType(), varargSpec.concreteType(),
-                    varargSpec.typeVarName(), true));
+                    varargSpec.typeVarName(), true, varargSpec.arrowHint()));
         }
         return effective;
     }

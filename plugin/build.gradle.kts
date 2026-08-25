@@ -10,6 +10,13 @@ dependencies {
     // (see the packaging task, Phase 7).
     compileOnly("io.trino:trino-spi:$trinoVersion")
 
+    // io.airlift.log.Logger — like trino-spi, Trino serves this from its own shared
+    // classloader (every real Trino connector logs through it), so it's compileOnly here
+    // too rather than bundled; version pinned to what trino-main:$trinoVersion itself
+    // resolves (confirmed via `./gradlew :plugin:dependencies`), matching the Jackson/
+    // Netty version-pinning already done below for the same shared-classloader reason.
+    compileOnly("io.airlift:log:439")
+
     // farm.query:vgi is the VGI client SDK: RpcConnection.proxy(VgiService.class),
     // the protocol records, and the client.* pushdown/projection encoders. Built
     // from source via the composite build in ../settings.gradle.kts so this

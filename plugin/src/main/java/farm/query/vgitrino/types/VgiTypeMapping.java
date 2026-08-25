@@ -220,14 +220,18 @@ public final class VgiTypeMapping {
 
     // ------------------------------------------------------------------
     // Trino -> Arrow: scalar-function arguments/return only (VgiScalarFunctions).
-    // Same core-type coverage as toTrinoType's reverse direction — Struct/List/
-    // FixedSizeList are out of scope here too (see the class javadoc).
+    // Same core-type coverage as toTrinoType's reverse direction.
     // ------------------------------------------------------------------
 
     /**
      * Map one Trino {@link Type} to the Arrow field VGI expects for it — the
      * write-side mirror of {@link #toTrinoType}, for a scalar function's
      * per-row {@code input_schema} or bind-time constant argument.
+     *
+     * <p>Equivalent to {@link #toArrowField(Type, String, Field)} with no hint
+     * — an {@link ArrayType} always maps to an Arrow {@code List} without one
+     * (see that method's own javadoc for why a hint can produce a
+     * {@code FixedSizeList} instead).
      *
      * @param type the Trino type (one of {@link #toTrinoType}'s core-covered types)
      * @param name the field name
@@ -236,6 +240,38 @@ public final class VgiTypeMapping {
      *         here (see the class javadoc)
      */
     public static Field toArrowField(Type type, String name) {
+        return toArrowField(type, name, null);
+    }
+
+    /**
+     * Map one Trino {@link Type} to the Arrow field VGI expects for it, using
+     * {@code hint} — the argument's ORIGINAL discovery-time Arrow field (from
+     * {@code FunctionInfo.arguments}), when the caller has one — to decide an
+     * {@link ArrayType}'s shape.
+     *
+     * <p>Trino's {@code ArrayType} carries no fixed-length information of its
+     * own, so without a hint this always produces an Arrow {@code List}. A
+     * worker that declared the argument as a {@code FixedSizeList} (e.g. the
+     * reference fixture's {@code geo_distance_fixed}/{@code geo_centroid_fixed},
+     * whose points are {@code list_(float64, 2)}) may validate the incoming
+     * batch's column shape strictly enough to reject a plain {@code List} in
+     * its place — passing the discovery-time field back here as {@code hint}
+     * reproduces the exact {@code FixedSizeList} width instead. Recurses into
+     * struct fields and list elements with their own corresponding child hint,
+     * so a {@code FixedSizeList} nested inside a struct field (or another
+     * list) still gets its width preserved.
+     *
+     * @param type the Trino type (one of {@link #toTrinoType}'s core-covered types)
+     * @param name the field name
+     * @param hint the original Arrow field this argument was discovered with,
+     *        or {@code null} when there isn't one (a bind-time constant, or an
+     *        {@code any}-typed argument, whose concrete type is only known at
+     *        this specific call site)
+     * @return a nullable Arrow field of the corresponding type
+     * @throws UnsupportedOperationException if {@code type} has no mapping
+     *         here (see the class javadoc)
+     */
+    public static Field toArrowField(Type type, String name, Field hint) {
         return switch (type) {
             case BooleanType t -> primitiveField(name, new ArrowType.Bool());
             case TinyintType t -> primitiveField(name, new ArrowType.Int(8, true));
@@ -249,19 +285,23 @@ public final class VgiTypeMapping {
             case DateType t -> primitiveField(name, new ArrowType.Date(org.apache.arrow.vector.types.DateUnit.DAY));
             case TimestampType t -> primitiveField(name, new ArrowType.Timestamp(microTimeUnit(t.getPrecision()), null));
             case RowType t -> {
-                List<Field> children = new ArrayList<>(t.getFields().size());
-                int i = 0;
-                for (RowType.Field f : t.getFields()) {
-                    children.add(toArrowField(f.getType(), f.getName().orElse("field" + i)));
-                    i++;
+                List<Field> hintChildren = hint != null ? hint.getChildren() : List.<Field>of();
+                List<RowType.Field> fields = t.getFields();
+                List<Field> children = new ArrayList<>(fields.size());
+                for (int i = 0; i < fields.size(); i++) {
+                    RowType.Field f = fields.get(i);
+                    Field childHint = i < hintChildren.size() ? hintChildren.get(i) : null;
+                    children.add(toArrowField(f.getType(), f.getName().orElse("field" + i), childHint));
                 }
                 yield new Field(name, FieldType.nullable(new ArrowType.Struct()), children);
             }
-            // Always produces a Arrow List, never FixedSizeList — Trino's ArrayType carries no
-            // fixed-length information to produce one from (see the class javadoc).
             case ArrayType t -> {
-                Field elementField = toArrowField(t.getElementType(), "item");
-                yield new Field(name, FieldType.nullable(new ArrowType.List()), List.of(elementField));
+                Field elementHint = hint != null && !hint.getChildren().isEmpty() ? hint.getChildren().get(0) : null;
+                Field elementField = toArrowField(t.getElementType(), "item", elementHint);
+                ArrowType shape = hint != null && hint.getType().getTypeID() == ArrowType.ArrowTypeID.FixedSizeList
+                        ? new ArrowType.FixedSizeList(((ArrowType.FixedSizeList) hint.getType()).getListSize())
+                        : new ArrowType.List();
+                yield new Field(name, FieldType.nullable(shape), List.of(elementField));
             }
             // DECIMAL is deliberately NOT covered in this (Trino -> Arrow, scalar-
             // function) direction: Trino's BOXED_NULLABLE representation for a
@@ -327,6 +367,7 @@ public final class VgiTypeMapping {
             case TimeStampMicroVector v -> v.setSafe(row, (Long) value);
             case StructVector v -> writeNested(type, v, row, value);
             case ListVector v -> writeNested(type, v, row, value);
+            case FixedSizeListVector v -> writeNested(type, v, row, value);
             default -> throw new UnsupportedOperationException(
                     "no value writer for Arrow vector type " + vector.getClass().getSimpleName());
         }
@@ -461,6 +502,25 @@ public final class VgiTypeMapping {
                     writeValue(elementType, dataVector, startOffset + i, readBoxedValue(elementType, arrayBlock, i));
                 }
                 lv.endValue(row, count);
+                if (needed > dataVector.getValueCount()) dataVector.setValueCount(needed);
+            }
+            case FixedSizeListVector fl -> {
+                ArrayType arrayType = (ArrayType) type;
+                Type elementType = arrayType.getElementType();
+                Block arrayBlock = (Block) value;
+                int width = fl.getListSize();
+                if (arrayBlock.getPositionCount() != width) {
+                    throw new IllegalArgumentException("expected " + width
+                            + " elements for a fixed-size list argument, got " + arrayBlock.getPositionCount());
+                }
+                int startOffset = fl.startNewValue(row);
+                FieldVector dataVector = fl.getDataVector();
+                int needed = startOffset + width;
+                while (dataVector.getValueCapacity() < needed) dataVector.reAlloc();
+                for (int i = 0; i < width; i++) {
+                    writeValue(elementType, dataVector, startOffset + i, readBoxedValue(elementType, arrayBlock, i));
+                }
+                fl.setNotNull(row);
                 if (needed > dataVector.getValueCount()) dataVector.setValueCount(needed);
             }
             default -> throw new UnsupportedOperationException(

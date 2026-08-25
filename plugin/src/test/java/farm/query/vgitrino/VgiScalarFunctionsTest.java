@@ -131,6 +131,18 @@ final class VgiScalarFunctionsTest {
 
     @Test
     @Timeout(60)
+    void geoDistanceFixedWritesAFixedSizeListArgument() {
+        // geo_distance_fixed declares its point arguments as a 2-element FixedSizeList
+        // (pa.list_(pa.float64(), 2)) — this is the one real test of VgiTypeMapping building an
+        // Arrow FixedSizeList (not a plain List) from a Trino ARRAY(DOUBLE) argument, using the
+        // discovery-time field as a width hint.
+        Object result = scalar("SELECT vgi_example.main.geo_distance_fixed("
+                + "CAST(ARRAY[0.0, 0.0] AS ARRAY(DOUBLE)), CAST(ARRAY[3.0, 4.0] AS ARRAY(DOUBLE)))");
+        assertEquals(5.0, (Double) result, 0.0001);
+    }
+
+    @Test
+    @Timeout(60)
     void binaryPacketHandlesConstBinaryAndConstStructArguments() {
         Object result = scalar("SELECT vgi_example.main.binary_packet(X'CAFE', X'0102', "
                 + "CAST(ROW('v1', BIGINT '1') AS ROW(label VARCHAR, version BIGINT)))");
