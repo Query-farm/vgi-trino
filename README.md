@@ -58,29 +58,81 @@ fixture-worker test; the in-process split test needs nothing external):
 
 **Sqllogictest conformance** (`plugin/src/test/.../conformance/`): runs the
 *actual* `.test` files from `~/Development/vgi/test/sql/integration/` — parsed
-by a small in-repo sqllogictest reader, not hand-ported equivalents — with
-their `ATTACH` rewritten to this connector's catalog and their real expected
-output compared against a real query result. Only `table/rowid.test` is
-ported so far — 8 of its 16 records are portable declarative-table `SELECT`s;
-the rest are skipped with a reported reason (`DESCRIBE`, struct-typed rowid
-access needing `ROW` type support, the `rowid_sequence(...)` calls, which now
-that table functions exist could be ported too — using DuckDB's `:=` named-arg
-syntax rather than Trino's `=>`, so the harness's naive `example.` rewrite
-alone won't carry them over unmodified). Running the file against a real
-worker is exactly what caught a real bug: this connector was resolving a
-table's backing scan function in the table's OWN schema, but VGI doesn't
-guarantee that — the fixture's `data.rowid_first` scans via
-`main.rowid_sequence`, a different schema entirely — fixed by passing no
-schema hint and letting the worker's own dispatcher search by name, matching
-vgi-python's own schema-less `Client` fallback.
+by a small in-repo sqllogictest reader (`SqlLogicTestFile`/`SqlLogicTestRunner`),
+not hand-ported equivalents — with their `ATTACH` rewritten to this connector's
+catalog and their real expected output compared against a real query result.
+Two files are pinned with exact skip/executed-count assertions as a stable
+regression check (`table/rowid.test`, `catalog/window_self_join.test` —
+see `VgiSqlLogicTestConformanceTest`); `VgiSqlLogicTestCensusTest` is a
+looser, unasserted measurement pass across the *entire* 327-file corpus, run
+on demand (`./gradlew :plugin:test --tests
+"farm.query.vgitrino.conformance.VgiSqlLogicTestCensusTest"`) to see where
+things actually stand.
 
-Most of the wider 327-file suite still can't run against Trino verbatim: ~119
-files use DuckDB-only introspection (`duckdb_tables()`, `duckdb_databases()`,
-`CALL enable_logging`, DuckDB's own `EXPLAIN (FORMAT JSON)` shape) with no
-Trino equivalent, ever. The ~161 files using table-function CALL syntax are a
-different story now that `ConnectorTableFunction` support exists (see *Table
-functions* below) — porting those needs a DuckDB-`:=`-to-Trino-`=>` syntax
-translation this harness doesn't do yet, not new connector functionality.
+Before executing each record, `SqlLogicTestRunner` rewrites four DuckDB-only
+syntax forms into their Trino equivalents (in `rewriteDuckDbOnlySyntax`/
+`CastRewriter`) — none of these are new connector functionality, just making
+sure a parser failure means an actual gap rather than "the harness never
+translated the SQL":
+- A bare table-function call used as a table reference —
+  `schema.function(args)` — becomes Trino's required
+  `TABLE(schema.function(args))`.
+- DuckDB's `name := value` named-argument syntax becomes Trino's
+  `name => value`.
+- DuckDB's builtin row generators, `range(...)`/`generate_series(...)`, used
+  bare as a table reference, become Trino's `UNNEST(SEQUENCE(...))` idiom —
+  Trino has no `range()` table function of its own, and the translation needs
+  two corrections, not just a name change: DuckDB's `range` is exclusive of
+  its stop bound (Python semantics) where `sequence` is inclusive, and
+  Trino's 2-argument `sequence(start, stop)` silently auto-detects
+  ascending-vs-descending when no step is given (`sequence(1, 0)` returns the
+  descending `[1, 0]`, not zero rows) — so the rewrite always emits an
+  explicit step to disable that guessing.
+- DuckDB's `expr::TYPE` postfix cast syntax (Trino has no such operator at
+  all) becomes `CAST(expr AS TYPE)`. Unlike the other three, a cast can
+  appear anywhere in an expression, not just after a fixed keyword, and the
+  type name itself sometimes needs translating too (`BLOB` → `VARBINARY`,
+  `TIMESTAMPTZ` → `TIMESTAMP WITH TIME ZONE`) — hand-rolling that expression
+  grammar isn't worth it when a maintained SQL-dialect library already gets
+  it right, so `CastRewriter` shells out to Python's
+  [sqlglot](https://github.com/tobymao/sqlglot) for this one. It runs
+  *after* the other three rewrites, deliberately — sqlglot's own
+  `duckdb -> trino` rule for bare `range()` calls is confirmed buggy (it
+  drops the query's column alias and reuses the table alias as the column
+  name instead, turning `SELECT i FROM range(10) t(i)` into an unresolvable
+  column reference), so this harness never lets sqlglot see a bare `range()`
+  call — by the time it runs, `SqlLogicTestRunner` has already turned it into
+  `UNNEST(SEQUENCE(...))`, which sqlglot correctly leaves untouched. This is a
+  best-effort, optional dependency, not a hard one: if sqlglot isn't
+  available, `CastRewriter` falls back to unrewritten SQL (one warning, not a
+  failure) — install it into a dedicated venv (kept out of the system Python
+  deliberately, since Homebrew's Python refuses a bare `pip install` under
+  PEP 668) with:
+  ```bash
+  python3 -m venv ~/.venvs/vgitrino-sqlglot
+  ~/.venvs/vgitrino-sqlglot/bin/pip install sqlglot
+  ```
+
+Running the real files against a real worker is exactly what caught a real
+bug along the way: this connector was resolving a table's backing scan
+function in the table's OWN schema, but VGI doesn't guarantee that — the
+fixture's `data.rowid_first` scans via `main.rowid_sequence`, a different
+schema entirely — fixed by passing no schema hint and letting the worker's
+own dispatcher search by name, matching vgi-python's own schema-less `Client`
+fallback.
+
+As of this writing, the full-corpus census (327 files) reports 447 records
+executed, 1315 skipped as known-non-portable (DuckDB-only introspection —
+`duckdb_tables()`, `CALL enable_logging`, DuckDB's own `EXPLAIN (FORMAT
+JSON)` shape, `QUALIFY` — with no Trino equivalent at all), and 3712 still
+failing. Of those failures the overwhelming majority (~93%) are still
+`PARSE_ERROR` — DuckDB SQL surface neither this harness's textual rewrites
+nor sqlglot cover (further syntax differences beyond the four handled
+above, or DuckDB scalar-function aliases like `len()` vs Trino's `length()`)
+— with smaller, more directly actionable buckets for genuine query-result
+mismatches and unregistered functions/features (most visibly, aggregate
+functions like `vgi_sum`/`vgi_avg`/`vgi_count`, which this connector doesn't
+implement yet — see *Scope* below).
 
 **`splits/*.test` fixture conformance** (`VgiSplitsFixtureConformanceTest`):
 13 of the 20 files in that category hand-ported (not parsed — DuckDB's `:=`
@@ -689,6 +741,11 @@ the same boundary on static predicate pushdown).
   `TABLE(...)`-argument/batch-path question for scalar functions (an
   entirely separate design, not this connector's row-at-a-time dispatch)
   is also still undecided.
+- **Aggregate functions.** VGI workers can expose aggregates (`vgi_sum`,
+  `vgi_avg`, `vgi_count`, etc. — confirmed real and unimplemented via the
+  sqllogictest census's `aggregate/*.test` files), and Trino's SPI supports
+  connector-defined aggregates via `FunctionProvider.getAggregationImplementation`
+  — not wired up at all yet, independent of the scalar-function work above.
 - **Write support**, **multi-branch tables** (`catalog_table_scan_branches_get`),
   **transactions**, **views** — VGI supports all four; none are wired up here
   (write support matches vgi-java's own worker-SDK scope, which is read-only

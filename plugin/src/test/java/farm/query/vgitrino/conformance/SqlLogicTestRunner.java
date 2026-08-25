@@ -47,6 +47,12 @@ final class SqlLogicTestRunner {
         int skipped = 0;
         List<String> failures = new ArrayList<>();
 
+        // First pass: apply every rewrite EXCEPT the :: cast one, and collect the retained
+        // (non-skipped) records so their SQL can be cast-rewritten as one batch — sqlglot is a
+        // Python subprocess, and spawning one per record (rather than once per file) would be
+        // needlessly slow across a 327-file, ~5000-record corpus.
+        List<SqlLogicTestFile.Record> retainedRecords = new ArrayList<>();
+        List<String> preCastSql = new ArrayList<>();
         for (SqlLogicTestFile.Record record : records) {
             if (record.kind() != SqlLogicTestFile.Kind.QUERY
                     && record.kind() != SqlLogicTestFile.Kind.STATEMENT_OK
@@ -65,6 +71,15 @@ final class SqlLogicTestRunner {
             String trinoSql = sql.replace(vgiCatalogRef, trinoCatalog + ".").strip();
             trinoSql = trinoSql.endsWith(";") ? trinoSql.substring(0, trinoSql.length() - 1) : trinoSql;
             trinoSql = rewriteDuckDbOnlySyntax(trinoSql, trinoCatalog);
+            retainedRecords.add(record);
+            preCastSql.add(trinoSql);
+        }
+
+        List<String> castRewritten = CastRewriter.rewriteBatch(preCastSql);
+
+        for (int idx = 0; idx < retainedRecords.size(); idx++) {
+            SqlLogicTestFile.Record record = retainedRecords.get(idx);
+            String trinoSql = castRewritten.get(idx);
 
             try {
                 switch (record.kind()) {
@@ -124,6 +139,13 @@ final class SqlLogicTestRunner {
      *       substitution above) that aren't already wrapped in {@code TABLE(...)}.</li>
      *   <li>DuckDB's {@code name := value} named-argument syntax becomes Trino's {@code name =>
      *       value}.</li>
+     *   <li>DuckDB's builtin row-generator functions {@code range(...)} and {@code
+     *       generate_series(...)}, used bare as a table reference, become Trino's {@code
+     *       UNNEST(SEQUENCE(...))} idiom — Trino has no {@code range()} table function of its
+     *       own. See {@link #rewriteRangeCalls} for the arithmetic this needs (DuckDB's {@code
+     *       range} is exclusive-stop, like Python's; Trino's {@code sequence} is inclusive-stop
+     *       and, worse, silently auto-detects ascending-vs-descending when no step is given —
+     *       both need correcting, not just the call syntax).</li>
      * </ul>
      *
      * <p>This is a best-effort textual rewrite, not a SQL parser: it only recognizes a table
@@ -135,7 +157,120 @@ final class SqlLogicTestRunner {
      * robustly.
      */
     static String rewriteDuckDbOnlySyntax(String sql, String trinoCatalog) {
-        return wrapBareTableFunctionCalls(sql, trinoCatalog).replace(":=", "=>");
+        String rewritten = wrapBareTableFunctionCalls(sql, trinoCatalog);
+        rewritten = rewriteRangeCalls(rewritten);
+        return rewritten.replace(":=", "=>");
+    }
+
+    /**
+     * Rewrites a bare {@code range(...)}/{@code generate_series(...)} table reference into
+     * Trino's {@code UNNEST(SEQUENCE(...))}. Only the 0/1/2-argument forms are handled — the only
+     * ones the real corpus actually uses (confirmed by grepping it; no 3-argument, explicit-step
+     * call exists) — a 3-argument call is left untouched (still fails afterward, exactly as
+     * before this rewrite existed, not a regression).
+     *
+     * <p>Two arithmetic corrections are needed, not just a name/argument-order change:
+     * <ul>
+     *   <li>{@code range(stop)}/{@code range(start, stop)} are exclusive of {@code stop} (Python's
+     *       {@code range} semantics); {@code sequence(start, stop)} is inclusive of both bounds —
+     *       so the translated stop bound is {@code (stop) - 1}, parenthesized so it's correct even
+     *       when {@code stop} is itself an expression, not a literal.</li>
+     *   <li>Trino's 2-argument {@code sequence(start, stop)} auto-detects direction when no step
+     *       is given — {@code sequence(1, 0)} does NOT return zero rows, it returns the
+     *       descending {@code [1, 0]}. DuckDB's {@code range(1, 1)} (which the real corpus uses)
+     *       must return zero rows. Always emitting an explicit {@code step} of {@code 1} disables
+     *       that auto-direction guessing, so an empty range stays empty instead of silently
+     *       flipping direction.</li>
+     * </ul>
+     * {@code generate_series(start, stop)} needs neither correction — DuckDB's version is already
+     * inclusive-stop, matching {@code sequence} directly — but still gets the explicit step for
+     * the same auto-direction reason.
+     */
+    private static String rewriteRangeCalls(String sql) {
+        StringBuilder out = new StringBuilder();
+        int i = 0;
+        int n = sql.length();
+        while (i < n) {
+            int afterKeyword = matchKeyword(sql, i, "FROM");
+            if (afterKeyword < 0) afterKeyword = matchKeyword(sql, i, "JOIN");
+            if (afterKeyword < 0) {
+                out.append(sql.charAt(i));
+                i++;
+                continue;
+            }
+            out.append(sql, i, afterKeyword);
+            int j = afterKeyword;
+            while (j < n && Character.isWhitespace(sql.charAt(j))) j++;
+            out.append(sql, afterKeyword, j);
+            i = j;
+
+            String funcName;
+            int nameEnd;
+            int afterRange = matchKeyword(sql, i, "range");
+            int afterGenSeries = matchKeyword(sql, i, "generate_series");
+            if (afterRange >= 0) { funcName = "range"; nameEnd = afterRange; }
+            else if (afterGenSeries >= 0) { funcName = "generate_series"; nameEnd = afterGenSeries; }
+            else continue;
+
+            int p = nameEnd;
+            while (p < n && Character.isWhitespace(sql.charAt(p))) p++;
+            if (p >= n || sql.charAt(p) != '(') continue;
+
+            int closeParen = findMatchingParen(sql, p);
+            if (closeParen < 0) continue;
+
+            List<String> callArgs = splitTopLevelArgs(sql.substring(p + 1, closeParen));
+            String rewritten = toSequenceCall(funcName, callArgs);
+            if (rewritten == null) continue; // unsupported arity — leave the original text alone
+
+            out.append(rewritten);
+            i = closeParen + 1;
+        }
+        return out.toString();
+    }
+
+    /** Builds the {@code UNNEST(SEQUENCE(...))} replacement text, or null if this arity isn't handled. */
+    private static String toSequenceCall(String funcName, List<String> args) {
+        if (funcName.equals("generate_series")) {
+            return args.size() == 2
+                    ? "UNNEST(SEQUENCE(" + args.get(0) + ", " + args.get(1) + ", 1))"
+                    : null;
+        }
+        return switch (args.size()) {
+            case 1 -> "UNNEST(SEQUENCE(0, (" + args.get(0) + ") - 1, 1))";
+            case 2 -> "UNNEST(SEQUENCE(" + args.get(0) + ", (" + args.get(1) + ") - 1, 1))";
+            default -> null;
+        };
+    }
+
+    /** Splits a function call's argument text on top-level commas — depth-aware (nested parens
+     *  don't split) and quote-aware (a comma inside a {@code '...'} literal doesn't split either).
+     *  Returns an empty list for a blank/whitespace-only argument list (a zero-argument call). */
+    private static List<String> splitTopLevelArgs(String argsText) {
+        List<String> args = new ArrayList<>();
+        int depth = 0;
+        boolean inString = false;
+        int start = 0;
+        for (int k = 0; k < argsText.length(); k++) {
+            char c = argsText.charAt(k);
+            if (inString) {
+                if (c == '\'') {
+                    if (k + 1 < argsText.length() && argsText.charAt(k + 1) == '\'') { k++; continue; }
+                    inString = false;
+                }
+                continue;
+            }
+            if (c == '\'') { inString = true; continue; }
+            if (c == '(') depth++;
+            else if (c == ')') depth--;
+            else if (c == ',' && depth == 0) {
+                args.add(argsText.substring(start, k).strip());
+                start = k + 1;
+            }
+        }
+        String last = argsText.substring(start).strip();
+        if (!last.isEmpty() || !args.isEmpty()) args.add(last);
+        return args;
     }
 
     private static String wrapBareTableFunctionCalls(String sql, String trinoCatalog) {
