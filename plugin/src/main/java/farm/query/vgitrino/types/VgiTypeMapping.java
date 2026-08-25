@@ -2,6 +2,7 @@
 
 package farm.query.vgitrino.types;
 
+import io.airlift.slice.Slice;
 import io.airlift.slice.Slices;
 import io.trino.spi.block.Block;
 import io.trino.spi.block.BlockBuilder;
@@ -38,8 +39,11 @@ import org.apache.arrow.vector.UInt2Vector;
 import org.apache.arrow.vector.UInt4Vector;
 import org.apache.arrow.vector.VarBinaryVector;
 import org.apache.arrow.vector.VarCharVector;
+import org.apache.arrow.vector.types.FloatingPointPrecision;
+import org.apache.arrow.vector.types.TimeUnit;
 import org.apache.arrow.vector.types.pojo.ArrowType;
 import org.apache.arrow.vector.types.pojo.Field;
+import org.apache.arrow.vector.types.pojo.FieldType;
 
 /**
  * Arrow ↔ Trino type/value mapping.
@@ -179,5 +183,136 @@ public final class VgiTypeMapping {
         BlockBuilder builder = trinoType.createBlockBuilder(null, rowCount);
         appendColumn(trinoType, vector, builder, rowCount);
         return builder.build();
+    }
+
+    // ------------------------------------------------------------------
+    // Trino -> Arrow: scalar-function arguments/return only (VgiScalarFunctions).
+    // Same core-type coverage as toTrinoType's reverse direction — Struct/List/
+    // FixedSizeList are out of scope here too (see the class javadoc).
+    // ------------------------------------------------------------------
+
+    /**
+     * Map one Trino {@link Type} to the Arrow field VGI expects for it — the
+     * write-side mirror of {@link #toTrinoType}, for a scalar function's
+     * per-row {@code input_schema} or bind-time constant argument.
+     *
+     * @param type the Trino type (one of {@link #toTrinoType}'s core-covered types)
+     * @param name the field name
+     * @return a nullable Arrow field of the corresponding type
+     * @throws UnsupportedOperationException if {@code type} has no mapping
+     *         here (see the class javadoc)
+     */
+    public static Field toArrowField(Type type, String name) {
+        ArrowType arrowType = switch (type) {
+            case BooleanType t -> new ArrowType.Bool();
+            case TinyintType t -> new ArrowType.Int(8, true);
+            case SmallintType t -> new ArrowType.Int(16, true);
+            case IntegerType t -> new ArrowType.Int(32, true);
+            case BigintType t -> new ArrowType.Int(64, true);
+            case RealType t -> new ArrowType.FloatingPoint(FloatingPointPrecision.SINGLE);
+            case DoubleType t -> new ArrowType.FloatingPoint(FloatingPointPrecision.DOUBLE);
+            case VarcharType t -> new ArrowType.Utf8();
+            case VarbinaryType t -> new ArrowType.Binary();
+            case DateType t -> new ArrowType.Date(org.apache.arrow.vector.types.DateUnit.DAY);
+            case TimestampType t -> new ArrowType.Timestamp(microTimeUnit(t.getPrecision()), null);
+            // DECIMAL is deliberately NOT covered in this (Trino -> Arrow, scalar-
+            // function) direction: Trino's BOXED_NULLABLE representation for a
+            // decimal argument is a raw Long (short) or Int128 (long) unscaled
+            // value, not a BigDecimal, and bridging that correctly needs real,
+            // separately-verified Int128<->Arrow-decimal-vector handling — see
+            // the README's deferred-items list. toTrinoType's read direction
+            // (declarative table columns) is unaffected.
+            default -> throw new UnsupportedOperationException(
+                    "column '" + name + "': no Arrow mapping for Trino type " + type);
+        };
+        return new Field(name, new FieldType(true, arrowType, null), null);
+    }
+
+    private static TimeUnit microTimeUnit(int precision) {
+        // Matches toTrinoType's own precision->unit mapping in reverse; VGI's
+        // own fixtures use microsecond timestamps almost exclusively, but every
+        // precision toTrinoType can produce must round-trip back out.
+        return switch (precision) {
+            case 0 -> TimeUnit.SECOND;
+            case 3 -> TimeUnit.MILLISECOND;
+            case 6 -> TimeUnit.MICROSECOND;
+            case 9 -> TimeUnit.NANOSECOND;
+            default -> TimeUnit.MICROSECOND;
+        };
+    }
+
+    /**
+     * Write one Trino native argument value (the {@code BOXED_NULLABLE}
+     * representation — boxed {@link Long}/{@link Double}/{@link Boolean}/
+     * {@link Slice}, or {@code null}) into row {@code row} of {@code vector}.
+     *
+     * @param type the argument's Trino type
+     * @param vector the destination Arrow vector, built from {@link #toArrowField}
+     * @param row the row index to write
+     * @param value the boxed value, or {@code null}
+     */
+    public static void writeValue(Type type, FieldVector vector, int row, Object value) {
+        if (value == null) {
+            vector.setNull(row);
+            return;
+        }
+        switch (vector) {
+            case BitVector v -> v.setSafe(row, ((Boolean) value) ? 1 : 0);
+            case TinyIntVector v -> v.setSafe(row, ((Long) value).byteValue());
+            case SmallIntVector v -> v.setSafe(row, ((Long) value).shortValue());
+            case IntVector v -> v.setSafe(row, ((Long) value).intValue());
+            case BigIntVector v -> v.setSafe(row, (Long) value);
+            case Float4Vector v -> v.setSafe(row, Float.intBitsToFloat(((Long) value).intValue()));
+            case Float8Vector v -> v.setSafe(row, (Double) value);
+            case VarCharVector v -> {
+                Slice s = (Slice) value;
+                v.setSafe(row, s.getBytes());
+            }
+            case VarBinaryVector v -> {
+                Slice s = (Slice) value;
+                v.setSafe(row, s.getBytes());
+            }
+            case DateDayVector v -> v.setSafe(row, ((Long) value).intValue());
+            case TimeStampMicroVector v -> v.setSafe(row, (Long) value);
+            default -> throw new UnsupportedOperationException(
+                    "no value writer for Arrow vector type " + vector.getClass().getSimpleName());
+        }
+    }
+
+    /**
+     * Read one value back out of row {@code row} of {@code vector}, as the
+     * {@code NULLABLE_RETURN}/{@code BOXED_NULLABLE} boxed representation
+     * ({@link Long}/{@link Double}/{@link Boolean}/{@link Slice}, or
+     * {@code null}) — the read-side counterpart of {@link #writeValue}, for a
+     * scalar function's single output column.
+     *
+     * @param type the return/argument's Trino type
+     * @param vector the Arrow vector to read
+     * @param row the row index to read
+     * @return the boxed value, or {@code null}
+     */
+    public static Object readValue(Type type, FieldVector vector, int row) {
+        if (vector.isNull(row)) return null;
+        return switch (vector) {
+            case BitVector v -> v.get(row) != 0;
+            case TinyIntVector v -> (long) v.get(row);
+            case SmallIntVector v -> (long) v.get(row);
+            case IntVector v -> (long) v.get(row);
+            case BigIntVector v -> v.get(row);
+            case UInt1Vector v -> v.get(row) & 0xFFL;
+            case UInt2Vector v -> v.get(row) & 0xFFFFL;
+            case UInt4Vector v -> v.get(row) & 0xFFFF_FFFFL;
+            case Float4Vector v -> (long) Float.floatToRawIntBits(v.get(row));
+            case Float8Vector v -> v.get(row);
+            case VarCharVector v -> Slices.wrappedBuffer(v.get(row));
+            case LargeVarCharVector v -> Slices.wrappedBuffer(v.get(row));
+            case VarBinaryVector v -> Slices.wrappedBuffer(v.get(row));
+            case LargeVarBinaryVector v -> Slices.wrappedBuffer(v.get(row));
+            case FixedSizeBinaryVector v -> Slices.wrappedBuffer(v.get(row));
+            case DateDayVector v -> (long) v.get(row);
+            case TimeStampMicroVector v -> v.get(row);
+            default -> throw new UnsupportedOperationException(
+                    "no value reader for Arrow vector type " + vector.getClass().getSimpleName());
+        };
     }
 }

@@ -1,0 +1,113 @@
+// Copyright 2026 Query Farm LLC - https://query.farm
+
+package farm.query.vgitrino;
+
+import io.trino.Session;
+import io.trino.testing.DistributedQueryRunner;
+import io.trino.testing.MaterializedResult;
+import io.trino.testing.TestingSession;
+import org.junit.jupiter.api.AfterAll;
+import org.junit.jupiter.api.Assumptions;
+import org.junit.jupiter.api.BeforeAll;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.Timeout;
+
+import java.io.File;
+import java.util.Map;
+
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNull;
+
+/**
+ * Real, end-to-end coverage of {@code VgiScalarFunctions} against a live
+ * {@code vgi-fixture-worker} — not just the one-function spike this class
+ * supersedes. Exercises: plain dispatch, a {@code vgi_const} argument (and the
+ * bind-cache's rebind-on-value-change behavior), an {@code any}-typed argument
+ * combined with overload resolution, a plain (all-concrete-type) overload set,
+ * and null handling.
+ */
+final class VgiScalarFunctionsTest {
+
+    private static DistributedQueryRunner runner;
+    private static Session session;
+
+    @BeforeAll
+    static void start() throws Exception {
+        File vgiPython = new File(System.getProperty("user.home"), "Development/vgi-python");
+        Assumptions.assumeTrue(vgiPython.isDirectory(),
+                "~/Development/vgi-python not present — skipping scalar function tests");
+
+        session = TestingSession.testSessionBuilder().setCatalog("vgi_example").setSchema("main").build();
+        runner = DistributedQueryRunner.builder(session).setWorkerCount(1).build();
+        runner.installPlugin(new VgiPlugin());
+        runner.createCatalog("vgi_example", VgiConnectorFactory.NAME, Map.of(
+                "vgi.location", "uv run --project " + vgiPython.getAbsolutePath() + " vgi-fixture-worker",
+                "vgi.catalog-name", "example"));
+    }
+
+    @AfterAll
+    static void stop() {
+        if (runner != null) runner.close();
+    }
+
+    private static Object scalar(String sql) {
+        MaterializedResult result = runner.execute(session, sql);
+        return result.getMaterializedRows().get(0).getField(0);
+    }
+
+    @Test
+    @Timeout(60)
+    void passthruDispatchesEndToEnd() {
+        assertEquals("hello", scalar("SELECT vgi_example.main.passthru('hello')"));
+    }
+
+    @Test
+    @Timeout(60)
+    void multiplyHandlesTheConstArgumentAndRebindsOnChange() {
+        // Same const value (2) across two separate calls — the bind cache should reuse one bind.
+        assertEquals(20L, scalar("SELECT vgi_example.main.multiply(10, 2)"));
+        assertEquals(40L, scalar("SELECT vgi_example.main.multiply(20, 2)"));
+        // A different const value (3) must rebind, not silently reuse the factor=2 bind.
+        assertEquals(30L, scalar("SELECT vgi_example.main.multiply(10, 3)"));
+    }
+
+    @Test
+    @Timeout(60)
+    void multiplyAppliesPerRowAcrossATable() {
+        MaterializedResult result = runner.execute(session,
+                "SELECT vgi_example.main.multiply(x, 5) FROM (VALUES (1), (2), (3)) AS t(x)");
+        assertEquals(5L, result.getMaterializedRows().get(0).getField(0));
+        assertEquals(10L, result.getMaterializedRows().get(1).getField(0));
+        assertEquals(15L, result.getMaterializedRows().get(2).getField(0));
+    }
+
+    @Test
+    @Timeout(60)
+    void anyMixedResolvesTheAnyTypedArgumentOverload() {
+        assertEquals("any+int: 7", scalar("SELECT vgi_example.main.any_mixed('x', 7)"));
+        assertEquals("any+str: hi", scalar("SELECT vgi_example.main.any_mixed(1, 'hi')"));
+    }
+
+    @Test
+    @Timeout(60)
+    void typeInfoResolvesAPlainConcreteOverloadSet() {
+        assertEquals("varchar", scalar("SELECT vgi_example.main.type_info(CAST('x' AS VARCHAR))"));
+        assertEquals("int64", scalar("SELECT vgi_example.main.type_info(CAST(1 AS BIGINT))"));
+    }
+
+    @Test
+    @Timeout(60)
+    void nullHandlingReceivesTheNullRatherThanShortCircuiting() {
+        MaterializedResult result = runner.execute(session,
+                "SELECT vgi_example.main.null_handling(x) FROM (VALUES (1), (NULL), (3)) AS t(x)");
+        assertEquals(1L, result.getMaterializedRows().get(0).getField(0));
+        assertEquals(-5000L, result.getMaterializedRows().get(1).getField(0));
+        assertEquals(3L, result.getMaterializedRows().get(2).getField(0));
+    }
+
+    @Test
+    @Timeout(60)
+    void passthruReturnsNullForNullInput() {
+        assertNull(scalar("SELECT vgi_example.main.passthru(CAST(NULL AS VARCHAR))"));
+    }
+}

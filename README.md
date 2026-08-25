@@ -480,6 +480,86 @@ suite already exercises — whose schema genuinely evolves across versions (`{id
 active}` → `{id, score}`), proving the resolved AT clause reaches both the schema-discovery RPCs and the
 scan itself consistently, not just one or the other.
 
+### Scalar functions
+
+Connector-defined scalar functions (`ConnectorMetadata.getFunctions`/`Connector.getFunctionProvider`)
+dispatch a real VGI worker's exchange-mode scalar call per row — `VgiScalarFunctions` discovers every
+`SCALAR_FUNCTION` a catalog exposes (mirroring `VgiTableFunctions.discover`) and builds a real Trino
+`Signature` per overload, rather than hardcoding one function.
+
+**Row-at-a-time is a real Trino ceiling, not a shortcut taken here.** VGI's scalar protocol is
+exchange-mode (client sends a batch, worker answers a batch 1:1), but Trino's scalar `MethodHandle`
+calling convention has no batch-level hook anywhere — confirmed by reading the actual codegen path
+(`CallColumnarFilterGenerator`'s `ForLoop` + per-row `invokeExact`, even on the "columnar" fast path) and
+by two first-party open issues asking for one: [trinodb/trino#18758](https://github.com/trinodb/trino/issues/18758)
+("Batch executed scalar UDFs", specifically about remote-service UDFs) and
+[trinodb/trino#14237](https://github.com/trinodb/trino/issues/14237) ("Project Hummingbird", whose
+batch-calling-convention task item is still unchecked). Trino's own strategy for cheap built-ins is a
+tight, JIT-vectorizable per-row loop — it cannot help a genuinely remote worker, and there is nothing
+this connector can do to change that without a batch convention Trino doesn't offer.
+
+**Connection handling never holds a connection longer than one invocation** — the opposite of an
+earlier spike (`193a7e4`) that opened one bind/init/exchange stream per `Driver` via Trino's
+`instanceFactory` hook and kept it open for that instance's lifetime. That was a real bug, not a
+shortcut: `instanceFactory` runs once per `Driver` (not once per query, confirmed by tracing
+`PageFunctionCompiler` → `LocalExecutionPlanner` → `DriverFactory`), so N concurrent drivers times M call
+sites can open far more connections than `vgi.connections` allows — and **Trino never calls any
+lifecycle/close hook on the instance it produces**, so every held connection genuinely leaked until GC
+eventually collected the whole operator graph. Every `invoke()` call here instead does one
+`client.withConnection(...)` — borrow, `init()`, one `exchange()` turn, `session.close()`, release —
+exactly mirroring the existing, already-tested table-scan pattern (`VgiSplitManager` binds once,
+`VgiPageSource` redeems on a separately-borrowed connection per split). `instanceFactory` still produces
+one object per `Driver` (an `Invoker`), but it holds no connection or open stream, so Trino never
+cleaning it up is harmless.
+
+The one thing worth caching: `bind()` itself, not the stream. `VgiScalarFunctions.BindCache` (bounded
+LRU, catalog-scoped) keys on `(function, observed const-argument values)` and reuses a cached
+`bind_call`/`opaque_data` across calls whose "constant" hasn't changed — Trino's `FunctionProvider` has
+no channel to receive a constant argument's actual VALUE ahead of invocation (`BoundSignature` carries
+only types), so a `vgi_const` argument arrives as just another value on the same row-at-a-time call; the
+cache rebinds the moment the observed value changes and reuses the existing bind otherwise. A query
+whose "constant" genuinely varies per row degrades to "no caching benefit" (a fresh `bind()` every row),
+never wrong results. Net honest cost versus the old spike: one extra `init()` RPC per row (the bind RPC
+is what gets amortized away, not `init()`+`exchange()`).
+
+Also covered: overloads (`getFunctions` can return more than one `FunctionMetadata` per name — real
+Trino overload resolution, not the table-function SPI's one-registration-per-name constraint), `any`-typed
+arguments via `Signature.typeVariable` (each gets its own independent type variable — see below for why
+this connector never ties one to the return type), and null handling (`BOXED_NULLABLE`/`NULLABLE_RETURN`
+declared honestly, with `ScalarFunctionAdapter.adapt` bridging to whatever convention Trino actually
+requests at a given call site — the same pattern Iceberg/AI-functions use).
+
+Verified end to end (`VgiScalarFunctionsTest`) against real fixture functions, not just one: `passthru`
+(plain dispatch, null in/out), `multiply` (a `vgi_const` argument, including the bind-cache's
+rebind-on-value-change behavior across two different const values), `any_mixed` (an `any`-typed argument
+resolved against two real overloads), `type_info` (a plain, all-concrete-type 5-way overload set), and
+`null_handling` (confirms Trino calls through with the null rather than short-circuiting before ever
+reaching the worker).
+
+**Deliberately out of scope for this pass, named rather than silently dropped:**
+
+- **A dynamic (bind-time-computed) return type.** VGI's `on_bind` can compute a genuinely new output
+  type from an argument's actual type (`double`'s int8→int64-style promotion, via `_promote_for_addition`)
+  — but Trino resolves a function's return type from its static `Signature` alone, before any RPC ever
+  happens, so this has no Trino representation at all. Detected at discovery time via the `vgi:any`
+  output-field metadata key `ScalarFunction.catalog_output_schema` emits for it (note: a different key
+  than the argument-side `vgi_type=any`) and skipped, not guessed at.
+- **`Struct`/`List`/`FixedSizeList` arguments or return** (`geo_*`, `binary_packet`) — `VgiTypeMapping`'s
+  Trino→Arrow direction covers the same core scalar types the Arrow→Trino direction already did; nested
+  types need real, separate `RowType`/`ArrayType` support in both directions.
+- **Varargs** (`sum_values`, `concat_values`) — `Signature.variableArity()` exists, but marshaling a
+  variable-arity call correctly is its own design pass, not folded into this one.
+- **Settings- and secrets-backed arguments** (`multiply_by_setting`, `secret_field`, `whoami`) — the same
+  already-noted gap as table functions (see *Scope* below): nothing on the scalar bind path sends
+  settings or secrets today.
+- **A colliding overload set is pruned, not fully exposed.** VGI's own Arrow type system distinguishes
+  overloads (e.g. `int64` vs. `uint32`/`uint64`) that `VgiTypeMapping` widens onto the *same* Trino type
+  (`BIGINT` — Trino has no unsigned integer type). Registering all of them would make every call
+  ambiguous ("Could not choose a best candidate operator") — confirmed against the real fixture's 5-way
+  `type_info` overload set, three of whose signatures collide this way. Only the first-discovered
+  overload per distinct Trino `Signature` is registered; a colliding later one is unreachable from Trino,
+  not silently wrong.
+
 ### Dynamic filtering
 
 A join's build-side values reach a VGI scan the same way a literal `WHERE`
@@ -548,6 +628,12 @@ the same boundary on static predicate pushdown).
 - **Overloaded table functions**, and any function with a varargs/`any`-typed/
   TABLE-input argument — see *Table functions* above for why these are
   skipped rather than registered wrong.
+- **Scalar functions with a dynamic (bind-time-computed) return type, a
+  varargs argument, a `Struct`/`List`/`FixedSizeList` argument or return, or a
+  colliding overload set** — see *Scalar functions* above for why each is
+  skipped rather than registered wrong. The `TABLE(...)`-argument/batch-path
+  question for scalar functions (an entirely separate design, not this
+  connector's row-at-a-time dispatch) is also still undecided.
 - **Write support**, **multi-branch tables** (`catalog_table_scan_branches_get`),
   **transactions**, **views** — VGI supports all four; none are wired up here
   (write support matches vgi-java's own worker-SDK scope, which is read-only
@@ -560,12 +646,13 @@ the same boundary on static predicate pushdown).
   attach-options mechanism) has no way to receive any from this connector
   today. `vgi.catalog-name` is the only per-attach parameter this connector
   threads through.
-- **Per-query settings and secrets.** `table_function_plan`/`init()` always
-  send `null`/`false` for `settings`/`secrets`/`resolved_secrets_provided` —
-  settings-aware and secret-scoped worker functions have no path to receive
-  either from this connector. Trino has no automatic SET-style pass-through,
-  but its per-session/catalog properties could plausibly be wired to VGI
-  settings; that's unbuilt, not merely untested.
+- **Per-query settings and secrets.** `table_function_plan`/`init()` and the
+  scalar-function bind path all always send `null`/`false` for
+  `settings`/`secrets`/`resolved_secrets_provided` — settings-aware and
+  secret-scoped worker functions have no path to receive either from this
+  connector. Trino has no automatic SET-style pass-through, but its
+  per-session/catalog properties could plausibly be wired to VGI settings;
+  that's unbuilt, not merely untested.
 
 ## License
 

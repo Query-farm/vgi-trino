@@ -11,7 +11,7 @@ import farm.query.vgi.protocol.TableInfo;
 import farm.query.vgi.protocol.TableScanFunctionGetResponse;
 import farm.query.vgirpc.marshal.RecordCodec;
 import farm.query.vgitrino.client.VgiWorkerClient;
-import farm.query.vgitrino.function.VgiScalarFunctionSpike;
+import farm.query.vgitrino.function.VgiScalarFunctions;
 import farm.query.vgitrino.types.ArrowSchemaCodec;
 import farm.query.vgitrino.types.VgiColumnNames;
 import farm.query.vgitrino.types.VgiTypeMapping;
@@ -59,12 +59,15 @@ import java.util.OptionalDouble;
 public final class VgiMetadata implements ConnectorMetadata {
 
     private final VgiWorkerClient client;
+    private final VgiScalarFunctions.Registry scalarFunctions;
 
     /**
      * @param client the pooled connection to this catalog's VGI worker
+     * @param scalarFunctions this catalog's discovered scalar functions (see {@link VgiScalarFunctions#discover})
      */
-    public VgiMetadata(VgiWorkerClient client) {
+    public VgiMetadata(VgiWorkerClient client, VgiScalarFunctions.Registry scalarFunctions) {
         this.client = client;
+        this.scalarFunctions = scalarFunctions;
     }
 
     @Override
@@ -278,28 +281,25 @@ public final class VgiMetadata implements ConnectorMetadata {
         return columnMetadataFor(field);
     }
 
-    /**
-     * SPIKE — see {@link VgiScalarFunctionSpike}'s javadoc for what this proves and what it
-     * deliberately doesn't (only {@code main.passthru} is registered; general scalar-function
-     * discovery from {@code catalog_schema_contents_functions} is real, scoped follow-on work).
-     */
+    /** Real discovery — see {@link VgiScalarFunctions#discover}; may return more than one overload. */
     @Override
     public Collection<FunctionMetadata> getFunctions(ConnectorSession session, SchemaFunctionName name) {
-        return VgiScalarFunctionSpike.matches(name.schemaName(), name.functionName())
-                ? VgiScalarFunctionSpike.metadataFor(VgiScalarFunctionSpike.functionId()).stream().toList()
-                : List.of();
+        return scalarFunctions.functionsFor(name.schemaName(), name.functionName());
     }
 
     @Override
     public FunctionMetadata getFunctionMetadata(ConnectorSession session, FunctionId functionId) {
-        return VgiScalarFunctionSpike.metadataFor(functionId)
-                .orElseThrow(() -> new IllegalArgumentException("unknown function id: " + functionId));
+        FunctionMetadata metadata = scalarFunctions.metadataFor(functionId);
+        if (metadata == null) {
+            throw new IllegalArgumentException("unknown function id: " + functionId);
+        }
+        return metadata;
     }
 
     @Override
     public FunctionDependencyDeclaration getFunctionDependencies(
             ConnectorSession session, FunctionId functionId, BoundSignature boundSignature) {
-        // main.passthru calls no other function/operator/cast — nothing to declare.
+        // VGI scalars call no other Trino function/operator/cast — nothing to declare.
         return FunctionDependencyDeclaration.NO_DEPENDENCIES;
     }
 }

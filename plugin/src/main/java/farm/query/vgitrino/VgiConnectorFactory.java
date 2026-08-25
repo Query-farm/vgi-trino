@@ -3,6 +3,7 @@
 package farm.query.vgitrino;
 
 import farm.query.vgitrino.client.VgiWorkerClient;
+import farm.query.vgitrino.function.VgiScalarFunctions;
 import farm.query.vgitrino.function.VgiTableFunctions;
 import io.trino.spi.connector.Connector;
 import io.trino.spi.connector.ConnectorContext;
@@ -34,6 +35,7 @@ public final class VgiConnectorFactory implements ConnectorFactory {
         VgiConfig vgiConfig = VgiConfig.fromProperties(config);
         VgiWorkerClient client = new VgiWorkerClient(vgiConfig);
         Set<ConnectorTableFunction> tableFunctions = VgiTableFunctions.discover(client);
-        return new VgiConnector(client, vgiConfig, tableFunctions);
+        VgiScalarFunctions.Registry scalarFunctions = VgiScalarFunctions.discover(client);
+        return new VgiConnector(client, vgiConfig, tableFunctions, scalarFunctions);
     }
 }

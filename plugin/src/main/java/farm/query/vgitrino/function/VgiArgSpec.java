@@ -36,8 +36,15 @@ import org.apache.arrow.vector.types.pojo.Field;
  *        named one, regardless of how the Trino caller wrote it — VGI's own
  *        {@code ArgumentsParser} dispatches by wire shape, not by whatever
  *        name a caller's {@code arg => value} syntax happened to use
+ * @param constArg whether this is a {@code vgi_const} argument — a scalar
+ *        function's bind-time constant, sent via {@code BindRequest.arguments}
+ *        rather than as a per-row {@code input_schema} column. Unused by table
+ *        functions (every {@code ScalarArgumentSpecification} is already
+ *        bind-time-only there); read by {@code VgiScalarFunctions} to split an
+ *        invocation's arguments into the bind-cache key vs. the per-row batch.
  */
-public record VgiArgSpec(String name, Type type, boolean hasDefault, Object defaultValue, boolean positional) {
+public record VgiArgSpec(String name, Type type, boolean hasDefault, Object defaultValue, boolean positional,
+        boolean constArg) {
 
     /**
      * Decode one argument field, or return {@code null} if this argument's
@@ -65,11 +72,12 @@ public record VgiArgSpec(String name, Type type, boolean hasDefault, Object defa
             return null;
         }
         boolean positional = metadata == null || !"named".equals(metadata.get("vgi_arg"));
+        boolean constArg = metadata != null && "true".equals(metadata.get("vgi_const"));
         String defaultJson = metadata == null ? null : metadata.get("vgi_default");
         if (defaultJson == null) {
-            return new VgiArgSpec(field.getName(), type, false, null, positional);
+            return new VgiArgSpec(field.getName(), type, false, null, positional, constArg);
         }
-        return new VgiArgSpec(field.getName(), type, true, coerceDefault(defaultJson, type), positional);
+        return new VgiArgSpec(field.getName(), type, true, coerceDefault(defaultJson, type), positional, constArg);
     }
 
     /**
