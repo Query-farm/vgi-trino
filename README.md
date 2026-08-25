@@ -566,3 +566,13 @@ the same boundary on static predicate pushdown).
   either from this connector. Trino has no automatic SET-style pass-through,
   but its per-session/catalog properties could plausibly be wired to VGI
   settings; that's unbuilt, not merely untested.
+
+## License
+
+[Query Farm Source-Available License, Version 1.0](LICENSE) — the same license
+[VGI](https://github.com/Query-farm/vgi) itself is released under. Free for
+development, testing, and internal Production Use; see the license for the
+narrow set of restricted uses (competing hosted offerings, commercial
+marketplaces) that require a separate agreement with Query Farm.
+
+Copyright 2026 Query Farm LLC - https://query.farm
