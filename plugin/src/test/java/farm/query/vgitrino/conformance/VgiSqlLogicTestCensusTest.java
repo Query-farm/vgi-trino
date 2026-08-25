@@ -64,7 +64,8 @@ final class VgiSqlLogicTestCensusTest {
     private static final List<String> NON_PORTABLE_MARKERS = List.of(
             "ATTACH ", "DETACH", "DESCRIBE",
             "duckdb_tables(", "duckdb_databases(", "duckdb_constraints(", "duckdb_logs(",
-            "duckdb_functions(", "enable_logging", "QUALIFY",
+            "duckdb_functions(", "duckdb_schemas(", "vgi_result_cache(", "vgi_result_cache_flush(",
+            "enable_logging", "QUALIFY",
             // DuckDB's EXPLAIN plan format (node names like EMPTY_RESULT/VGI_TABLE_SCAN) has zero
             // correspondence to Trino's own EXPLAIN output shape — confirmed by a real sample
             // (table/column_statistics.test) comparing a DuckDB plan-node regex against Trino's
@@ -88,7 +89,43 @@ final class VgiSqlLogicTestCensusTest {
             // schema-qualifier), so a bare catalog-name-as-data comparison against
             // information_schema can never match the renamed Trino catalog ("vgi_example"). A
             // harness catalog-naming artifact, not a connector information_schema bug.
-            "information_schema");
+            "information_schema",
+            // The SAME multi-catalog-alias limitation, a different real shape: accumulate/*.test
+            // files ATTACH the same worker under two SEPARATE catalog names ("accumulate",
+            // "accumulate2") to test cross-attach behavior — this harness only ever attaches ONE
+            // Trino catalog ("vgi_example", from the canonical "example." reference), so a call
+            // qualified by either secondary alias has no matching Trino catalog to route to at
+            // all (confirmed the dominant remaining PARSE_ERROR driver by sampling real failures —
+            // ~60+ of the corpus's "mismatched input '('" parses trace here). Fixing this for real
+            // would mean the harness discovering and attaching a Trino catalog per distinct ATTACH
+            // alias per file, a genuine architecture change, not a textual rewrite.
+            "accumulate(", "accumulate_read(", "accumulate_clear(",
+            // attach/attach_options_echo.test's own version of the same thing: "ao"/"ao_defaults"/
+            // "ao_other" are separate ATTACH aliases this harness never creates a Trino catalog
+            // for either.
+            "echo_attach_options(",
+            // A DuckDB/VGI-extension-native introspection function (lists attached catalogs),
+            // unrelated to any worker-registered function — no Trino equivalent, same category as
+            // duckdb_tables()/etc. above. Lowercase: matches the real corpus casing (confirmed by
+            // reading the source directly — an earlier, uppercase "VGI_CATALOGS(" marker silently
+            // never matched anything, the same class of case-sensitivity mistake already fixed
+            // once for accumulate(/accumulate_read(/accumulate_clear( above).
+            "vgi_catalogs(",
+            // DuckDB's own runtime-tuning PRAGMA-like statements (no SESSION keyword, no such
+            // session property in Trino at all) — harmless, unrelated to anything this connector
+            // does, same category as duckdb_tables()/etc.
+            "SET threads", "SET vgi_streaming_window",
+            // Trino has no CREATE TEMP/TEMPORARY TABLE at all (matches the existing "no write
+            // support" scope gap, not a new one) — "TEMP", not "TEMPORARY", is the real corpus
+            // spelling.
+            "CREATE TEMP ",
+            // A worker whose behavior is defined by a literal source-code-string argument at
+            // runtime — gated behind require-env VGI_WORKER_SUPPORTS_DYNAMIC_CODE and explicitly
+            // excluded from this connector's static-registration model (a function's shape must be
+            // known at catalog-discovery time; there's no such thing as "the behavior of THIS
+            // specific call" for a statically-registered Trino function) — not a bug, a
+            // fundamentally different feature this connector's architecture doesn't support.
+            "vgi_dynamic_agg(", "vgi_dynamic_ml_agg(");
 
     private VgiWorkerHarness.Handle worker;
     private DistributedQueryRunner runner;
@@ -133,6 +170,7 @@ final class VgiSqlLogicTestCensusTest {
         Map<String, Integer> reasonCounts = new HashMap<>();
         List<String> worstFiles = new ArrayList<>();
         List<String> queryMismatchSamples = new ArrayList<>();
+        List<String> parseErrorSamples = new ArrayList<>();
 
         for (Path file : files) {
             SqlLogicTestRunner.Result result;
@@ -156,6 +194,9 @@ final class VgiSqlLogicTestCensusTest {
                     if (failure.startsWith("QUERY mismatch") && queryMismatchSamples.size() < 200) {
                         queryMismatchSamples.add(INTEGRATION_ROOT.relativize(file) + ":\n" + failure);
                     }
+                    if (classify(failure).startsWith("PARSE_ERROR") && parseErrorSamples.size() < 60) {
+                        parseErrorSamples.add(INTEGRATION_ROOT.relativize(file) + ":\n" + failure);
+                    }
                 }
             }
         }
@@ -176,6 +217,8 @@ final class VgiSqlLogicTestCensusTest {
                 .forEach(e -> report.append(String.format("%6d  %s%n", e.getValue(), e.getKey())));
         report.append("--- QUERY_MISMATCH samples (").append(queryMismatchSamples.size()).append(") ---\n");
         queryMismatchSamples.forEach(s -> report.append(s).append("\n---\n"));
+        report.append("--- PARSE_ERROR samples (").append(parseErrorSamples.size()).append(") ---\n");
+        parseErrorSamples.forEach(s -> report.append(s).append("\n---\n"));
         report.append("--- files with failures (").append(worstFiles.size()).append(") ---\n");
         worstFiles.forEach(f -> report.append(f).append('\n'));
         System.out.println(report);

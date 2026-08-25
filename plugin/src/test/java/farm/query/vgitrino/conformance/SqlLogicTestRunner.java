@@ -356,7 +356,62 @@ final class SqlLogicTestRunner {
         String rewritten = insertDefaultSchema(sql, trinoCatalog);
         rewritten = wrapBareTableFunctionCalls(rewritten, trinoCatalog);
         rewritten = rewriteRangeCalls(rewritten);
+        rewritten = rewriteAtClause(rewritten);
         return rewritten.replace(":=", "=>");
+    }
+
+    /**
+     * Rewrites DuckDB's time-travel {@code AT (VERSION => expr)}/{@code AT (TIMESTAMP => expr)}
+     * clause into Trino's own {@code FOR VERSION AS OF expr}/{@code FOR TIMESTAMP AS OF expr} —
+     * this connector's time-travel support (see the README's own "Time travel" section) already
+     * implements the LATTER syntax; the corpus just never spoke it. Not a syntax-only nicety: this
+     * exercises a real, already-working feature the census previously never got to test at all
+     * (every one of these records was failing as a parse error before this rewrite existed).
+     */
+    private static String rewriteAtClause(String sql) {
+        StringBuilder out = new StringBuilder();
+        int i = 0;
+        int n = sql.length();
+        while (i < n) {
+            int afterAt = matchKeyword(sql, i, "AT");
+            int p = afterAt;
+            if (afterAt >= 0) {
+                while (p < n && Character.isWhitespace(sql.charAt(p))) p++;
+            }
+            if (afterAt < 0 || p >= n || sql.charAt(p) != '(') {
+                out.append(sql.charAt(i));
+                i++;
+                continue;
+            }
+            int openParen = p;
+            int afterOpenWs = openParen + 1;
+            while (afterOpenWs < n && Character.isWhitespace(sql.charAt(afterOpenWs))) afterOpenWs++;
+            int afterKeyword = matchKeyword(sql, afterOpenWs, "VERSION");
+            String keyword = "VERSION";
+            if (afterKeyword < 0) {
+                afterKeyword = matchKeyword(sql, afterOpenWs, "TIMESTAMP");
+                keyword = "TIMESTAMP";
+            }
+            int afterKwWs = afterKeyword;
+            if (afterKeyword >= 0) {
+                while (afterKwWs < n && Character.isWhitespace(sql.charAt(afterKwWs))) afterKwWs++;
+            }
+            if (afterKeyword < 0 || !sql.startsWith("=>", afterKwWs)) {
+                out.append(sql.charAt(i));
+                i++;
+                continue;
+            }
+            int closeParen = findMatchingParen(sql, openParen);
+            if (closeParen < 0) {
+                out.append(sql.charAt(i));
+                i++;
+                continue;
+            }
+            String content = sql.substring(afterKwWs + 2, closeParen).strip();
+            out.append("FOR ").append(keyword).append(" AS OF ").append(content);
+            i = closeParen + 1;
+        }
+        return out.toString();
     }
 
     /**

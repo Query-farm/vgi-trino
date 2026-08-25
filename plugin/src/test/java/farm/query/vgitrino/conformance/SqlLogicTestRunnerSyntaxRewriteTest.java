@@ -164,6 +164,22 @@ final class SqlLogicTestRunnerSyntaxRewriteTest {
     }
 
     @Test
+    void rewritesAtVersionClauseToTrinoSyntax() {
+        assertEquals(
+                "SELECT * FROM vgi_example.data.t FOR VERSION AS OF 1",
+                SqlLogicTestRunner.rewriteDuckDbOnlySyntax(
+                        "SELECT * FROM vgi_example.data.t AT (VERSION => 1)", CATALOG));
+    }
+
+    @Test
+    void rewritesAtTimestampClauseWithATypedLiteral() {
+        assertEquals(
+                "SELECT * FROM vgi_example.data.t FOR TIMESTAMP AS OF TIMESTAMP '2019-01-01'",
+                SqlLogicTestRunner.rewriteDuckDbOnlySyntax(
+                        "SELECT * FROM vgi_example.data.t AT (TIMESTAMP => TIMESTAMP '2019-01-01')", CATALOG));
+    }
+
+    @Test
     void leavesAThreeArgRangeCallAlone() {
         // Not observed in the real corpus, and the explicit-step arithmetic is genuinely harder
         // to get right (DuckDB's step-aware exclusive-stop boundary isn't just "stop - step" in
