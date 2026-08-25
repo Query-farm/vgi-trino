@@ -19,10 +19,10 @@ SELECT * FROM vgi_example.data.numbers;
 This is a working v1: catalog/schema/table discovery, callable VGI table
 functions via Trino's `TABLE(catalog.schema.fn(args))` syntax, real
 multi-split parallel scans via `table_function_plan` (for both declarative
-tables and table functions), and projection pushdown are implemented and
-verified end to end (`./gradlew :plugin:test`) against the reference Python
-fixture worker and an in-process split-capable worker. Read-only. See
-**Scope** below for what's deliberately not here yet.
+tables and table functions), and projection *and predicate* pushdown are
+implemented and verified end to end (`./gradlew :plugin:test`) against the
+reference Python fixture worker and an in-process split-capable worker.
+Read-only. See **Scope** below for what's deliberately not here yet.
 
 ```sql
 -- A callable VGI table function:
@@ -189,17 +189,57 @@ wrong/partial signature, and a name VGI itself overloads (multiple
 one registration per name, unlike VGI's own arity/type-resolved dispatch) is
 skipped too rather than guessing which overload a caller meant.
 
+### Predicate pushdown
+
+`VgiMetadata.applyFilter` intersects Trino's `Constraint.getSummary()`
+(`TupleDomain<ColumnHandle>`) into the table handle's own carried
+`TupleDomain<VgiColumnHandle>`, returning `Optional.empty()` once a fixed
+point is reached (required — Trino calls `applyFilter` repeatedly until it
+stops changing anything, and returning a "new" handle that's actually
+unchanged loops forever). The constraint travels unevaluated inside the
+handle from planning through both places it needs to reach the wire:
+`VgiSplitManager` (into `table_function_plan`'s `pushdown_filters`, so
+splits can be pruned/sized before any row is read) and
+`VgiPageSourceProvider`/`VgiPageSource` (into `init`'s `pushdown_filters`,
+per redeemed split) — both via the same `VgiFilterEncoding.encode(constraint,
+fullSchema, projectedColumns)` call, so the two never drift apart on how a
+column index is resolved.
+
+`ConstraintApplicationResult`'s `remainingFilter` is always the constraint's
+own full summary, never `TupleDomain.all()` — `VgiFilterTranslator` only
+handles a deliberately narrow set of Arrow types (signed integers, UTF-8,
+binary, boolean, and `DOUBLE`-width floats; nothing else), and a table's
+`auto_apply_filters` flag is a worker-side promise, not something this
+connector can verify column-by-column. Telling Trino the filter isn't
+provably exact means Trino always re-checks it, which is safe (redundant
+re-filtering on an already-correct row) in every case where the push either
+did nothing or did exactly the right thing — the only case that would ever
+matter is the one this design can't tell apart from those two, so it costs
+nothing to always play it safe.
+
+That safety net is why this was deferred past the rest of v1: a wrong
+Trino-value → VGI-filter-AST translation, run against a worker that trusts
+pushed filters enough to prune rows *before* Trino ever sees them
+(`auto_apply_filters=true`), doesn't produce a wrong answer Trino's own
+re-check would fix — it produces missing rows Trino never had a chance to
+recheck, silently. `VgiFilterPushdownQueryRunnerTest` is written against
+exactly that fixture (`example.data.filter_echo_table`), and every filtered
+assertion also checks the table's own `pushed_filters` echo column isn't the
+`"(none)"` sentinel — proving a filter genuinely reached and was evaluated by
+the worker, not merely that the (correct) result happened to match without
+one.
+
+Building this test surfaced one real, pre-existing bug unrelated to filter
+translation itself: `SELECT count(*) FROM filter_echo_table` returned `0`
+rows instead of `100`. Trino resolves `count(*)` to a *zero-column*
+projection, and both `VgiSplitManager` and `VgiPageSource` were encoding "no
+desired columns" as an explicit `projection_ids=[]` — which this table's real
+`projection_pushdown=true` scan function (correctly) reads as "return zero
+columns," not "no restriction, return everything." Fixed in both places by
+treating an empty desired-columns set as `projection_ids=null` instead.
+
 ## Scope — what v1 does not do yet
 
-- **Predicate pushdown** (`applyFilter`). Deliberately deferred, not just
-  unscheduled: getting the value-type translation (Trino's native
-  per-type representation → VGI's Arrow-typed filter AST) wrong is not merely
-  a missed optimization the way an imperfect projection would be — a worker
-  function with `auto_apply_filters` on could silently drop rows a wrong
-  filter excluded, and Trino's own re-check can't recover rows the worker
-  never returned. That risk deserves dedicated test coverage (ideally against
-  a fixture function with `auto_apply_filters=true` to prove exactness)
-  before landing, not a rushed pass.
 - **`http(s)://` transport.** Subprocess, `unix://`, and `tcp://` are
   implemented (all thin wrappers over `RpcConnection` + an existing
   `RpcTransport`); HTTP needs its own client (state tokens, request/response

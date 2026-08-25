@@ -37,6 +37,7 @@ public final class VgiSplitSource implements ConnectorSplitSource {
     private final byte[] bindCall;
     private final byte[] bindOpaqueData;
     private final List<Integer> projectionIds;
+    private final byte[] pushdownFilters;
 
     private byte[] cursor;
     private volatile boolean finished;
@@ -51,14 +52,20 @@ public final class VgiSplitSource implements ConnectorSplitSource {
      *        them. Sourced from whatever Trino already told
      *        {@link VgiSplitManager#getSplits} it needed — no
      *        {@code applyProjection} plumbing required to get this far
+     * @param pushdownFilters the encoded static filter predicate for THIS same
+     *        projection (see {@link farm.query.vgitrino.filter.VgiFilterEncoding}),
+     *        or {@code null} if there's nothing to push. A plan is built from
+     *        static filters only — join-key values aren't known until per-tick
+     *        redemption
      */
     public VgiSplitSource(VgiWorkerClient client, VgiConfig config, byte[] bindCall, byte[] bindOpaqueData,
-            List<Integer> projectionIds) {
+            List<Integer> projectionIds, byte[] pushdownFilters) {
         this.client = client;
         this.config = config;
         this.bindCall = bindCall;
         this.bindOpaqueData = bindOpaqueData;
         this.projectionIds = projectionIds;
+        this.pushdownFilters = pushdownFilters;
     }
 
     @Override
@@ -71,8 +78,8 @@ public final class VgiSplitSource implements ConnectorSplitSource {
         TableFunctionPlanRequest request = new TableFunctionPlanRequest(
                 bindCall, bindOpaqueData,
                 projectionIds,
-                null,                       // pushdown_filters — Phase 4
-                null,                       // join_keys
+                pushdownFilters,
+                null,                       // join_keys — not known until per-split redemption
                 null,                       // row_limit
                 config.targetSplitBytes(),
                 config.minSplits(),

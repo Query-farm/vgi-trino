@@ -20,8 +20,11 @@ import io.trino.spi.connector.ConnectorSession;
 import io.trino.spi.connector.ConnectorTableHandle;
 import io.trino.spi.connector.ConnectorTableMetadata;
 import io.trino.spi.connector.ConnectorTableVersion;
+import io.trino.spi.connector.Constraint;
+import io.trino.spi.connector.ConstraintApplicationResult;
 import io.trino.spi.connector.SchemaTableName;
 import io.trino.spi.connector.TableNotFoundException;
+import io.trino.spi.predicate.TupleDomain;
 import io.trino.spi.statistics.Estimate;
 import io.trino.spi.statistics.TableStatistics;
 import org.apache.arrow.vector.types.pojo.Field;
@@ -112,7 +115,8 @@ public final class VgiMetadata implements ConnectorMetadata {
             byte[] bindArguments = ScanFunctionArguments.toBindArguments(scan.arguments());
 
             return new VgiTableHandle(info.schema_name(), info.name(),
-                    scan.function_name(), bindArguments, info.columns(), info.cardinality_estimate());
+                    scan.function_name(), bindArguments, info.columns(), info.cardinality_estimate(),
+                    TupleDomain.all());
         });
     }
 
@@ -170,6 +174,31 @@ public final class VgiMetadata implements ConnectorMetadata {
         return TableStatistics.builder()
                 .setRowCount(Estimate.of(handle.cardinalityEstimate()))
                 .build();
+    }
+
+    @Override
+    public Optional<ConstraintApplicationResult<ConnectorTableHandle>> applyFilter(
+            ConnectorSession session, ConnectorTableHandle table, Constraint constraint) {
+        VgiTableHandle handle = (VgiTableHandle) table;
+        TupleDomain<VgiColumnHandle> newConstraint =
+                constraint.getSummary().transformKeys(VgiColumnHandle.class::cast);
+        TupleDomain<VgiColumnHandle> merged = handle.constraint().intersect(newConstraint);
+        if (merged.equals(handle.constraint())) {
+            // Nothing new to record — returning a result here anyway would
+            // have Trino call applyFilter again with the same input forever.
+            return Optional.empty();
+        }
+        VgiTableHandle newHandle = new VgiTableHandle(handle.schemaName(), handle.tableName(),
+                handle.scanFunctionName(), handle.scanFunctionArguments(), handle.outputSchema(),
+                handle.cardinalityEstimate(), merged);
+        // remainingFilter is the SAME summary we were just given, unchanged:
+        // this connector never declares a filter exactly applied (see
+        // VgiFilterTranslator's javadoc for why), so Trino must still check
+        // every row itself — recording the constraint on the handle is purely
+        // informational, letting a worker with auto_apply_filters prune early
+        // as an optimization Trino's own re-check stays correct regardless of.
+        return Optional.of(new ConstraintApplicationResult<>(
+                newHandle, constraint.getSummary(), constraint.getExpression(), false));
     }
 
     @Override

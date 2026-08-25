@@ -61,9 +61,16 @@ public final class VgiPageSource implements ConnectorPageSource {
      * @param split the split to redeem
      * @param columns the columns this page source must emit, in requested order
      * @param tableOutputSchema the owning table's full (bind-time) Arrow schema bytes
+     * @param pushdownFilters the encoded static filter predicate for this same
+     *        projection (see {@link farm.query.vgitrino.filter.VgiFilterEncoding}),
+     *        or {@code null} if there's nothing to push. Column indices inside
+     *        it are relative to {@code projectionIds}'s (sorted-by-ordinal)
+     *        order below, which the caller must have built the filter against —
+     *        sorting independently by ordinal in both places is what keeps the
+     *        two consistent without sharing a list instance
      */
     public VgiPageSource(VgiWorkerClient client, VgiSplit split, List<VgiColumnHandle> columns,
-            byte[] tableOutputSchema) {
+            byte[] tableOutputSchema, byte[] pushdownFilters) {
         this.client = client;
         this.columns = columns;
         this.connection = client.borrow();
@@ -71,13 +78,17 @@ public final class VgiPageSource implements ConnectorPageSource {
         try {
             // Same projection Trino already told the split source, sourced the
             // same way — the columns this page source's own caller passed in.
-            List<Integer> projectionIds = columns.stream().map(VgiColumnHandle::ordinal).sorted().toList();
+            // Empty means "no restriction" (null), not "zero columns" — see
+            // VgiSplitManager's own comment on this for the real-worker bug
+            // sending projection_ids=[] caused (0 rows instead of the count).
+            List<Integer> projectionIds = columns.isEmpty()
+                    ? null : columns.stream().map(VgiColumnHandle::ordinal).sorted().toList();
             InitRequest initRequest = new InitRequest(
                     split.bindCall(),
                     tableOutputSchema,
                     split.bindOpaqueData(),
                     projectionIds,
-                    null,           // pushdown_filters — Phase 4
+                    pushdownFilters,
                     null,           // join_keys
                     null,           // phase (producer mode)
                     null,           // execution_id — primary init, worker mints one

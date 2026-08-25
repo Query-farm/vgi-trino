@@ -3,9 +3,11 @@
 package farm.query.vgitrino.page;
 
 import farm.query.vgitrino.client.VgiWorkerClient;
+import farm.query.vgitrino.filter.VgiFilterEncoding;
 import farm.query.vgitrino.metadata.VgiColumnHandle;
 import farm.query.vgitrino.metadata.VgiTableHandle;
 import farm.query.vgitrino.split.VgiSplit;
+import farm.query.vgitrino.types.ArrowSchemaCodec;
 import io.trino.spi.connector.ColumnHandle;
 import io.trino.spi.connector.ConnectorPageSource;
 import io.trino.spi.connector.ConnectorPageSourceProvider;
@@ -15,7 +17,9 @@ import io.trino.spi.connector.ConnectorTableCredentials;
 import io.trino.spi.connector.ConnectorTableHandle;
 import io.trino.spi.connector.ConnectorTransactionHandle;
 import io.trino.spi.connector.DynamicFilter;
+import org.apache.arrow.vector.types.pojo.Schema;
 
+import java.util.Comparator;
 import java.util.List;
 import java.util.Optional;
 
@@ -41,6 +45,15 @@ public final class VgiPageSourceProvider implements ConnectorPageSourceProvider 
         VgiSplit vgiSplit = (VgiSplit) split;
         VgiTableHandle handle = (VgiTableHandle) table;
         List<VgiColumnHandle> vgiColumns = columns.stream().map(VgiColumnHandle.class::cast).toList();
-        return new VgiPageSource(client, vgiSplit, vgiColumns, handle.outputSchema());
+        // Sorted by ordinal independently of VgiPageSource's own internal sort
+        // for projection_ids — the two must agree on order for the filter's
+        // column indices to line up, and "sort this same column set by
+        // ordinal" gives the same answer wherever it's computed.
+        List<VgiColumnHandle> sortedColumns = vgiColumns.stream()
+                .sorted(Comparator.comparingInt(VgiColumnHandle::ordinal))
+                .toList();
+        Schema fullSchema = ArrowSchemaCodec.deserializeSchema(handle.outputSchema());
+        byte[] pushdownFilters = VgiFilterEncoding.encode(handle.constraint(), fullSchema, sortedColumns);
+        return new VgiPageSource(client, vgiSplit, vgiColumns, handle.outputSchema(), pushdownFilters);
     }
 }

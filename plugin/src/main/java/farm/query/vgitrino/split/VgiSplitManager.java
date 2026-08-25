@@ -7,9 +7,11 @@ import farm.query.vgi.protocol.BindResponse;
 import farm.query.vgirpc.marshal.RecordCodec;
 import farm.query.vgitrino.VgiConfig;
 import farm.query.vgitrino.client.VgiWorkerClient;
+import farm.query.vgitrino.filter.VgiFilterEncoding;
 import farm.query.vgitrino.function.VgiTableFunctionHandle;
 import farm.query.vgitrino.metadata.VgiColumnHandle;
 import farm.query.vgitrino.metadata.VgiTableHandle;
+import farm.query.vgitrino.types.ArrowSchemaCodec;
 import io.trino.spi.connector.ColumnHandle;
 import io.trino.spi.connector.Constraint;
 import io.trino.spi.connector.ConnectorSession;
@@ -18,6 +20,7 @@ import io.trino.spi.connector.ConnectorSplitSource;
 import io.trino.spi.connector.ConnectorTableHandle;
 import io.trino.spi.connector.ConnectorTransactionHandle;
 import io.trino.spi.function.table.ConnectorTableFunctionHandle;
+import org.apache.arrow.vector.types.pojo.Schema;
 
 import java.util.List;
 import java.util.Set;
@@ -61,12 +64,22 @@ public final class VgiSplitManager implements ConnectorSplitManager {
         VgiTableHandle handle = (VgiTableHandle) table;
         // Trino already tells us exactly which columns this query needs here —
         // no applyProjection plumbing required to push that through as
-        // table_function_plan/init's projection_ids. An empty set is itself
-        // meaningful (e.g. SELECT count(*)): zero columns, not "unrestricted".
-        List<Integer> projectionIds = desiredColumns.stream()
-                .map(c -> ((VgiColumnHandle) c).ordinal())
-                .sorted()
+        // table_function_plan/init's projection_ids. An EMPTY set arrives for
+        // e.g. SELECT count(*), where Trino needs no column values at all —
+        // sending that through as an explicit projection_ids=[] (zero columns)
+        // was tried and is wrong: against a real projection_pushdown=true
+        // fixture (example.data.filter_echo_table) it made the worker return
+        // ZERO ROWS instead of the correct count, not merely zero-width ones.
+        // Treat empty as "no restriction" (null) instead — correct, if not
+        // maximally I/O-efficient, for the rare all-columns-elided case.
+        List<VgiColumnHandle> projectedColumns = desiredColumns.stream()
+                .map(VgiColumnHandle.class::cast)
+                .sorted(java.util.Comparator.comparingInt(VgiColumnHandle::ordinal))
                 .toList();
+        List<Integer> projectionIds = projectedColumns.isEmpty()
+                ? null : projectedColumns.stream().map(VgiColumnHandle::ordinal).toList();
+        Schema fullSchema = ArrowSchemaCodec.deserializeSchema(handle.outputSchema());
+        byte[] pushdownFilters = VgiFilterEncoding.encode(handle.constraint(), fullSchema, projectedColumns);
         return client.withConnection(a -> {
             BindRequest bindRequest = new BindRequest(
                     handle.scanFunctionName(),
@@ -91,7 +104,8 @@ public final class VgiSplitManager implements ConnectorSplitManager {
                     null);
             BindResponse bound = a.service().bind(bindRequest, null);
             byte[] serializedBindCall = RecordCodec.serializeToBytes(bindRequest);
-            return new VgiSplitSource(client, config, serializedBindCall, bound.opaque_data(), projectionIds);
+            return new VgiSplitSource(client, config, serializedBindCall, bound.opaque_data(),
+                    projectionIds, pushdownFilters);
         });
     }
 
@@ -105,6 +119,9 @@ public final class VgiSplitManager implements ConnectorSplitManager {
     public ConnectorSplitSource getSplits(
             ConnectorTransactionHandle transaction, ConnectorSession session, ConnectorTableFunctionHandle handle) {
         VgiTableFunctionHandle functionHandle = (VgiTableFunctionHandle) handle;
-        return new VgiSplitSource(client, config, functionHandle.bindCall(), functionHandle.bindOpaqueData(), null);
+        // No predicate pushdown for table functions in v1 (Trino's PTF calls
+        // don't carry a WHERE-clause constraint the way a table scan does).
+        return new VgiSplitSource(client, config, functionHandle.bindCall(), functionHandle.bindOpaqueData(),
+                null, null);
     }
 }

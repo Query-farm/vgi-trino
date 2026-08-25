@@ -3,6 +3,7 @@
 package farm.query.vgitrino.metadata;
 
 import io.trino.spi.connector.ConnectorTableHandle;
+import io.trino.spi.predicate.TupleDomain;
 
 /**
  * A bound VGI table: which schema/table, and the scan function + arguments
@@ -25,6 +26,10 @@ import io.trino.spi.connector.ConnectorTableHandle;
  *        ({@code TableInfo.cardinality_estimate}), or {@code null} if it
  *        offered none — fed straight to {@code getTableStatistics} with no
  *        extra RPC, since {@code catalog_table_get} already returned it
+ * @param constraint the predicate {@code applyFilter} has accepted so far
+ *        (informational only — never declared exactly applied, so Trino
+ *        always re-checks every row regardless of what the worker did with
+ *        it; see {@code farm.query.vgitrino.filter.VgiFilterTranslator})
  */
 public record VgiTableHandle(
         String schemaName,
@@ -32,5 +37,6 @@ public record VgiTableHandle(
         String scanFunctionName,
         byte[] scanFunctionArguments,
         byte[] outputSchema,
-        Long cardinalityEstimate) implements ConnectorTableHandle {
+        Long cardinalityEstimate,
+        TupleDomain<VgiColumnHandle> constraint) implements ConnectorTableHandle {
 }
