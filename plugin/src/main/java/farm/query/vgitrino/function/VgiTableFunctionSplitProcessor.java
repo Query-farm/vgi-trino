@@ -24,26 +24,33 @@ import org.apache.arrow.vector.types.pojo.Schema;
 import java.io.IOException;
 import java.util.List;
 import java.util.NoSuchElementException;
+import java.util.concurrent.CompletableFuture;
 
 /**
  * Redeems one {@link VgiSplit} of a table-function call via {@code init()}
  * and drains it into Trino {@link Page}s.
  *
  * <p>The table-function analogue of {@link farm.query.vgitrino.page.VgiPageSource}
- * — same redemption/drain mechanics, wrapped in the pull-based
- * {@link TableFunctionSplitProcessor#process()} shape (no columns list: a
- * table function has no separate projection step at this layer, so every
- * column of the bound output schema is always emitted).
+ * — same redemption/drain mechanics (including the same non-blocking
+ * connection acquisition; see that class's own javadoc for the full
+ * rationale), wrapped in the pull-based {@link TableFunctionSplitProcessor#process()}
+ * shape (no columns list: a table function has no separate projection step
+ * at this layer, so every column of the bound output schema is always
+ * emitted) — {@code process()} itself returns {@link TableFunctionProcessorState.Blocked}
+ * in place of {@code ConnectorPageSource.isBlocked()}'s separate method.
  */
 public final class VgiTableFunctionSplitProcessor implements TableFunctionSplitProcessor {
 
     private final VgiWorkerClient client;
-    private final VgiWorkerClient.Attached connection;
-    private final ClientStreamSession<?> session;
     private final Schema arrowSchema;
 
+    private final CompletableFuture<VgiWorkerClient.Attached> connectionFuture;
+    private final CompletableFuture<VgiWorkerClient.Attached> redemption;
+
+    private volatile ClientStreamSession<?> session;
+    private volatile boolean closeRequested;
     private boolean finished;
-    private boolean connectionHealthy = true;
+    private volatile boolean connectionHealthy = true;
 
     /**
      * @param client the pool to borrow a connection from for this split's lifetime
@@ -52,7 +59,17 @@ public final class VgiTableFunctionSplitProcessor implements TableFunctionSplitP
      */
     public VgiTableFunctionSplitProcessor(VgiWorkerClient client, VgiSplit split, byte[] outputSchema) {
         this.client = client;
-        this.connection = client.borrow();
+        this.arrowSchema = ArrowSchemaCodec.deserializeSchema(outputSchema);
+        this.connectionFuture = client.borrowAsync();
+        this.redemption = connectionFuture.thenApplyAsync(a -> redeem(a, split, outputSchema), client.executor());
+    }
+
+    /** Runs on {@link VgiWorkerClient#executor()} once a connection is assigned. */
+    private VgiWorkerClient.Attached redeem(VgiWorkerClient.Attached a, VgiSplit split, byte[] outputSchema) {
+        if (closeRequested) {
+            client.release(a, true);
+            return null;
+        }
         boolean ok = false;
         try {
             InitRequest initRequest = new InitRequest(
@@ -71,18 +88,26 @@ public final class VgiTableFunctionSplitProcessor implements TableFunctionSplitP
                     null,           // substream_id
                     split.token().length == 0 ? null : List.of(split.token()),
                     null);          // row_limit
-            RpcStream<? extends StreamState> stream = connection.service().init(initRequest, null);
+            RpcStream<? extends StreamState> stream = a.service().init(initRequest, null);
             this.session = (ClientStreamSession<?>) stream;
-            this.arrowSchema = ArrowSchemaCodec.deserializeSchema(outputSchema);
             ok = true;
+            return a;
         } finally {
-            if (!ok) client.release(connection, false);
+            if (!ok) client.release(a, false);
         }
     }
 
     @Override
     public TableFunctionProcessorState process() {
         if (finished) return TableFunctionProcessorState.Finished.FINISHED;
+        if (!redemption.isDone()) {
+            return TableFunctionProcessorState.Blocked.blocked(redemption.thenApply(a -> null));
+        }
+        // "Done" can mean "failed" (the connection future completed
+        // exceptionally, or redeem()'s own init() call threw) — join()
+        // surfaces that here as a CompletionException rather than silently
+        // producing no rows.
+        redemption.join();
         AnnotatedBatch batch;
         try {
             batch = session.tick();
@@ -108,12 +133,18 @@ public final class VgiTableFunctionSplitProcessor implements TableFunctionSplitP
 
     @Override
     public void close() throws IOException {
-        try {
-            session.close();
-        } catch (Exception e) {
-            connectionHealthy = false;
-        } finally {
-            client.release(connection, connectionHealthy);
-        }
+        finished = true;
+        closeRequested = true;
+        client.cancelPendingBorrow(connectionFuture);
+        redemption.whenComplete((connection, error) -> {
+            if (connection == null) return;
+            try {
+                session.close();
+            } catch (Exception e) {
+                connectionHealthy = false;
+            } finally {
+                client.release(connection, connectionHealthy);
+            }
+        });
     }
 }

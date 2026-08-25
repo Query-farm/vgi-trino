@@ -19,14 +19,16 @@ import java.net.StandardProtocolFamily;
 import java.net.URI;
 import java.net.UnixDomainSocketAddress;
 import java.nio.channels.SocketChannel;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Deque;
 import java.util.List;
 import java.util.Queue;
-import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
-import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.function.Function;
@@ -69,7 +71,13 @@ public final class VgiWorkerClient implements AutoCloseable {
     }
 
     private final VgiConfig config;
-    private final BlockingQueue<Attached> pool = new LinkedBlockingQueue<>();
+    // Guards both deques below. A plain monitor, not a BlockingQueue: async
+    // acquisition (borrowAsync) needs to hand an available connection
+    // straight to a WAITING FUTURE without any thread blocking to receive
+    // it, which a blocking queue's own API has no way to express.
+    private final Object lock = new Object();
+    private final Deque<Attached> available = new ArrayDeque<>();
+    private final Deque<CompletableFuture<Attached>> waiters = new ArrayDeque<>();
     // Every live connection this client has ever opened, for close() to shut
     // down — including self-healing replacements minted by release(), which
     // is why this can't be the fixed List.copyOf snapshot construction alone
@@ -116,14 +124,13 @@ public final class VgiWorkerClient implements AutoCloseable {
         List<Attached> opened = new ArrayList<>(n);
         try {
             for (int i = 0; i < n; i++) {
-                Attached a = openAndAttach();
-                opened.add(a);
-                pool.add(a);
+                opened.add(openAndAttach());
             }
         } catch (RuntimeException e) {
             for (Attached a : opened) closeQuietly(a);
             throw e;
         }
+        available.addAll(opened);
         all.addAll(opened);
     }
 
@@ -166,47 +173,105 @@ public final class VgiWorkerClient implements AutoCloseable {
      * Must be paired with exactly one {@link #release} call.
      *
      * <p>Blocks up to {@link VgiConfig#connectionAcquireTimeoutMillis()}, not
-     * forever. Trino's split-processor/page-source construction is expected
-     * to be cheap and non-blocking (the SPI's own async escape hatches —
-     * {@code ConnectorPageSource.isBlocked()},
-     * {@code TableFunctionProcessorState.Blocked} — exist for exactly the
-     * case this connector doesn't yet use them for), so it may legitimately
-     * schedule more concurrent splits than {@link VgiConfig#connections()}
-     * allows — e.g. a {@code LIMIT} satisfiable from the very first split
-     * still starts redeeming others in parallel before the engine notices it
-     * has enough. Those extras block here, behind whichever connections are
-     * already busy, exactly as intended — a bounded wait is what keeps a
-     * connector or worker that's genuinely stuck (nothing left that will ever
-     * free one) from hanging the calling Trino engine thread, and every other
-     * query sharing whatever thread pool that thread came from, forever.
+     * forever, but should only be used for calls that happen ONCE per query
+     * (catalog/table metadata, a scan's own bind+plan) — code that can run
+     * concurrently, once per SPLIT, must use {@link #borrowAsync} instead
+     * (see {@code VgiPageSource}/{@code VgiTableFunctionSplitProcessor}), or
+     * enough concurrently-scheduled splits will queue real Trino engine
+     * threads behind this bounded wait rather than yielding them back to the
+     * engine while genuinely idle.
      *
      * @return a connection from the pool
      * @throws RuntimeException if none becomes available within the
      *         configured timeout, or the wait is interrupted
      */
     public Attached borrow() {
+        CompletableFuture<Attached> future = borrowAsync();
         try {
-            Attached a = pool.poll(config.connectionAcquireTimeoutMillis(), TimeUnit.MILLISECONDS);
-            if (a == null) {
-                throw new RuntimeException(new TimeoutException(
-                        "timed out after " + config.connectionAcquireTimeoutMillis()
-                                + "ms waiting for a pooled VGI worker connection ("
-                                + "vgi.connections=" + config.connections() + " may be too small for how many "
-                                + "splits this query redeems concurrently, or the worker may be stuck — raise "
-                                + "vgi.connection-acquire-timeout-millis or vgi.connections if this is expected)"));
-            }
-            return a;
+            return future.get(config.connectionAcquireTimeoutMillis(), TimeUnit.MILLISECONDS);
+        } catch (TimeoutException e) {
+            // Nobody else will ever collect from `future` — if it slipped
+            // through despite withdrawal (raced a concurrent release()),
+            // reclaim the connection into the pool rather than lose it.
+            cancelPendingBorrow(future);
+            future.thenAccept(this::offer);
+            throw new RuntimeException(new TimeoutException(
+                    "timed out after " + config.connectionAcquireTimeoutMillis()
+                            + "ms waiting for a pooled VGI worker connection ("
+                            + "vgi.connections=" + config.connections() + " may be too small for how many "
+                            + "splits this query redeems concurrently, or the worker may be stuck — raise "
+                            + "vgi.connection-acquire-timeout-millis or vgi.connections if this is expected)"));
         } catch (InterruptedException e) {
+            cancelPendingBorrow(future);
+            future.thenAccept(this::offer);
             Thread.currentThread().interrupt();
             throw new RuntimeException("interrupted waiting for a VGI worker connection", e);
+        } catch (ExecutionException e) {
+            throw e.getCause() instanceof RuntimeException re ? re : new RuntimeException(e.getCause());
         }
     }
 
     /**
-     * Return a borrowed connection: to the pool if {@code healthy}, or evict,
-     * close it, and mint a fresh replacement otherwise (VGI's lockstep framing
-     * means a connection a call failed against may be left in an indeterminate
-     * wire state — reusing it would corrupt the next call rather than merely
+     * Reserve a connection without blocking the calling thread: completes
+     * immediately if one is already available, otherwise returns an
+     * incomplete future that a later {@link #release} call will complete —
+     * the async counterpart to {@link #borrow}, for code that must not
+     * occupy a Trino engine thread just to wait its turn (Trino may schedule
+     * more concurrent splits than {@link VgiConfig#connections()} allows —
+     * e.g. a {@code LIMIT} satisfiable from the very first split still
+     * starts redeeming others in parallel before the engine notices it has
+     * enough — and the resulting excess must queue as pure data, not as
+     * blocked threads). Never times out on its own; a caller that needs a
+     * bound should race it against a delay of its own choosing.
+     *
+     * @return a future for a connection from the pool
+     */
+    public CompletableFuture<Attached> borrowAsync() {
+        synchronized (lock) {
+            Attached a = available.poll();
+            if (a != null) return CompletableFuture.completedFuture(a);
+            CompletableFuture<Attached> future = new CompletableFuture<>();
+            waiters.add(future);
+            return future;
+        }
+    }
+
+    /**
+     * Withdraw an unwanted wait from {@link #waiters}: for a {@link #borrow}
+     * caller giving up (timeout, interruption), or a {@code VgiPageSource}/
+     * {@code VgiTableFunctionSplitProcessor} whose split was closed/cancelled
+     * before {@link #borrowAsync} ever handed it a connection. Without this,
+     * an abandoned waiter sits in {@link #waiters} forever — not leaking a
+     * real connection (nothing is holding one), but capable of stealing a
+     * LATER {@link #release} from whichever active caller actually needs it,
+     * since {@link #offer} has no way to tell a live waiter from a dead one.
+     *
+     * <p>Only removes the entry — does NOT reclaim a connection that slipped
+     * through despite the withdrawal (a race against a concurrent {@link
+     * #release} completing this exact future in the gap before this call
+     * runs). {@link #borrow}'s own callers own that decision for themselves
+     * (nobody else will ever collect from their future, so they reclaim
+     * unconditionally); a page source/split processor's {@code close()} owns
+     * it too, but differently — it may have ALREADY started redeeming that
+     * connection by the time it notices the close, and must not race its own
+     * in-flight {@code init()} by also handing the same connection back here.
+     * A shared, unconditional reclaim in this one method can't tell those
+     * two situations apart, so it isn't this method's job.
+     *
+     * @param future a future this same client's {@link #borrowAsync} returned
+     */
+    public void cancelPendingBorrow(CompletableFuture<Attached> future) {
+        synchronized (lock) {
+            waiters.remove(future);
+        }
+    }
+
+    /**
+     * Return a borrowed connection: to the pool (or straight to a waiting
+     * {@link #borrowAsync} caller) if {@code healthy}, or evict, close it,
+     * and mint a fresh replacement otherwise (VGI's lockstep framing means a
+     * connection a call failed against may be left in an indeterminate wire
+     * state — reusing it would corrupt the next call rather than merely
      * fail it).
      *
      * <p>The replacement is what keeps the pool's SIZE stable across a
@@ -218,12 +283,12 @@ public final class VgiWorkerClient implements AutoCloseable {
      * genuinely unreachable — that slot is honestly lost rather than retried
      * in a loop that could hang this call.
      *
-     * @param a the connection {@link #borrow} returned
+     * @param a the connection {@link #borrow}/{@link #borrowAsync} returned
      * @param healthy whether every call made against it completed cleanly
      */
     public void release(Attached a, boolean healthy) {
         if (healthy) {
-            pool.offer(a);
+            offer(a);
             return;
         }
         closeQuietly(a);
@@ -231,7 +296,7 @@ public final class VgiWorkerClient implements AutoCloseable {
         try {
             Attached replacement = openAndAttach();
             all.add(replacement);
-            pool.offer(replacement);
+            offer(replacement);
         } catch (RuntimeException e) {
             // The worker looks genuinely down: nothing to put back. Losing
             // one pool slot here is an honest degradation (this catalog now
@@ -239,6 +304,37 @@ public final class VgiWorkerClient implements AutoCloseable {
             // unlike silently coming up short forever, later borrow() calls
             // still succeed against the remaining connections and only run
             // out if EVERY one of them has failed the same way.
+        }
+    }
+
+    /**
+     * Hand a connection straight to the longest-waiting {@link #borrowAsync}
+     * caller, or park it in {@link #available} if there isn't one.
+     * {@code CompletableFuture.complete} runs any callbacks already chained
+     * onto that future (a page source's own {@code thenApplyAsync}, say)
+     * synchronously on THIS thread unless they were chained with an
+     * executor-qualified variant — which is exactly why every caller of
+     * {@code borrowAsync} in this connector chains onward with {@code
+     * thenApplyAsync(..., executor())}, never a bare {@code thenApply}: this
+     * method runs from inside {@link #release}, called from arbitrary
+     * connector threads (another split's teardown, this class's own
+     * constructor-time replacement logic), and none of them should end up
+     * unexpectedly running a DIFFERENT split's {@code init()} RPC.
+     */
+    private void offer(Attached a) {
+        CompletableFuture<Attached> waiter;
+        synchronized (lock) {
+            waiter = waiters.poll();
+            if (waiter == null) {
+                available.add(a);
+                return;
+            }
+        }
+        if (!waiter.complete(a)) {
+            // Lost a race with abandon() cancelling/discarding this exact
+            // waiter between poll() and complete() — it has no taker now,
+            // so put it back rather than let it vanish.
+            offer(a);
         }
     }
 
