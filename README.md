@@ -40,6 +40,7 @@ Set per catalog in `etc/catalog/<name>.properties`:
 | `vgi.catalog-name` | yes | The VGI-side catalog to attach — one of the names the worker's `catalog_catalogs()` advertises (e.g. `example` for the reference fixture worker). **Not** the Trino catalog name (the properties filename) — that's a purely local alias the worker never sees, the same split DuckDB's own `ATTACH 'name' AS alias` makes. |
 | `vgi.connections` | no (default 4) | Size of the pooled-connection set. VGI's RPC is lockstep per connection — one call in flight at a time — so this also caps how many splits can be redeemed concurrently against this catalog. Size it to comfortably exceed the concurrency Trino actually schedules for a split-heavy scan, not just the parallelism you want — Trino may schedule more concurrent splits than this allows (e.g. a `LIMIT` it can satisfy from the first few splits still starts redeeming others in parallel before it notices), and the excess queues behind `vgi.connection-acquire-timeout-millis` rather than being throttled proactively. |
 | `vgi.connection-acquire-timeout-millis` | no (default 30000) | How long a caller waits for a pooled connection before failing. Bounds what would otherwise be an unlimited wait — see `VgiWorkerClient.borrow`'s javadoc. |
+| `vgi.max-plan-pages` | no (default 1024) | Bound on `table_function_plan` pagination — a worker that never stops cursoring makes `VgiSplitSource` throw once this many pages have been fetched, naming the cap, rather than follow it forever or silently truncate. Matches the C++ VGI extension's own `vgi_split_plan_max_pages` default. |
 | `vgi.target-split-size-bytes` | no | Passed to `table_function_plan` as `target_split_bytes`. |
 | `vgi.min-splits` | no | Passed as `min_splits`. |
 | `vgi.max-splits-per-response` | no (default 1000) | Pagination cap per `table_function_plan` call — Trino's own `getNextBatch(maxSize)` further clamps this per call. |
@@ -220,6 +221,33 @@ zone, and 128-bit decimals. Anything else (half-precision floats, timestamps
 `UnsupportedOperationException` naming the column and type rather than
 silently mis-typing it.
 
+### Statistics
+
+`VgiMetadata.getTableStatistics` reports row count from `catalog_table_get`'s
+`cardinality_estimate` (already fetched with the table itself — no extra
+RPC) plus real per-column min/max/distinct-count/nulls, from
+`catalog_table_column_statistics_get` decoded via the existing
+`ColumnStatisticsDecoder`. The RPC is unconditional rather than gated on some
+advertised capability: a worker with nothing to say answers empty bytes,
+which the decoder reads as "no statistics" rather than an error, so a table
+that never declared any degrades to row-count-only (or fully empty) exactly
+as before this existed — verified against a real fixture table with no
+`statistics=` block (`VgiTableStatisticsQueryRunnerTest`).
+
+Only the numeric case populates a `DoubleRange`: VGI's min/max are boxed
+Java values matching the column's own Arrow type (`Long` for an integer
+column, `String` for UTF-8, WKB `byte[]` for geometry), and a non-`Number`
+value correctly yields no range rather than a meaningless coercion —
+`distinctValuesCount`/`nullsFraction` still populate regardless of type.
+`nullsFraction` itself only ever resolves to exactly `0.0` or `1.0`: VGI's
+wire shape carries `has_null`/`has_not_null` as two independent booleans,
+which can say "some of both" but not what fraction — reporting a guessed
+number there would mislead the cost model more than reporting unknown does.
+
+Verified end to end against the reference fixture worker's `data.numbers`
+table, whose statistics are extracted from a real DuckDB `ANALYZE`-style
+pass (`statistics_from_duckdb()`), not hand-authored test numbers.
+
 ### Table functions
 
 VGI's callable table functions (`example.sequence(count)`,
@@ -382,11 +410,6 @@ the same boundary on static predicate pushdown).
   implemented (all thin wrappers over `RpcConnection` + an existing
   `RpcTransport`); HTTP needs its own client (state tokens, request/response
   framing) that isn't wrapped anywhere yet.
-- **Per-column statistics.** Row-count estimates flow from
-  `catalog_table_get`'s own `cardinality_estimate` (no extra RPC); per-column
-  min/max/distinct stats (`table_function_statistics`,
-  `catalog_table_column_statistics_get` — both already decodable client-side
-  via `ColumnStatisticsDecoder`) aren't wired into `getTableStatistics` yet.
 - **Predicate/dynamic-filter pushdown for table functions.** Not deferred —
   impossible via Trino's current PTF SPI; see *Table functions* above.
 - **Overloaded table functions**, and any function with a varargs/`any`-typed/
@@ -403,7 +426,3 @@ the same boundary on static predicate pushdown).
   Trino schedules more concurrent splits than `vgi.connections` allows (see
   the splits-conformance section above); the correct fix is future-based
   acquisition, not just a generous timeout.
-- **A page-count guard on runaway `table_function_plan` pagination.** A
-  worker that never stops cursoring makes `VgiSplitSource` follow it forever
-  — the analogue of the C++ extension's `vgi_split_plan_max_pages` doesn't
-  exist here (`splits/plan_bounds.test`, not ported for exactly this reason).

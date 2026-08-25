@@ -84,6 +84,7 @@ public final class VgiSplitSource implements ConnectorSplitSource {
 
     private byte[] cursor;
     private volatile boolean finished;
+    private int pagesFetched;
 
     /** The fullest (static ∩ dynamic-so-far) predicate already sent to the worker, across calls. */
     private TupleDomain<VgiColumnHandle> lastCommunicatedPredicate = TupleDomain.all();
@@ -136,6 +137,18 @@ public final class VgiSplitSource implements ConnectorSplitSource {
     }
 
     private List<ConnectorSplit> fetchNextBatch(int maxSize, DynamicFilterSnapshot dynamicFilter) {
+        pagesFetched++;
+        if (pagesFetched > config.maxPlanPages()) {
+            // Stopping early and returning what was already collected would
+            // turn this into a SILENT SUBSET — a correct-looking answer
+            // missing rows, with no error — which is worse than failing
+            // outright. Name the cap so an operator can tell this was the
+            // client's bound, not a genuine absence of further data.
+            throw new RuntimeException("table_function_plan exceeded the scan-planning page cap ("
+                    + config.maxPlanPages() + " pages, vgi.max-plan-pages) — the worker either has an "
+                    + "unusually large split enumeration or never stops cursoring; raise vgi.max-plan-pages "
+                    + "if the former");
+        }
         int cap = Math.min(Math.max(1, maxSize), Math.max(1, config.maxSplitsPerResponse()));
 
         TupleDomain<VgiColumnHandle> dynamicPredicate = dynamicFilter == null

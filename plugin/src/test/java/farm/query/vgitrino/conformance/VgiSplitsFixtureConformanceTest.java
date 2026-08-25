@@ -63,11 +63,12 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
  *   <li>{@code ttl_floor.test} — asserts a client-side {@code
  *       vgi_split_token_min_ttl_seconds} floor DuckDB enforces at plan time;
  *       this connector has no equivalent setting or check.</li>
- *   <li>{@code plan_bounds.test} — asserts a client-side page-count cap
- *       ({@code vgi_split_plan_max_pages}) on runaway pagination. This
- *       connector has no such guard at all (a worker that never stops
- *       cursoring would make {@code VgiSplitSource} loop forever) — a real,
- *       documented gap, not something with a Trino-side setting to test.</li>
+ *   <li>{@code plan_bounds.test} — asserts a client-side page-count cap on
+ *       runaway pagination. Not portable here (no reference fixture worker
+ *       function actually cursors forever), but the underlying property IS
+ *       now implemented and tested — see {@code VgiPlanPageCapTest}, against
+ *       a hand-rolled fixture built for exactly this, the same reasoning
+ *       {@code VgiConnectorSplitParallelismTest} gives for its own.</li>
  *   <li>{@code cache_interaction.test} — entirely about DuckDB's table-function
  *       result cache ({@code vgi_result_cache_stats()}, {@code duckdb_logs}),
  *       which this connector doesn't have.</li>

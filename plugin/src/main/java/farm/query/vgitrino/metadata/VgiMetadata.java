@@ -2,6 +2,7 @@
 
 package farm.query.vgitrino.metadata;
 
+import farm.query.vgi.client.ColumnStatisticsDecoder;
 import farm.query.vgi.client.ScanFunctionArguments;
 import farm.query.vgi.client.TableInfoDecoder;
 import farm.query.vgi.protocol.ItemsResponse;
@@ -25,6 +26,7 @@ import io.trino.spi.connector.ConstraintApplicationResult;
 import io.trino.spi.connector.SchemaTableName;
 import io.trino.spi.connector.TableNotFoundException;
 import io.trino.spi.predicate.TupleDomain;
+import io.trino.spi.statistics.DoubleRange;
 import io.trino.spi.statistics.Estimate;
 import io.trino.spi.statistics.TableStatistics;
 import org.apache.arrow.vector.types.pojo.Field;
@@ -35,6 +37,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.OptionalDouble;
 
 /**
  * Catalog/schema/table discovery, backed by the VGI catalog RPCs
@@ -162,18 +165,77 @@ public final class VgiMetadata implements ConnectorMetadata {
 
     @Override
     public TableStatistics getTableStatistics(ConnectorSession session, ConnectorTableHandle table) {
-        // Row count only for v1 — the worker's own cardinality_estimate from
-        // catalog_table_get, at no extra RPC cost. Per-column statistics
-        // (table_function_statistics / catalog_table_column_statistics_get,
-        // both already decodable client-side via ColumnStatisticsDecoder) are
-        // a documented follow-up, not wired up here yet.
         VgiTableHandle handle = (VgiTableHandle) table;
-        if (handle.cardinalityEstimate() == null) {
+        TableStatistics.Builder builder = TableStatistics.builder();
+        if (handle.cardinalityEstimate() != null) {
+            builder.setRowCount(Estimate.of(handle.cardinalityEstimate()));
+        }
+        // catalog_table_column_statistics_get is a DECLARATIVE-table-only RPC
+        // (schema_name + table name, no bind_call) — a worker with nothing to
+        // say returns empty bytes, which ColumnStatisticsDecoder reads as "no
+        // statistics" rather than an error, so it's cheap and safe to call
+        // unconditionally rather than gating it on row count being known.
+        List<farm.query.vgi.catalog.ColumnStatistics> columnStats = client.withConnection(a ->
+                ColumnStatisticsDecoder.decode(a.service().catalog_table_column_statistics_get(
+                        a.handle(), handle.schemaName(), handle.tableName(), null, null)));
+        if (handle.cardinalityEstimate() == null && columnStats.isEmpty()) {
             return TableStatistics.empty();
         }
-        return TableStatistics.builder()
-                .setRowCount(Estimate.of(handle.cardinalityEstimate()))
-                .build();
+        Schema schema = ArrowSchemaCodec.deserializeSchema(handle.outputSchema());
+        List<Field> fields = schema == null ? List.of() : schema.getFields();
+        Map<String, Integer> ordinalsByWireName = new LinkedHashMap<>();
+        for (int i = 0; i < fields.size(); i++) {
+            ordinalsByWireName.put(fields.get(i).getName(), i);
+        }
+        for (farm.query.vgi.catalog.ColumnStatistics stats : columnStats) {
+            Integer ordinal = ordinalsByWireName.get(stats.columnName());
+            if (ordinal == null) continue; // a stats row for a column this schema no longer has
+            builder.setColumnStatistics(new VgiColumnHandle(stats.columnName(), ordinal),
+                    toTrinoColumnStatistics(stats));
+        }
+        return builder.build();
+    }
+
+    private static io.trino.spi.statistics.ColumnStatistics toTrinoColumnStatistics(
+            farm.query.vgi.catalog.ColumnStatistics stats) {
+        io.trino.spi.statistics.ColumnStatistics.Builder builder =
+                io.trino.spi.statistics.ColumnStatistics.builder();
+        if (stats.distinctCount() != null) {
+            builder.setDistinctValuesCount(Estimate.of(stats.distinctCount()));
+        }
+        if (!stats.hasNull()) {
+            builder.setNullsFraction(Estimate.zero());
+        } else if (!stats.hasNotNull()) {
+            // Every value is NULL — the column carries no other information.
+            builder.setNullsFraction(Estimate.of(1.0));
+        }
+        // A boolean has_null/has_not_null pair can't say WHAT FRACTION is null
+        // when both are true, so nullsFraction stays unknown (the default) —
+        // reporting a guessed fraction would mislead the cost model more than
+        // reporting nothing does.
+        toRange(stats).ifPresent(builder::setRange);
+        return builder.build();
+    }
+
+    /**
+     * VGI's min/max are boxed Java values matching the column's own Arrow
+     * type — {@code Long} for an integer column, {@code Double} for a
+     * floating-point one, {@code String} (or {@code byte[]}, for geometry
+     * columns) for anything else. Trino's {@code DoubleRange} only makes
+     * sense for the numeric case, so a non-{@link Number} min/max (a string
+     * column's lexical bounds, say) correctly yields no range rather than a
+     * meaningless numeric coercion — {@code dataSize}/{@code distinctValuesCount}
+     * still carry whatever this connector knows about such a column.
+     */
+    private static Optional<DoubleRange> toRange(farm.query.vgi.catalog.ColumnStatistics stats) {
+        OptionalDouble min = asDouble(stats.min());
+        OptionalDouble max = asDouble(stats.max());
+        if (min.isEmpty() || max.isEmpty()) return Optional.empty();
+        return Optional.of(new DoubleRange(min.getAsDouble(), max.getAsDouble()));
+    }
+
+    private static OptionalDouble asDouble(Object value) {
+        return value instanceof Number number ? OptionalDouble.of(number.doubleValue()) : OptionalDouble.empty();
     }
 
     @Override

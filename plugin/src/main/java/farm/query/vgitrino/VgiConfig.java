@@ -48,6 +48,15 @@ import java.util.Map;
  *        clear, diagnosable failure instead of hanging the calling Trino
  *        engine thread — and, by extension, every query sharing whatever
  *        thread pool that thread came from — forever
+ * @param maxPlanPages the pagination bound on {@code table_function_plan}:
+ *        {@link farm.query.vgitrino.split.VgiSplitSource} follows {@code
+ *        next_cursors} across calls, and a worker that never stops cursoring
+ *        (by accident as easily as on purpose) would otherwise make it follow
+ *        forever. Stopping early and using only what was collected would turn
+ *        that hang into a SILENT SUBSET — a correct-looking answer missing
+ *        rows, with no error — which is worse, so this throws instead once hit,
+ *        naming the cap in the message. Mirrors the C++ VGI extension's own
+ *        {@code vgi_split_plan_max_pages} setting (default 1024, matched here)
  */
 public record VgiConfig(
         String location,
@@ -57,7 +66,8 @@ public record VgiConfig(
         Long minSplits,
         int maxSplitsPerResponse,
         long dynamicFilteringWaitTimeoutMillis,
-        long connectionAcquireTimeoutMillis) {
+        long connectionAcquireTimeoutMillis,
+        int maxPlanPages) {
 
     /** Default connection-pool size when {@code vgi.connections} is unset. */
     public static final int DEFAULT_CONNECTIONS = 4;
@@ -70,6 +80,9 @@ public record VgiConfig(
 
     /** Default connection-acquire wait, when {@code vgi.connection-acquire-timeout-millis} is unset. */
     public static final long DEFAULT_CONNECTION_ACQUIRE_TIMEOUT_MILLIS = 30_000L;
+
+    /** Default {@code table_function_plan} pagination bound, when {@code vgi.max-plan-pages} is unset. */
+    public static final int DEFAULT_MAX_PLAN_PAGES = 1024;
 
     /**
      * Parse the catalog properties map Trino provides.
@@ -101,8 +114,10 @@ public record VgiConfig(
         long connectionAcquireTimeoutMillis = parseLong(
                 properties.get("vgi.connection-acquire-timeout-millis"),
                 DEFAULT_CONNECTION_ACQUIRE_TIMEOUT_MILLIS);
+        int maxPlanPages = parseInt(properties.get("vgi.max-plan-pages"), DEFAULT_MAX_PLAN_PAGES);
         return new VgiConfig(location, catalogName, connections, targetSplitBytes, minSplits,
-                maxSplitsPerResponse, dynamicFilteringWaitTimeoutMillis, connectionAcquireTimeoutMillis);
+                maxSplitsPerResponse, dynamicFilteringWaitTimeoutMillis, connectionAcquireTimeoutMillis,
+                maxPlanPages);
     }
 
     private static int parseInt(String value, int fallback) {
