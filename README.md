@@ -36,7 +36,7 @@ Set per catalog in `etc/catalog/<name>.properties`:
 | Property | Required | Description |
 |---|---|---|
 | `connector.name` | yes | `vgi` |
-| `vgi.location` | yes | The worker to attach: a bare shell command (subprocess transport), `unix:///path/to.sock`, `tcp://host:port`, or `http(s)://host:port/path` — an already-running HTTP server, unlike the other three schemes (which each spawn or connect to their own worker instance per pooled connection). |
+| `vgi.location` | yes | The worker to attach: a bare shell command (subprocess transport), `unix:///path/to.sock`, `tcp://host:port`, `http(s)://host:port/path` — an already-running HTTP server, unlike the other schemes (which each spawn or connect to their own worker instance per pooled connection) — or `launch:<argv>`, a shared warm worker every pooled connection (and any other process pointed at the identical `launch:` location) reuses rather than spawning its own. |
 | `vgi.catalog-name` | yes | The VGI-side catalog to attach — one of the names the worker's `catalog_catalogs()` advertises (e.g. `example` for the reference fixture worker). **Not** the Trino catalog name (the properties filename) — that's a purely local alias the worker never sees, the same split DuckDB's own `ATTACH 'name' AS alias` makes. |
 | `vgi.connections` | no (default 4) | Size of the pooled-connection set. VGI's RPC is lockstep per connection — one call in flight at a time — so this also caps how many splits can be redeemed concurrently against this catalog. Trino may schedule more concurrent splits than this allows (e.g. a `LIMIT` it can satisfy from the first few splits still starts redeeming others in parallel before it notices) — the excess queues as pending futures, not blocked threads, so raising this changes throughput, not correctness; see *Connection acquisition* below. |
 | `vgi.connection-acquire-timeout-millis` | no (default 30000) | How long the catalog/table-metadata and scan bind+plan calls (`VgiWorkerClient.borrow`, used once per query) wait for a pooled connection before failing. Does NOT bound split redemption itself — that's non-blocking (`borrowAsync`) and has no timeout of its own; see *Connection acquisition* below. |
@@ -294,8 +294,32 @@ hook, so the same ~15 assertions per suite run for real over every transport
 rather than only subprocess. `unix://`/`tcp://`'s pooled 16-connection
 catalogs are, by construction, the first exercise anywhere in this test tree
 of one real worker process serving many concurrent pooled clients — proven
-sound, not merely assumed. `launch:` (the shared-warm-worker transport) has
-no coverage here because it isn't implemented — see Scope.
+sound, not merely assumed.
+
+**`launch:` (the shared-warm-worker transport).** `openTransport` recognizes
+`launch:<argv>` — the first pooled connection to a given `(argv, cwd,
+VGI_RPC_*-env)` tuple spawns a warm worker under a per-tuple `flock(2)`; every
+other connection to the same tuple (this catalog's own remaining pooled
+connections, or an entirely separate DuckDB process pointed at the identical
+`launch:` location) reuses it. `<argv>` is tokenized with POSIX shell-quote
+semantics (`LaunchLocationParser`), byte-for-byte matching the C++ extension's
+own `ParseLaunchArgv` — this is what lets a Trino-launched worker be shared
+with a DuckDB process: both sides only agree on which worker to reuse if they
+tokenize the same location string into the same argv list, since that list is
+exactly what gets hashed. The actual spawn/flock/discovery machinery lives in
+`vgi-rpc-java`'s `farm.query.vgirpc.launcher` package (see that repo — this
+connector only adds the `launch:` branch and the argv tokenizer), verified
+there against a real spawned worker process, and here (`VgiLaunchTransportTest`)
+against the real Python fixture worker: connectable, and a 4-connection pool
+sharing one worker process rather than spawning four. Needs JDK 22+ (the
+Foreign Function & Memory API — `flock(2)`, not `java.nio`'s `fcntl`-based
+`FileChannel.lock()`, is the one syscall that actually interlocks with the
+Python/C++ reference launchers); this connector requires JDK 25 regardless, so
+that's never a real constraint here. Not covered by the transport-parameterized
+conformance suites above — `launch:` resolves to a `unix://` connection under
+the hood, so its distinguishing risk (hash stability, spawn-once-reuse-many,
+idle-timeout self-shutdown) is orthogonal to query correctness, which is what
+those suites actually exercise.
 
 ### Type mapping
 
@@ -509,9 +533,6 @@ the same boundary on static predicate pushdown).
   attach-options mechanism) has no way to receive any from this connector
   today. `vgi.catalog-name` is the only per-attach parameter this connector
   threads through.
-- **`launch:` transport** (the shared-warm-worker/launcher protocol) — not implemented; `openTransport`
-  doesn't recognize the scheme at all. A from-scratch implementation (canonical-JSON tuple hashing,
-  `flock(2)`-based coordination, spawn-if-needed discovery) belongs in `vgi-rpc-java`, not here.
 - **Per-query settings and secrets.** `table_function_plan`/`init()` always
   send `null`/`false` for `settings`/`secrets`/`resolved_secrets_provided` —
   settings-aware and secret-scoped worker functions have no path to receive

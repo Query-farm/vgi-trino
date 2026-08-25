@@ -63,6 +63,7 @@ cat > "$RUN_DIR/etc/jvm.config" <<'EOF'
 -XX:+HeapDumpOnOutOfMemoryError
 --add-opens=java.base/java.nio=ALL-UNNAMED
 --add-modules=jdk.incubator.vector
+--enable-native-access=ALL-UNNAMED
 EOF
 
 cat > "$RUN_DIR/etc/config.properties" <<'EOF'

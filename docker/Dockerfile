@@ -26,11 +26,15 @@ COPY plugin/build/plugin/vgi /usr/lib/trino/plugin/vgi
 # itself; it's a whole-JVM flag, so it has to land in the base image's own
 # jvm.config. `--add-modules=jdk.incubator.vector` is the same story as
 # `dev/run-local-trino.sh`'s local (non-Docker) launcher needs — Trino's own
-# SIMD block-encoding support requires it too. Neither of these showed up
-# until this connector was actually run inside a real `trinodb/trino` image;
-# `./gradlew :plugin:test`'s in-process DistributedQueryRunner sets its own
-# test JVM args and never exercises this path.
+# SIMD block-encoding support requires it too. `--enable-native-access=ALL-UNNAMED`
+# is the same category of concern again, for the `launch:` transport's Foreign
+# Function & Memory API use (vgi-rpc-java's launcher package, flock(2)/geteuid())
+# — a plugin's isolated classloader can't grant itself native access either.
+# None of these three showed up until this connector was actually run inside a
+# real `trinodb/trino` image; `./gradlew :plugin:test`'s in-process
+# DistributedQueryRunner sets its own test JVM args and never exercises this path.
 RUN printf '%s\n' \
     '--add-opens=java.base/java.nio=ALL-UNNAMED' \
     '--add-modules=jdk.incubator.vector' \
+    '--enable-native-access=ALL-UNNAMED' \
     >> /etc/trino/jvm.config

@@ -7,6 +7,8 @@ import farm.query.vgi.protocol.CatalogAttachRequest;
 import farm.query.vgi.protocol.CatalogAttachResult;
 import farm.query.vgirpc.RpcConnection;
 import farm.query.vgirpc.http.HttpRpcConnection;
+import farm.query.vgirpc.launcher.LaunchConfig;
+import farm.query.vgirpc.launcher.LauncherClient;
 import farm.query.vgirpc.transport.RpcTransport;
 import farm.query.vgirpc.transport.SubprocessTransport;
 import farm.query.vgirpc.transport.TcpSocketTransport;
@@ -400,13 +402,23 @@ public final class VgiWorkerClient implements AutoCloseable {
     private static RpcTransport openTransport(String location) {
         if (location.startsWith("unix://")) {
             String path = location.substring("unix://".length());
+            return connectUnixSocket(path);
+        }
+        if (location.startsWith("launch:")) {
+            // A launch: location resolves to a warm, shared worker's unix socket (spawning it
+            // if none is running yet) and connects to it exactly like a plain unix:// location —
+            // launch: IS unix://, just with the spawn-if-needed step folded in first. See the
+            // README's Scope section for what this doesn't (yet) do: per-location idle-timeout/
+            // state-dir overrides (the ATTACH options the C++ extension exposes for this), and
+            // Windows (launch: itself has no Windows implementation in vgi-rpc-java either).
+            List<String> argv = LaunchLocationParser.parseArgv(location.substring("launch:".length()));
+            String socketPath;
             try {
-                SocketChannel channel = SocketChannel.open(StandardProtocolFamily.UNIX);
-                channel.connect(UnixDomainSocketAddress.of(path));
-                return new UnixSocketTransport(channel);
+                socketPath = LauncherClient.launch(LaunchConfig.of(argv));
             } catch (IOException e) {
-                throw new UncheckedIOException("failed to connect to VGI unix socket " + path, e);
+                throw new UncheckedIOException("failed to launch VGI worker for " + location, e);
             }
+            return connectUnixSocket(socketPath);
         }
         if (location.startsWith("tcp://")) {
             URI uri = URI.create(location);
@@ -422,6 +434,16 @@ public final class VgiWorkerClient implements AutoCloseable {
         // env expansion, and PATH lookup behave the way it would on a
         // terminal — matches the DuckDB extension's own LOCATION contract.
         return new SubprocessTransport(List.of("/bin/sh", "-c", location));
+    }
+
+    private static RpcTransport connectUnixSocket(String path) {
+        try {
+            SocketChannel channel = SocketChannel.open(StandardProtocolFamily.UNIX);
+            channel.connect(UnixDomainSocketAddress.of(path));
+            return new UnixSocketTransport(channel);
+        } catch (IOException e) {
+            throw new UncheckedIOException("failed to connect to VGI unix socket " + path, e);
+        }
     }
 
     private static void closeQuietly(Attached a) {
