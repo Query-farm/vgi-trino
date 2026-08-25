@@ -7,7 +7,12 @@ import farm.query.vgitrino.split.VgiSplit;
 import io.trino.spi.connector.ConnectorSession;
 import io.trino.spi.connector.ConnectorSplit;
 import io.trino.spi.connector.ConnectorTableCredentials;
+import io.trino.spi.function.BoundSignature;
+import io.trino.spi.function.FunctionDependencies;
+import io.trino.spi.function.FunctionId;
 import io.trino.spi.function.FunctionProvider;
+import io.trino.spi.function.InvocationConvention;
+import io.trino.spi.function.ScalarFunctionImplementation;
 import io.trino.spi.function.table.ConnectorTableFunctionHandle;
 import io.trino.spi.function.table.TableFunctionProcessorProvider;
 import io.trino.spi.function.table.TableFunctionSplitProcessor;
@@ -41,5 +46,22 @@ public final class VgiFunctionProvider implements FunctionProvider {
                 return new VgiTableFunctionSplitProcessor(client, (VgiSplit) split, h.outputSchema());
             }
         };
+    }
+
+    /**
+     * SPIKE — see {@link VgiScalarFunctionSpike}'s javadoc. {@code invocationConvention} is
+     * intentionally unexamined: this spike always returns the same {@code (Slice) -> Slice},
+     * never-null convention regardless of what Trino asks for, to find out empirically which
+     * convention a real query actually requests before building the general (possibly
+     * multi-convention) case.
+     */
+    @Override
+    public ScalarFunctionImplementation getScalarFunctionImplementation(
+            FunctionId functionId, BoundSignature boundSignature,
+            FunctionDependencies functionDependencies, InvocationConvention invocationConvention) {
+        return ScalarFunctionImplementation.builder()
+                .methodHandle(VgiScalarFunctionSpike.methodHandle())
+                .instanceFactory(VgiScalarFunctionSpike.instanceFactory(client))
+                .build();
     }
 }

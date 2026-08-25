@@ -11,6 +11,7 @@ import farm.query.vgi.protocol.TableInfo;
 import farm.query.vgi.protocol.TableScanFunctionGetResponse;
 import farm.query.vgirpc.marshal.RecordCodec;
 import farm.query.vgitrino.client.VgiWorkerClient;
+import farm.query.vgitrino.function.VgiScalarFunctionSpike;
 import farm.query.vgitrino.types.ArrowSchemaCodec;
 import farm.query.vgitrino.types.VgiColumnNames;
 import farm.query.vgitrino.types.VgiTypeMapping;
@@ -25,6 +26,11 @@ import io.trino.spi.connector.Constraint;
 import io.trino.spi.connector.ConstraintApplicationResult;
 import io.trino.spi.connector.SchemaTableName;
 import io.trino.spi.connector.TableNotFoundException;
+import io.trino.spi.function.BoundSignature;
+import io.trino.spi.function.FunctionDependencyDeclaration;
+import io.trino.spi.function.FunctionId;
+import io.trino.spi.function.FunctionMetadata;
+import io.trino.spi.function.SchemaFunctionName;
 import io.trino.spi.predicate.TupleDomain;
 import io.trino.spi.statistics.DoubleRange;
 import io.trino.spi.statistics.Estimate;
@@ -33,6 +39,7 @@ import org.apache.arrow.vector.types.pojo.Field;
 import org.apache.arrow.vector.types.pojo.Schema;
 
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -269,5 +276,30 @@ public final class VgiMetadata implements ConnectorMetadata {
         Schema schema = ArrowSchemaCodec.deserializeSchema(handle.outputSchema());
         Field field = schema.getFields().get(columnHandle.ordinal());
         return columnMetadataFor(field);
+    }
+
+    /**
+     * SPIKE — see {@link VgiScalarFunctionSpike}'s javadoc for what this proves and what it
+     * deliberately doesn't (only {@code main.passthru} is registered; general scalar-function
+     * discovery from {@code catalog_schema_contents_functions} is real, scoped follow-on work).
+     */
+    @Override
+    public Collection<FunctionMetadata> getFunctions(ConnectorSession session, SchemaFunctionName name) {
+        return VgiScalarFunctionSpike.matches(name.schemaName(), name.functionName())
+                ? VgiScalarFunctionSpike.metadataFor(VgiScalarFunctionSpike.functionId()).stream().toList()
+                : List.of();
+    }
+
+    @Override
+    public FunctionMetadata getFunctionMetadata(ConnectorSession session, FunctionId functionId) {
+        return VgiScalarFunctionSpike.metadataFor(functionId)
+                .orElseThrow(() -> new IllegalArgumentException("unknown function id: " + functionId));
+    }
+
+    @Override
+    public FunctionDependencyDeclaration getFunctionDependencies(
+            ConnectorSession session, FunctionId functionId, BoundSignature boundSignature) {
+        // main.passthru calls no other function/operator/cast — nothing to declare.
+        return FunctionDependencyDeclaration.NO_DEPENDENCIES;
     }
 }

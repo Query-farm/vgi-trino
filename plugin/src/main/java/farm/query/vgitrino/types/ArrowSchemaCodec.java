@@ -3,10 +3,12 @@
 package farm.query.vgitrino.types;
 
 import org.apache.arrow.vector.ipc.ReadChannel;
+import org.apache.arrow.vector.ipc.WriteChannel;
 import org.apache.arrow.vector.ipc.message.MessageSerializer;
 import org.apache.arrow.vector.types.pojo.Schema;
 
 import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
 import java.nio.channels.Channels;
 
 /**
@@ -37,6 +39,20 @@ public final class ArrowSchemaCodec {
             return MessageSerializer.deserializeSchema(rc);
         } catch (Exception e) {
             throw new RuntimeException("failed to decode Arrow schema bytes", e);
+        }
+    }
+
+    /**
+     * Encode an Arrow schema as the IPC schema-message bytes VGI expects on the wire (e.g.
+     * {@code BindRequest.input_schema}) — the write-side mirror of {@link #deserializeSchema}.
+     */
+    public static byte[] serializeSchema(Schema schema) {
+        try (ByteArrayOutputStream out = new ByteArrayOutputStream()) {
+            WriteChannel wc = new WriteChannel(Channels.newChannel(out));
+            MessageSerializer.serialize(wc, schema);
+            return out.toByteArray();
+        } catch (Exception e) {
+            throw new RuntimeException("failed to encode Arrow schema", e);
         }
     }
 }
