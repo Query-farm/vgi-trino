@@ -138,16 +138,21 @@ final class SqlLogicTestRunnerSyntaxRewriteTest {
 
     @Test
     void rewritesAPureHexEscapeBlobLiteralToTrinoHexSyntax() {
+        // Called directly, not via rewriteDuckDbOnlySyntax: this rewrite runs AFTER CastRewriter
+        // (post-sqlglot) in the real pipeline, since the corpus's actual source shape is DuckDB's
+        // postfix '\xCA\xFE'::BLOB, which only becomes CAST(...) once sqlglot's own :: rewrite has
+        // already run — see rewriteBlobHexLiterals's own javadoc for the real ordering bug this
+        // reflects.
         assertEquals(
                 "SELECT X'CAFE'",
-                SqlLogicTestRunner.rewriteDuckDbOnlySyntax("SELECT CAST('\\xCA\\xFE' AS VARBINARY)", CATALOG));
+                SqlLogicTestRunner.rewriteBlobHexLiterals("SELECT CAST('\\xCA\\xFE' AS VARBINARY)"));
     }
 
     @Test
     void rewritesAnEmptyBlobLiteral() {
         assertEquals(
                 "SELECT X''",
-                SqlLogicTestRunner.rewriteDuckDbOnlySyntax("SELECT CAST('' AS VARBINARY)", CATALOG));
+                SqlLogicTestRunner.rewriteBlobHexLiterals("SELECT CAST('' AS VARBINARY)"));
     }
 
     @Test
@@ -155,7 +160,7 @@ final class SqlLogicTestRunnerSyntaxRewriteTest {
         // Plain text mixed with escapes -- deliberately out of scope, see rewriteBlobHexLiterals's
         // own javadoc -- must not be corrupted by a partial/incorrect rewrite attempt.
         String sql = "SELECT CAST('abc\\xCA' AS VARBINARY)";
-        assertEquals(sql, SqlLogicTestRunner.rewriteDuckDbOnlySyntax(sql, CATALOG));
+        assertEquals(sql, SqlLogicTestRunner.rewriteBlobHexLiterals(sql));
     }
 
     @Test

@@ -10,8 +10,10 @@ import io.trino.testing.MaterializedResult;
 import io.trino.testing.MaterializedRow;
 
 import java.io.IOException;
+import java.math.BigDecimal;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -81,6 +83,17 @@ final class SqlLogicTestRunner {
         }
 
         List<String> castRewritten = CastRewriter.rewriteBatch(preCastSql);
+        // The BLOB hex-escape rewrite must run AFTER the cast rewrite, not before: the source
+        // corpus uses DuckDB's postfix '\xCA\xFE'::BLOB syntax, which sqlglot itself turns into
+        // CAST('\xCA\xFE' AS VARBINARY) as part of its own '::' -> CAST(...) rewrite — the exact
+        // textual shape rewriteBlobHexLiterals looks for doesn't exist until THAT step has already
+        // run. Running it earlier (as part of rewriteDuckDbOnlySyntax, alongside the other
+        // pre-cast-rewrite passes) was a real ordering bug: it silently never matched anything,
+        // confirmed by a real mismatch sample still showing the untranslated '::BLOB' escape text
+        // reaching Trino verbatim.
+        for (int idx = 0; idx < castRewritten.size(); idx++) {
+            castRewritten.set(idx, rewriteBlobHexLiterals(castRewritten.get(idx)));
+        }
 
         for (int idx = 0; idx < retainedRecords.size(); idx++) {
             SqlLogicTestFile.Record record = retainedRecords.get(idx);
@@ -99,7 +112,19 @@ final class SqlLogicTestRunner {
                             }
                             actual.add(cells);
                         }
-                        if (!rowsMatch(actual, record.expectedRows())) {
+                        List<List<String>> expected = record.expectedRows();
+                        // A query with no ORDER BY has no guaranteed row order at all (standard
+                        // SQL semantics, not a connector correctness question) — DuckDB's and
+                        // Trino's own (both equally valid, but different) execution orders will
+                        // disagree on an unordered GROUP BY, confirmed against a real sample
+                        // (table/partition_columns.test: identical rows, different order). Compare
+                        // as a sorted multiset rather than positionally in that case; an explicit
+                        // ORDER BY still gets a real, order-sensitive comparison.
+                        if (!trinoSql.toUpperCase(Locale.ROOT).contains("ORDER BY")) {
+                            actual = sortedCopy(actual);
+                            expected = sortedCopy(expected);
+                        }
+                        if (!rowsMatch(actual, expected)) {
                             failures.add("QUERY mismatch for:\n" + trinoSql
                                     + "\nexpected: " + record.expectedRows()
                                     + "\nactual:   " + actual);
@@ -185,12 +210,18 @@ final class SqlLogicTestRunner {
      *       VARBINARY column.</li>
      *   <li>A {@link RowType} value — {@code Type.getObjectValue} returns a plain {@link List}
      *       with no field names (Trino's own generic representation for any row), which prints as
-     *       {@code [3.0, 4.0]}; DuckDB prints a struct as {@code {'field': value, ...}}. Only the
-     *       top-level column's type is threaded through here (matching what the real mismatches
-     *       needed — {@code geo_centroid_struct}/{@code geo_centroid_list} both return a bare
-     *       two-field struct) — a struct nested inside an array/another struct falls back to the
-     *       plain {@code List} rendering, a known, narrower gap than fixing every nesting depth
-     *       would need.</li>
+     *       {@code [3.0, 4.0]}; DuckDB prints a struct as {@code {'field': value, ...}} — with
+     *       string field values UNQUOTED, confirmed against a real sample ({@code
+     *       table/rowid.test}'s {@code {'a': 0, 'b': s_0}}, not {@code {'a': 0, 'b': 's_0'}}. Only
+     *       the top-level column's type is threaded through here (matching what the real
+     *       mismatches needed — {@code geo_centroid_struct}/{@code geo_centroid_list}/{@code
+     *       rowid_struct} all return a bare, non-nested struct) — a struct nested inside an
+     *       array/another struct falls back to the plain {@code List} rendering, a known, narrower
+     *       gap than fixing every nesting depth would need.</li>
+     *   <li>A {@link Double} — Java's default {@code Double.toString()} switches to scientific
+     *       notation above a certain magnitude ({@code 1.1997E7}); DuckDB always prints the full
+     *       plain decimal expansion ({@code 11994000.0}) — confirmed against a real sample
+     *       ({@code table/projected_data.test}).</li>
      * </ul>
      */
     static String formatCell(Type type, Object value) {
@@ -203,6 +234,9 @@ final class SqlLogicTestRunner {
         if (value instanceof String s) {
             return s.isEmpty() ? "(empty)" : s;
         }
+        if (value instanceof Double d) {
+            return formatDouble(d);
+        }
         if (type instanceof RowType rowType && value instanceof List<?> fieldValues) {
             List<RowType.Field> fields = rowType.getFields();
             StringBuilder struct = new StringBuilder("{");
@@ -210,12 +244,31 @@ final class SqlLogicTestRunner {
                 if (i > 0) struct.append(", ");
                 String fieldName = fields.get(i).getName().orElse("field" + i);
                 Object fieldValue = fieldValues.get(i);
-                String fieldText = fieldValue instanceof String s ? "'" + s + "'" : String.valueOf(fieldValue);
+                String fieldText = fieldValue instanceof Double d ? formatDouble(d) : String.valueOf(fieldValue);
                 struct.append('\'').append(fieldName).append("': ").append(fieldText);
             }
             return struct.append('}').toString();
         }
         return value.toString();
+    }
+
+    /** {@link Double#toString()} without ever falling back to scientific notation — see {@link
+     *  #formatCell}'s own javadoc for the real mismatch this fixes. {@link BigDecimal#toPlainString()}
+     *  never uses an exponent regardless of scale, so parsing {@code Double.toString(d)} (itself
+     *  possibly already in scientific form) through a {@link BigDecimal} and back out gives the
+     *  same VALUE in DuckDB's always-plain-decimal convention. */
+    private static String formatDouble(double d) {
+        if (Double.isNaN(d) || Double.isInfinite(d)) return Double.toString(d);
+        String plain = new BigDecimal(Double.toString(d)).stripTrailingZeros().toPlainString();
+        return plain.contains(".") ? plain : plain + ".0";
+    }
+
+    /** A copy of {@code rows}, sorted into a stable, arbitrary total order — for comparing an
+     *  ORDER-BY-less query's result as a multiset (see the {@code QUERY} case in {@link #run}). */
+    private static List<List<String>> sortedCopy(List<List<String>> rows) {
+        List<List<String>> copy = new ArrayList<>(rows);
+        copy.sort(Comparator.comparing(row -> String.join("", row)));
+        return copy;
     }
 
     /** Row-by-row, cell-by-cell comparison via {@link #cellsMatch} rather than a bare {@link
@@ -303,7 +356,6 @@ final class SqlLogicTestRunner {
         String rewritten = insertDefaultSchema(sql, trinoCatalog);
         rewritten = wrapBareTableFunctionCalls(rewritten, trinoCatalog);
         rewritten = rewriteRangeCalls(rewritten);
-        rewritten = rewriteBlobHexLiterals(rewritten);
         return rewritten.replace(":=", "=>");
     }
 
@@ -321,8 +373,15 @@ final class SqlLogicTestRunner {
      * run of {@code \xHH} groups — a mix of plain text and escapes, or any other DuckDB string
      * escape, is left alone rather than guessing at a more general escape-decoding rule the real
      * corpus doesn't need.
+     *
+     * <p><b>Must run AFTER {@link CastRewriter}, not as part of {@link #rewriteDuckDbOnlySyntax}</b>
+     * — the real corpus writes this as DuckDB's postfix {@code '\xCA\xFE'::BLOB} form, which only
+     * BECOMES {@code CAST('\xCA\xFE' AS VARBINARY)} once sqlglot's own {@code ::} → {@code CAST}
+     * rewrite has already run. Running this method before that step is a real ordering bug found
+     * the hard way: it silently matched nothing (the {@code CAST(...)} shape didn't exist yet),
+     * and the untranslated {@code ::BLOB} escape text reached Trino verbatim.
      */
-    private static String rewriteBlobHexLiterals(String sql) {
+    static String rewriteBlobHexLiterals(String sql) {
         String marker = "CAST('";
         StringBuilder out = new StringBuilder();
         int i = 0;
