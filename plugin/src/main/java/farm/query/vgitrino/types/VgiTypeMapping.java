@@ -4,8 +4,12 @@ package farm.query.vgitrino.types;
 
 import io.airlift.slice.Slice;
 import io.airlift.slice.Slices;
+import io.trino.spi.block.ArrayValueBuilder;
 import io.trino.spi.block.Block;
 import io.trino.spi.block.BlockBuilder;
+import io.trino.spi.block.RowValueBuilder;
+import io.trino.spi.block.SqlRow;
+import io.trino.spi.type.ArrayType;
 import io.trino.spi.type.BigintType;
 import io.trino.spi.type.BooleanType;
 import io.trino.spi.type.DateType;
@@ -14,6 +18,7 @@ import io.trino.spi.type.Decimals;
 import io.trino.spi.type.DoubleType;
 import io.trino.spi.type.IntegerType;
 import io.trino.spi.type.RealType;
+import io.trino.spi.type.RowType;
 import io.trino.spi.type.SmallintType;
 import io.trino.spi.type.TimestampType;
 import io.trino.spi.type.TinyintType;
@@ -39,11 +44,19 @@ import org.apache.arrow.vector.UInt2Vector;
 import org.apache.arrow.vector.UInt4Vector;
 import org.apache.arrow.vector.VarBinaryVector;
 import org.apache.arrow.vector.VarCharVector;
+import org.apache.arrow.vector.complex.FixedSizeListVector;
+import org.apache.arrow.vector.complex.ListVector;
+import org.apache.arrow.vector.complex.StructVector;
 import org.apache.arrow.vector.types.FloatingPointPrecision;
 import org.apache.arrow.vector.types.TimeUnit;
 import org.apache.arrow.vector.types.pojo.ArrowType;
 import org.apache.arrow.vector.types.pojo.Field;
 import org.apache.arrow.vector.types.pojo.FieldType;
+
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
 
 /**
  * Arrow ↔ Trino type/value mapping.
@@ -54,11 +67,18 @@ import org.apache.arrow.vector.types.pojo.FieldType;
  * {@code UInt64} has no exact Trino counterpart and maps to {@code BIGINT}
  * with a documented wraparound caveat — see {@link #toTrinoType}), both float
  * widths, UTF-8 strings, binary, booleans, dates, timestamps <em>without</em>
- * a time zone, and 128-bit decimals. Arrow types with no mapping here
- * (half-precision floats, timestamps WITH a time zone, duration, list/struct/
- * map nesting) throw {@link UnsupportedOperationException} rather than
- * silently truncating or mis-typing a column — extending this class is
- * tracked as follow-up work (the plan's Phase 8), not a silent gap.
+ * a time zone, 128-bit decimals, and arbitrarily nested {@code Struct}/
+ * {@code List}/{@code FixedSizeList} (mapped to Trino {@link RowType}/
+ * {@link ArrayType} — see {@link #toTrinoType}/{@link #toArrowField} for the
+ * one asymmetry: writing a Trino {@link ArrayType} value always produces an
+ * Arrow {@code List}, never a {@code FixedSizeList}, since Trino's type
+ * system carries no fixed-length information to produce one from). Arrow
+ * types with no mapping here (half-precision floats, timestamps WITH a time
+ * zone, duration, {@code Map}) throw {@link UnsupportedOperationException}
+ * rather than silently truncating or mis-typing a column — extending this
+ * class further is tracked as follow-up work, not a silent gap. 128-bit
+ * decimals are themselves not covered in the Trino -> Arrow (scalar-argument)
+ * direction — see {@link #toArrowField}'s own note.
  */
 public final class VgiTypeMapping {
 
@@ -119,6 +139,16 @@ public final class VgiTypeMapping {
                 }
                 yield DecimalType.createDecimalType(d.getPrecision(), d.getScale());
             }
+            case Struct -> {
+                List<RowType.Field> rowFields = new ArrayList<>(field.getChildren().size());
+                for (Field child : field.getChildren()) {
+                    rowFields.add(RowType.field(child.getName(), toTrinoType(child)));
+                }
+                yield RowType.from(rowFields);
+            }
+            // A list's single child field carries the element type; its own name (conventionally
+            // "item") carries no meaning Trino's ArrayType preserves.
+            case List, LargeList, FixedSizeList -> new ArrayType(toTrinoType(field.getChildren().get(0)));
             default -> throw unsupported(type, field.getName());
         };
     }
@@ -166,6 +196,9 @@ public final class VgiTypeMapping {
             case DateDayVector v -> type.writeLong(builder, v.get(row));
             case TimeStampMicroVector v -> type.writeLong(builder, v.get(row));
             case DecimalVector v -> Decimals.writeBigDecimal((DecimalType) type, builder, v.getObject(row));
+            case StructVector v -> type.writeObject(builder, readNested(type, v, row));
+            case ListVector v -> type.writeObject(builder, readNested(type, v, row));
+            case FixedSizeListVector v -> type.writeObject(builder, readNested(type, v, row));
             default -> throw new UnsupportedOperationException(
                     "no value writer for Arrow vector type " + vector.getClass().getSimpleName());
         }
@@ -203,18 +236,33 @@ public final class VgiTypeMapping {
      *         here (see the class javadoc)
      */
     public static Field toArrowField(Type type, String name) {
-        ArrowType arrowType = switch (type) {
-            case BooleanType t -> new ArrowType.Bool();
-            case TinyintType t -> new ArrowType.Int(8, true);
-            case SmallintType t -> new ArrowType.Int(16, true);
-            case IntegerType t -> new ArrowType.Int(32, true);
-            case BigintType t -> new ArrowType.Int(64, true);
-            case RealType t -> new ArrowType.FloatingPoint(FloatingPointPrecision.SINGLE);
-            case DoubleType t -> new ArrowType.FloatingPoint(FloatingPointPrecision.DOUBLE);
-            case VarcharType t -> new ArrowType.Utf8();
-            case VarbinaryType t -> new ArrowType.Binary();
-            case DateType t -> new ArrowType.Date(org.apache.arrow.vector.types.DateUnit.DAY);
-            case TimestampType t -> new ArrowType.Timestamp(microTimeUnit(t.getPrecision()), null);
+        return switch (type) {
+            case BooleanType t -> primitiveField(name, new ArrowType.Bool());
+            case TinyintType t -> primitiveField(name, new ArrowType.Int(8, true));
+            case SmallintType t -> primitiveField(name, new ArrowType.Int(16, true));
+            case IntegerType t -> primitiveField(name, new ArrowType.Int(32, true));
+            case BigintType t -> primitiveField(name, new ArrowType.Int(64, true));
+            case RealType t -> primitiveField(name, new ArrowType.FloatingPoint(FloatingPointPrecision.SINGLE));
+            case DoubleType t -> primitiveField(name, new ArrowType.FloatingPoint(FloatingPointPrecision.DOUBLE));
+            case VarcharType t -> primitiveField(name, new ArrowType.Utf8());
+            case VarbinaryType t -> primitiveField(name, new ArrowType.Binary());
+            case DateType t -> primitiveField(name, new ArrowType.Date(org.apache.arrow.vector.types.DateUnit.DAY));
+            case TimestampType t -> primitiveField(name, new ArrowType.Timestamp(microTimeUnit(t.getPrecision()), null));
+            case RowType t -> {
+                List<Field> children = new ArrayList<>(t.getFields().size());
+                int i = 0;
+                for (RowType.Field f : t.getFields()) {
+                    children.add(toArrowField(f.getType(), f.getName().orElse("field" + i)));
+                    i++;
+                }
+                yield new Field(name, FieldType.nullable(new ArrowType.Struct()), children);
+            }
+            // Always produces a Arrow List, never FixedSizeList — Trino's ArrayType carries no
+            // fixed-length information to produce one from (see the class javadoc).
+            case ArrayType t -> {
+                Field elementField = toArrowField(t.getElementType(), "item");
+                yield new Field(name, FieldType.nullable(new ArrowType.List()), List.of(elementField));
+            }
             // DECIMAL is deliberately NOT covered in this (Trino -> Arrow, scalar-
             // function) direction: Trino's BOXED_NULLABLE representation for a
             // decimal argument is a raw Long (short) or Int128 (long) unscaled
@@ -225,6 +273,9 @@ public final class VgiTypeMapping {
             default -> throw new UnsupportedOperationException(
                     "column '" + name + "': no Arrow mapping for Trino type " + type);
         };
+    }
+
+    private static Field primitiveField(String name, ArrowType arrowType) {
         return new Field(name, new FieldType(true, arrowType, null), null);
     }
 
@@ -274,6 +325,8 @@ public final class VgiTypeMapping {
             }
             case DateDayVector v -> v.setSafe(row, ((Long) value).intValue());
             case TimeStampMicroVector v -> v.setSafe(row, (Long) value);
+            case StructVector v -> writeNested(type, v, row, value);
+            case ListVector v -> writeNested(type, v, row, value);
             default -> throw new UnsupportedOperationException(
                     "no value writer for Arrow vector type " + vector.getClass().getSimpleName());
         }
@@ -311,8 +364,193 @@ public final class VgiTypeMapping {
             case FixedSizeBinaryVector v -> Slices.wrappedBuffer(v.get(row));
             case DateDayVector v -> (long) v.get(row);
             case TimeStampMicroVector v -> v.get(row);
+            case StructVector v -> readNested(type, v, row);
+            case ListVector v -> readNested(type, v, row);
+            case FixedSizeListVector v -> readNested(type, v, row);
             default -> throw new UnsupportedOperationException(
                     "no value reader for Arrow vector type " + vector.getClass().getSimpleName());
+        };
+    }
+
+    // ------------------------------------------------------------------
+    // Struct/List/FixedSizeList: recursive bridging shared by appendValue
+    // (table-column reading), readValue, and writeValue.
+    // ------------------------------------------------------------------
+
+    /**
+     * Read one Arrow struct/list/fixed-size-list cell as the Trino "object" representation
+     * ({@link SqlRow} for a struct, {@link Block} for a list) — what {@link RowType}/
+     * {@link ArrayType} each override {@code Type.writeObject} to accept. Recurses through
+     * {@link #readValue} per child/element, so arbitrarily nested struct-of-list-of-struct shapes
+     * round-trip without special-casing depth.
+     */
+    private static Object readNested(Type type, FieldVector vector, int row) {
+        return switch (vector) {
+            case StructVector sv -> {
+                RowType rowType = (RowType) type;
+                List<RowType.Field> fields = rowType.getFields();
+                yield RowValueBuilder.buildRowValue(rowType, fieldBuilders -> {
+                    for (int i = 0; i < fields.size(); i++) {
+                        Type fieldType = fields.get(i).getType();
+                        Field childArrowField = sv.getField().getChildren().get(i);
+                        FieldVector childVector = sv.getChild(childArrowField.getName());
+                        writeBoxedValue(fieldType, fieldBuilders.get(i), readValue(fieldType, childVector, row));
+                    }
+                });
+            }
+            case ListVector lv -> {
+                ArrayType arrayType = (ArrayType) type;
+                Type elementType = arrayType.getElementType();
+                int start = lv.getElementStartIndex(row);
+                int end = lv.getElementEndIndex(row);
+                FieldVector inner = lv.getDataVector();
+                yield ArrayValueBuilder.buildArrayValue(arrayType, end - start, elementBuilder -> {
+                    for (int i = start; i < end; i++) {
+                        writeBoxedValue(elementType, elementBuilder, readValue(elementType, inner, i));
+                    }
+                });
+            }
+            case FixedSizeListVector fl -> {
+                ArrayType arrayType = (ArrayType) type;
+                Type elementType = arrayType.getElementType();
+                int width = fl.getListSize();
+                int start = row * width;
+                FieldVector inner = fl.getDataVector();
+                yield ArrayValueBuilder.buildArrayValue(arrayType, width, elementBuilder -> {
+                    for (int i = 0; i < width; i++) {
+                        writeBoxedValue(elementType, elementBuilder, readValue(elementType, inner, start + i));
+                    }
+                });
+            }
+            default -> throw new UnsupportedOperationException(
+                    "no nested value reader for Arrow vector type " + vector.getClass().getSimpleName());
+        };
+    }
+
+    /**
+     * Write a Trino {@link SqlRow}/{@link Block} (a struct/list argument's {@code BOXED_NULLABLE}
+     * representation) into an Arrow struct/list vector — the write-side mirror of
+     * {@link #readNested}, recursing through {@link #writeValue} per child/element.
+     */
+    private static void writeNested(Type type, FieldVector vector, int row, Object value) {
+        switch (vector) {
+            case StructVector sv -> {
+                RowType rowType = (RowType) type;
+                SqlRow sqlRow = (SqlRow) value;
+                List<RowType.Field> fields = rowType.getFields();
+                int rawIndex = sqlRow.getRawIndex();
+                for (int i = 0; i < fields.size(); i++) {
+                    Type fieldType = fields.get(i).getType();
+                    Block fieldBlock = sqlRow.getRawFieldBlock(i);
+                    Field childArrowField = sv.getField().getChildren().get(i);
+                    FieldVector childVector = sv.getChild(childArrowField.getName());
+                    writeValue(fieldType, childVector, row, readBoxedValue(fieldType, fieldBlock, rawIndex));
+                }
+                sv.setIndexDefined(row);
+            }
+            case ListVector lv -> {
+                ArrayType arrayType = (ArrayType) type;
+                Type elementType = arrayType.getElementType();
+                Block arrayBlock = (Block) value;
+                int startOffset = lv.startNewValue(row);
+                FieldVector dataVector = lv.getDataVector();
+                int count = arrayBlock.getPositionCount();
+                int needed = startOffset + count;
+                while (dataVector.getValueCapacity() < needed) dataVector.reAlloc();
+                for (int i = 0; i < count; i++) {
+                    writeValue(elementType, dataVector, startOffset + i, readBoxedValue(elementType, arrayBlock, i));
+                }
+                lv.endValue(row, count);
+                if (needed > dataVector.getValueCount()) dataVector.setValueCount(needed);
+            }
+            default -> throw new UnsupportedOperationException(
+                    "no nested value writer for Arrow vector type " + vector.getClass().getSimpleName());
+        }
+    }
+
+    /**
+     * Read one field/element out of a Trino {@link Block} in the same boxed representation
+     * ({@link Long}/{@link Double}/{@link Boolean}/{@link Slice}/{@link SqlRow}/{@link Block}, or
+     * {@code null}) {@link #readValue}/{@link #writeValue} use elsewhere — dispatching on
+     * {@link Type#getJavaType()} since {@code Type.getObject}/{@code writeObject} are only valid
+     * for types whose native representation genuinely IS an object (Slice, SqlRow, Block, Int128,
+     * …); a primitive-native type (long/double/boolean) requires its own typed getter/writer.
+     */
+    private static Object readBoxedValue(Type type, Block block, int position) {
+        if (block.isNull(position)) return null;
+        Class<?> javaType = type.getJavaType();
+        if (javaType == long.class) return type.getLong(block, position);
+        if (javaType == double.class) return type.getDouble(block, position);
+        if (javaType == boolean.class) return type.getBoolean(block, position);
+        return type.getObject(block, position);
+    }
+
+    /** The write-side mirror of {@link #readBoxedValue}. */
+    private static void writeBoxedValue(Type type, BlockBuilder builder, Object value) {
+        if (value == null) {
+            builder.appendNull();
+            return;
+        }
+        Class<?> javaType = type.getJavaType();
+        if (javaType == long.class) type.writeLong(builder, (Long) value);
+        else if (javaType == double.class) type.writeDouble(builder, (Double) value);
+        else if (javaType == boolean.class) type.writeBoolean(builder, (Boolean) value);
+        else type.writeObject(builder, value);
+    }
+
+    /**
+     * Convert a value in this connector's boxed representation (as {@link #readValue} returns, or
+     * {@link #writeValue} expects) into the plain, recursively-nested Java shape VGI's
+     * {@code ArgumentsEncoder}/{@code ScalarValue} client-side encoder expects for a bind-time
+     * constant argument — used only for {@code vgi_const} scalar-function arguments, never for
+     * the per-row exchange path (which uses {@link #writeValue}/{@link #readValue} directly).
+     *
+     * <p>{@link Slice} becomes {@link String} (UTF-8) or {@code byte[]} (binary); a struct becomes
+     * a {@link LinkedHashMap} (preserving field order); a list becomes an {@link ArrayList} —
+     * recursively, so an arbitrarily nested struct/list constant converts in one pass.
+     *
+     * <p><strong>One honest caveat</strong>: nested values are converted to whatever Java class
+     * {@code ScalarValue.of(Object)} naturally infers a matching Arrow type from — a {@code REAL}
+     * (32-bit float) struct/list field specifically widens to {@code FLOAT64} on the wire this
+     * way, since {@code ScalarValue}'s own type inference only distinguishes {@code Float} vs.
+     * {@code Double} it never receives (this method always hands it a {@code Double}). The
+     * top-level value's own declared Arrow type (built via {@link #toArrowField} by the caller) is
+     * NOT affected — only values nested inside a struct/list lose this width.
+     *
+     * @param type the value's Trino type
+     * @param boxedValue the boxed value, or {@code null}
+     * @return the plain, recursively-converted value, or {@code null}
+     */
+    public static Object toPlainValue(Type type, Object boxedValue) {
+        if (boxedValue == null) return null;
+        return switch (type) {
+            case VarcharType t -> ((Slice) boxedValue).toStringUtf8();
+            case VarbinaryType t -> ((Slice) boxedValue).getBytes();
+            case RealType t -> Float.intBitsToFloat(((Long) boxedValue).intValue());
+            case DateType t -> ((Long) boxedValue).intValue();
+            case RowType rowType -> {
+                SqlRow sqlRow = (SqlRow) boxedValue;
+                List<RowType.Field> fields = rowType.getFields();
+                int rawIndex = sqlRow.getRawIndex();
+                Map<String, Object> map = new LinkedHashMap<>();
+                for (int i = 0; i < fields.size(); i++) {
+                    Type fieldType = fields.get(i).getType();
+                    String fieldName = fields.get(i).getName().orElse("field" + i);
+                    Object fieldValue = readBoxedValue(fieldType, sqlRow.getRawFieldBlock(i), rawIndex);
+                    map.put(fieldName, toPlainValue(fieldType, fieldValue));
+                }
+                yield map;
+            }
+            case ArrayType arrayType -> {
+                Block arrayBlock = (Block) boxedValue;
+                Type elementType = arrayType.getElementType();
+                List<Object> list = new ArrayList<>(arrayBlock.getPositionCount());
+                for (int i = 0; i < arrayBlock.getPositionCount(); i++) {
+                    list.add(toPlainValue(elementType, readBoxedValue(elementType, arrayBlock, i)));
+                }
+                yield list;
+            }
+            default -> boxedValue; // Boolean/Long/Double already match ScalarValue's expectations
         };
     }
 }

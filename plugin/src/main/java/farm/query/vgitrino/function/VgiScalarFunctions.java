@@ -19,15 +19,10 @@ import farm.query.vgirpc.wire.Allocators;
 import farm.query.vgitrino.client.VgiWorkerClient;
 import farm.query.vgitrino.types.ArrowSchemaCodec;
 import farm.query.vgitrino.types.VgiTypeMapping;
-import io.airlift.slice.Slice;
 import io.trino.spi.function.FunctionId;
 import io.trino.spi.function.FunctionMetadata;
 import io.trino.spi.function.Signature;
-import io.trino.spi.type.DateType;
-import io.trino.spi.type.RealType;
 import io.trino.spi.type.Type;
-import io.trino.spi.type.VarbinaryType;
-import io.trino.spi.type.VarcharType;
 import org.apache.arrow.vector.FieldVector;
 import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.arrow.vector.types.pojo.ArrowType;
@@ -109,9 +104,17 @@ public final class VgiScalarFunctions {
     // Discovery
     // ------------------------------------------------------------------
 
-    /** One (possibly overloaded) VGI scalar function argument, resolved at discovery time. */
+    /**
+     * One (possibly overloaded) VGI scalar function argument, resolved at discovery time.
+     *
+     * @param varargs whether this is the trailing {@code vgi_varargs} argument — always the LAST
+     *        entry in a function's argument list (a non-trailing vararg means the whole function
+     *        is skipped at discovery, see {@link #tryBuildEntry}); consumes every resolved
+     *        argument position from here to the end of a specific call site's bound arity (see
+     *        {@link #effectiveArgs})
+     */
     record ScalarArg(String name, boolean positional, boolean constArg, boolean anyType,
-            Type concreteType, String typeVarName) {}
+            Type concreteType, String typeVarName, boolean varargs) {}
 
     /** One registered overload: static discovery-time info plus the Trino {@link FunctionMetadata}. */
     record Entry(FunctionId functionId, String schemaName, String functionName,
@@ -210,9 +213,15 @@ public final class VgiScalarFunctions {
         int anyIndex = 0;
         for (Field field : argsSchema == null ? List.<Field>of() : argsSchema.getFields()) {
             ScalarArg arg = decodeScalarArg(field, anyIndex);
-            if (arg == null) return null; // varargs / table-typed / unsupported concrete type
+            if (arg == null) return null; // table-typed / const-vararg / unsupported concrete type
             if (arg.anyType()) anyIndex++;
             args.add(arg);
+        }
+        // A vararg argument must be the LAST one — Signature.variableArity() means "the last
+        // declared argument type repeats," which has no representation for a vararg group
+        // followed by more fixed arguments.
+        for (int i = 0; i < args.size() - 1; i++) {
+            if (args.get(i).varargs()) return null;
         }
 
         Schema outSchema = ArrowSchemaCodec.deserializeSchema(info.output_schema());
@@ -236,6 +245,9 @@ public final class VgiScalarFunctions {
         for (ScalarArg arg : args) {
             if (arg.anyType()) sig.argumentType(typeVariable(arg.typeVarName()));
             else sig.argumentType(arg.concreteType());
+        }
+        if (!args.isEmpty() && args.get(args.size() - 1).varargs()) {
+            sig.variableArity();
         }
         sig.returnType(returnType);
         Signature signature = sig.build();
@@ -261,21 +273,25 @@ public final class VgiScalarFunctions {
 
     private static ScalarArg decodeScalarArg(Field field, int anyIndex) {
         Map<String, String> metadata = field.getMetadata();
-        if (metadata != null && "true".equals(metadata.get("vgi_varargs"))) return null; // deferred
         String vgiType = metadata == null ? null : metadata.get("vgi_type");
         if ("table".equals(vgiType)) return null; // not a scalar argument at all
         boolean positional = metadata == null || !"named".equals(metadata.get("vgi_arg"));
         boolean constArg = metadata != null && "true".equals(metadata.get("vgi_const"));
+        boolean varargs = metadata != null && "true".equals(metadata.get("vgi_varargs"));
+        // A constant vararg has no real fixture and no clear wire meaning (ArgumentsEncoder's
+        // bind-time constants and a varargs row-column group are two different channels) —
+        // skip rather than guess.
+        if (varargs && constArg) return null;
         if ("any".equals(vgiType)) {
-            return new ScalarArg(field.getName(), positional, constArg, true, null, "T" + anyIndex);
+            return new ScalarArg(field.getName(), positional, constArg, true, null, "T" + anyIndex, varargs);
         }
         Type type;
         try {
             type = VgiTypeMapping.toTrinoType(field);
         } catch (UnsupportedOperationException e) {
-            return null; // struct/list/etc — deferred, see class javadoc
+            return null; // unsupported concrete type — see class javadoc
         }
-        return new ScalarArg(field.getName(), positional, constArg, false, type, null);
+        return new ScalarArg(field.getName(), positional, constArg, false, type, null, varargs);
     }
 
     // ------------------------------------------------------------------
@@ -299,19 +315,26 @@ public final class VgiScalarFunctions {
      *        arguments only, in the order they appear in {@link #rowArgIndices}
      * @param rowArgIndices signature-order indices of the non-const arguments
      * @param constArgIndices signature-order indices of the {@code vgi_const} arguments
+     * @param effectiveArgs {@code entry.args()}, expanded to this call site's actual bound
+     *        arity — identical to {@code entry.args()} for a non-variadic function; for a
+     *        variable-arity one, the trailing vararg spec is repeated (each repeat given a
+     *        distinct synthetic name, since Arrow field names must be unique — VGI's own
+     *        dispatch reads a vararg group by BATCH COLUMN POSITION, not name, confirmed
+     *        against {@code vgi/scalar_function.py}'s {@code _resolution_index} handling, so the
+     *        exact repeated name is never significant beyond uniqueness)
      */
     record CallConfig(Entry entry, List<Type> argumentTypes, Type returnType, Schema rowInputSchema,
-            int[] rowArgIndices, int[] constArgIndices) {}
+            int[] rowArgIndices, int[] constArgIndices, List<ScalarArg> effectiveArgs) {}
 
     /**
      * Resolve one call site's {@link CallConfig} from the static {@link Entry}
      * and this call's bound argument/return types.
      */
     public static CallConfig buildCallConfig(Entry entry, List<Type> argumentTypes, Type returnType) {
+        List<ScalarArg> specs = effectiveArgs(entry, argumentTypes.size());
         List<Integer> rowIdx = new ArrayList<>();
         List<Integer> constIdx = new ArrayList<>();
         List<Field> rowFields = new ArrayList<>();
-        List<ScalarArg> specs = entry.args();
         for (int i = 0; i < specs.size(); i++) {
             ScalarArg spec = specs.get(i);
             if (spec.constArg()) {
@@ -323,7 +346,27 @@ public final class VgiScalarFunctions {
         }
         return new CallConfig(entry, argumentTypes, returnType, new Schema(rowFields),
                 rowIdx.stream().mapToInt(Integer::intValue).toArray(),
-                constIdx.stream().mapToInt(Integer::intValue).toArray());
+                constIdx.stream().mapToInt(Integer::intValue).toArray(),
+                specs);
+    }
+
+    /**
+     * Expand {@code entry.args()} to exactly {@code callArity} entries — see {@link CallConfig}'s
+     * {@code effectiveArgs} javadoc.
+     */
+    private static List<ScalarArg> effectiveArgs(Entry entry, int callArity) {
+        List<ScalarArg> declared = entry.args();
+        if (callArity == declared.size()) return declared;
+        ScalarArg varargSpec = declared.get(declared.size() - 1);
+        List<ScalarArg> effective = new ArrayList<>(callArity);
+        effective.addAll(declared.subList(0, declared.size() - 1));
+        int repeatCount = callArity - (declared.size() - 1);
+        for (int i = 0; i < repeatCount; i++) {
+            effective.add(new ScalarArg(varargSpec.name() + "_" + i, varargSpec.positional(),
+                    varargSpec.constArg(), varargSpec.anyType(), varargSpec.concreteType(),
+                    varargSpec.typeVarName(), true));
+        }
+        return effective;
     }
 
     // ------------------------------------------------------------------
@@ -410,7 +453,7 @@ public final class VgiScalarFunctions {
             int[] constIdx = cfg.constArgIndices();
             for (int i = 0; i < constIdx.length; i++) {
                 int sigIndex = constIdx[i];
-                ScalarArg spec = cfg.entry().args().get(sigIndex);
+                ScalarArg spec = cfg.effectiveArgs().get(sigIndex);
                 Type type = cfg.argumentTypes().get(sigIndex);
                 ScalarValue value = toScalarValue(type, constValues.get(i));
                 if (spec.positional()) encoder.positional(value);
@@ -419,17 +462,16 @@ public final class VgiScalarFunctions {
             return encoder.encode();
         }
 
+        /**
+         * Build the {@code ArgumentsEncoder}-ready constant, delegating the value's actual shape
+         * to {@link VgiTypeMapping#toPlainValue} — see its own javadoc for the one honest caveat
+         * (a nested struct/list field's exact width isn't always preserved, since {@code
+         * ScalarValue}'s own type inference only distinguishes what Java's boxing naturally does).
+         */
         private static ScalarValue toScalarValue(Type trinoType, Object boxedValue) {
             ArrowType arrowType = VgiTypeMapping.toArrowField(trinoType, "value").getType();
             if (boxedValue == null) return ScalarValue.ofNull(arrowType);
-            Object wireValue = switch (trinoType) {
-                case VarcharType t -> ((Slice) boxedValue).toStringUtf8();
-                case VarbinaryType t -> ((Slice) boxedValue).getBytes();
-                case RealType t -> Float.intBitsToFloat(((Long) boxedValue).intValue());
-                case DateType t -> ((Long) boxedValue).intValue();
-                default -> boxedValue; // Boolean/Long/Double already match VectorScalarCodec's expectations
-            };
-            return ScalarValue.of(arrowType, wireValue);
+            return ScalarValue.of(arrowType, VgiTypeMapping.toPlainValue(trinoType, boxedValue));
         }
     }
 

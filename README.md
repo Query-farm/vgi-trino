@@ -328,10 +328,14 @@ columns actually produce: signed/unsigned integers (unsigned widened to the
 next signed Trino width; `UInt64` has no exact match and maps to `BIGINT`
 with a documented wraparound caveat above `Long.MAX_VALUE`), both float
 widths, UTF-8 strings, binary, booleans, dates, timestamps *without* a time
-zone, and 128-bit decimals. Anything else (half-precision floats, timestamps
-*with* a time zone, duration, list/struct/map nesting) throws
-`UnsupportedOperationException` naming the column and type rather than
-silently mis-typing it.
+zone, 128-bit decimals, and arbitrarily nested `Struct`/`List`/`FixedSizeList`
+(mapped to Trino `RowType`/`ArrayType`, recursively, in both the Arrow → Trino
+read direction and — for scalar-function arguments and return values — the
+reverse). Anything else (half-precision floats, timestamps *with* a time
+zone, duration, `Map`) throws `UnsupportedOperationException` naming the
+column and type rather than silently mis-typing it; the Trino → Arrow
+direction additionally doesn't cover 128-bit decimals or writing a
+`FixedSizeList` — see *Scalar functions*' own scope notes for why.
 
 ### Statistics
 
@@ -525,30 +529,53 @@ is what gets amortized away, not `init()`+`exchange()`).
 Also covered: overloads (`getFunctions` can return more than one `FunctionMetadata` per name — real
 Trino overload resolution, not the table-function SPI's one-registration-per-name constraint), `any`-typed
 arguments via `Signature.typeVariable` (each gets its own independent type variable — see below for why
-this connector never ties one to the return type), and null handling (`BOXED_NULLABLE`/`NULLABLE_RETURN`
+this connector never ties one to the return type), null handling (`BOXED_NULLABLE`/`NULLABLE_RETURN`
 declared honestly, with `ScalarFunctionAdapter.adapt` bridging to whatever convention Trino actually
-requests at a given call site — the same pattern Iceberg/AI-functions use).
+requests at a given call site — the same pattern Iceberg/AI-functions use), nested `Struct`/`List`/
+`FixedSizeList` arguments and return types (`RowType`/`ArrayType` ↔ Arrow, recursively — see *Type
+mapping* above), and varargs (`Signature.variableArity()`, with the trailing `vgi_const`-ineligible
+argument spec repeated to match each call site's actual resolved arity).
 
 Verified end to end (`VgiScalarFunctionsTest`) against real fixture functions, not just one: `passthru`
 (plain dispatch, null in/out), `multiply` (a `vgi_const` argument, including the bind-cache's
 rebind-on-value-change behavior across two different const values), `any_mixed` (an `any`-typed argument
-resolved against two real overloads), `type_info` (a plain, all-concrete-type 5-way overload set), and
+resolved against two real overloads), `type_info` (a plain, all-concrete-type 5-way overload set),
 `null_handling` (confirms Trino calls through with the null rather than short-circuiting before ever
-reaching the worker).
+reaching the worker), `geo_distance_struct`/`geo_distance_list` (struct and list row arguments),
+`binary_packet` (const binary and const struct arguments together), and `geo_centroid_struct` (varargs of
+struct arguments, returning a struct — all three new capabilities at once).
 
-**Deliberately out of scope for this pass, named rather than silently dropped:**
+**Deliberately out of scope, named rather than silently dropped:**
 
 - **A dynamic (bind-time-computed) return type.** VGI's `on_bind` can compute a genuinely new output
   type from an argument's actual type (`double`'s int8→int64-style promotion, via `_promote_for_addition`)
   — but Trino resolves a function's return type from its static `Signature` alone, before any RPC ever
   happens, so this has no Trino representation at all. Detected at discovery time via the `vgi:any`
   output-field metadata key `ScalarFunction.catalog_output_schema` emits for it (note: a different key
-  than the argument-side `vgi_type=any`) and skipped, not guessed at.
-- **`Struct`/`List`/`FixedSizeList` arguments or return** (`geo_*`, `binary_packet`) — `VgiTypeMapping`'s
-  Trino→Arrow direction covers the same core scalar types the Arrow→Trino direction already did; nested
-  types need real, separate `RowType`/`ArrayType` support in both directions.
-- **Varargs** (`sum_values`, `concat_values`) — `Signature.variableArity()` exists, but marshaling a
-  variable-arity call correctly is its own design pass, not folded into this one.
+  than the argument-side `vgi_type=any`) and skipped, not guessed at. This one isn't a scope choice —
+  it's a ceiling of Trino's current function-resolution model, not something more engineering fixes. It
+  quietly also excludes any function whose return type simply isn't *declared* statically even though
+  it's fixed in practice (e.g. the reference fixture's own `sum_values`/`concat_values`, whose `on_bind`
+  always returns the same concrete type but never says so via an explicit `Returns(type)` — indistinguishable
+  from a genuinely dynamic one without executing `on_bind`, so treated the same, conservatively).
+- **A colliding overload set is pruned, not fully exposed.** VGI's own Arrow type system distinguishes
+  overloads (e.g. `int64` vs. `uint32`/`uint64`) that `VgiTypeMapping` widens onto the *same* Trino type
+  (`BIGINT` — Trino has no unsigned integer type). Registering all of them would make every call
+  ambiguous ("Could not choose a best candidate operator") — confirmed against the real fixture's 5-way
+  `type_info` overload set, three of whose signatures collide this way. Only the first-discovered
+  overload per distinct Trino `Signature` is registered; a colliding later one is unreachable from
+  Trino, not silently wrong. Also a ceiling, not a scope choice.
+- **A `FixedSizeList` argument, on write.** Reading one (a worker's return value, or a table column) is
+  fully supported. Writing one — building a scalar function's per-row `input_schema` from a Trino
+  `ARRAY` argument — always produces an Arrow `List`, never a `FixedSizeList`: Trino's `ArrayType` carries
+  no fixed-length information to produce one from. Untested against the reference fixture's own
+  `geo_distance_fixed`/`geo_centroid_fixed` (which declare a `FixedSizeList`-typed parameter) — whether
+  the worker's own argument validation accepts a `List` in a `FixedSizeList`'s place is an open,
+  real question, not yet answered against real infrastructure.
+- **128-bit decimal arguments/return**, in the Trino → Arrow (scalar) direction specifically. Trino's
+  `BOXED_NULLABLE` representation for a decimal is a raw `Long` (short) or `Int128` (long) unscaled
+  value, not a `BigDecimal` — bridging that correctly needs real, separately-verified `Int128` handling.
+  `toTrinoType`'s read direction (declarative table columns) already supports it.
 - **Settings- and secrets-backed arguments** (`multiply_by_setting`, `secret_field`, `whoami`) — the same
   already-noted gap as table functions (see *Scope* below): nothing on the scalar bind path sends
   settings or secrets today.
@@ -629,11 +656,12 @@ the same boundary on static predicate pushdown).
   TABLE-input argument — see *Table functions* above for why these are
   skipped rather than registered wrong.
 - **Scalar functions with a dynamic (bind-time-computed) return type, a
-  varargs argument, a `Struct`/`List`/`FixedSizeList` argument or return, or a
-  colliding overload set** — see *Scalar functions* above for why each is
-  skipped rather than registered wrong. The `TABLE(...)`-argument/batch-path
-  question for scalar functions (an entirely separate design, not this
-  connector's row-at-a-time dispatch) is also still undecided.
+  colliding overload set, a `FixedSizeList` argument (on write), a 128-bit
+  decimal argument/return, or settings/secrets-backed arguments** — see
+  *Scalar functions* above for why each is skipped rather than registered
+  wrong. The `TABLE(...)`-argument/batch-path question for scalar functions
+  (an entirely separate design, not this connector's row-at-a-time dispatch)
+  is also still undecided.
 - **Write support**, **multi-branch tables** (`catalog_table_scan_branches_get`),
   **transactions**, **views** — VGI supports all four; none are wired up here
   (write support matches vgi-java's own worker-SDK scope, which is read-only
