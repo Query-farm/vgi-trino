@@ -21,6 +21,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.TreeMap;
@@ -105,6 +106,7 @@ final class VgiSqlLogicTestCensusTest {
         int totalFailed = 0;
         int filesFullyClean = 0; // every non-skipped record executed with no failures
         Map<String, Integer> failureBuckets = new TreeMap<>();
+        Map<String, Integer> reasonCounts = new HashMap<>();
         List<String> worstFiles = new ArrayList<>();
 
         for (Path file : files) {
@@ -125,6 +127,7 @@ final class VgiSqlLogicTestCensusTest {
                 worstFiles.add(INTEGRATION_ROOT.relativize(file) + " (" + result.failures().size() + " failures)");
                 for (String failure : result.failures()) {
                     failureBuckets.merge(classify(failure), 1, Integer::sum);
+                    reasonCounts.merge(reasonKey(failure), 1, Integer::sum);
                 }
             }
         }
@@ -138,22 +141,53 @@ final class VgiSqlLogicTestCensusTest {
         report.append("files with zero failures: ").append(filesFullyClean).append(" / ").append(files.size()).append('\n');
         report.append("--- failure buckets ---\n");
         failureBuckets.forEach((bucket, count) -> report.append(String.format("%6d  %s%n", count, bucket)));
+        report.append("--- top 30 distinct failure reasons (across all buckets) ---\n");
+        reasonCounts.entrySet().stream()
+                .sorted(Map.Entry.<String, Integer>comparingByValue().reversed())
+                .limit(30)
+                .forEach(e -> report.append(String.format("%6d  %s%n", e.getValue(), e.getKey())));
         report.append("--- files with failures (").append(worstFiles.size()).append(") ---\n");
         worstFiles.forEach(f -> report.append(f).append('\n'));
         System.out.println(report);
     }
 
-    /** Buckets one failure message from {@link SqlLogicTestRunner.Result#failures()} by likely cause. */
+    /**
+     * A short, deduplicatable "reason" for one failure — the last non-blank line of the message
+     * (where the actual exception text lives; earlier lines are the record's own SQL/expected-vs-
+     * actual dump), truncated so two failures differing only in a literal value/position still
+     * collapse to the same bucket.
+     */
+    private static String reasonKey(String failure) {
+        String[] lines = failure.split("\n");
+        String last = "";
+        for (int i = lines.length - 1; i >= 0; i--) {
+            if (!lines[i].isBlank()) { last = lines[i].strip(); break; }
+        }
+        return last.length() > 140 ? last.substring(0, 140) : last;
+    }
+
+    /**
+     * Buckets one failure message from {@link SqlLogicTestRunner.Result#failures()} by likely
+     * cause. Checks the most SPECIFIC signatures first deliberately: an earlier version of this
+     * method checked a bare {@code "line 1:"} substring as its parse-error signal — which matches
+     * almost every Trino exception message, since nearly all of them carry a {@code line:column}
+     * position regardless of category — and so silently swallowed genuine {@code UNSUPPORTED}
+     * classifications (a "Function 'X' not registered" message also contains "line 1:") into
+     * {@code PARSE_ERROR} ahead of the {@code not registered} check. Confirmed by direct comparison
+     * of two census runs where only connector functionality changed (aggregate-function support
+     * added, no syntax-rewrite change at all) and {@code PARSE_ERROR} still dropped sharply —
+     * impossible if the bucketing were actually parse-error-specific.
+     */
     private static String classify(String failure) {
         if (failure.startsWith("QUERY mismatch")) return "QUERY_MISMATCH (ran, wrong data — worth investigating)";
-        if (failure.contains("mismatched input") || failure.contains("Non-query expression encountered")
-                || failure.contains("line 1:") || failure.contains("SyntaxException")) {
-            return "PARSE_ERROR (likely DuckDB-only SQL syntax, e.g. bare table-function CALL syntax)";
-        }
         if (failure.startsWith("expected an error for")) return "EXPECTED_ERROR_DIDNT_HAPPEN";
         if (failure.contains("not registered") || failure.contains("does not exist")
                 || failure.contains("Unsupported")) {
             return "UNSUPPORTED (function/feature not registered or implemented)";
+        }
+        if (failure.contains("mismatched input") || failure.contains("Non-query expression encountered")
+                || failure.contains("SyntaxException") || failure.contains("extraneous input")) {
+            return "PARSE_ERROR (likely DuckDB-only SQL syntax, e.g. bare table-function CALL syntax)";
         }
         return "OTHER_RUNTIME_ERROR";
     }
