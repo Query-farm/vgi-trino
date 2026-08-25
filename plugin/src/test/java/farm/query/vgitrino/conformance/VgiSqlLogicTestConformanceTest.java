@@ -18,7 +18,6 @@ import org.junit.jupiter.api.Timeout;
 
 import java.io.File;
 import java.nio.file.Path;
-import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 
@@ -111,75 +110,12 @@ final class VgiSqlLogicTestConformanceTest {
         Assumptions.assumeTrue(testFile.toFile().isFile(),
                 "~/Development/vgi/test/sql/integration/table/rowid.test not present");
 
-        List<SqlLogicTestFile.Record> records = SqlLogicTestFile.parse(testFile);
-        int executed = 0;
-        int skipped = 0;
-        List<String> failures = new ArrayList<>();
+        SqlLogicTestRunner.Result result = SqlLogicTestRunner.run(
+                runner, session, testFile, "example.", TRINO_CATALOG, NON_PORTABLE_MARKERS);
 
-        for (SqlLogicTestFile.Record record : records) {
-            if (record.kind() != SqlLogicTestFile.Kind.QUERY
-                    && record.kind() != SqlLogicTestFile.Kind.STATEMENT_OK
-                    && record.kind() != SqlLogicTestFile.Kind.STATEMENT_ERROR) {
-                continue;
-            }
-            String sql = String.join("\n", record.sql());
-            if (sql.isBlank()) continue;
-
-            boolean nonPortable = NON_PORTABLE_MARKERS.stream().anyMatch(sql::contains);
-            if (nonPortable) {
-                skipped++;
-                continue;
-            }
-
-            String trinoSql = sql.replace("example.", TRINO_CATALOG + ".").strip();
-            trinoSql = trinoSql.endsWith(";") ? trinoSql.substring(0, trinoSql.length() - 1) : trinoSql;
-
-            try {
-                switch (record.kind()) {
-                    case QUERY -> {
-                        MaterializedResult result = runner.execute(session, trinoSql);
-                        List<List<String>> actual = new ArrayList<>();
-                        for (MaterializedRow row : result.getMaterializedRows()) {
-                            List<String> cells = new ArrayList<>(row.getFieldCount());
-                            for (int i = 0; i < row.getFieldCount(); i++) {
-                                Object v = row.getField(i);
-                                cells.add(v == null ? "NULL" : v.toString());
-                            }
-                            actual.add(cells);
-                        }
-                        if (!actual.equals(record.expectedRows())) {
-                            failures.add("QUERY mismatch for:\n" + trinoSql
-                                    + "\nexpected: " + record.expectedRows()
-                                    + "\nactual:   " + actual);
-                        } else {
-                            executed++;
-                        }
-                    }
-                    case STATEMENT_OK -> {
-                        runner.execute(session, trinoSql);
-                        executed++;
-                    }
-                    case STATEMENT_ERROR -> {
-                        try {
-                            runner.execute(session, trinoSql);
-                            failures.add("expected an error for:\n" + trinoSql);
-                        } catch (RuntimeException e) {
-                            // A DuckDB-specific error-message substring isn't
-                            // expected to match Trino's own wording — the
-                            // meaningful assertion here is just "it failed".
-                            executed++;
-                        }
-                    }
-                    default -> { }
-                }
-            } catch (RuntimeException e) {
-                failures.add("unexpected failure for:\n" + trinoSql + "\n" + e);
-            }
-        }
-
-        if (!failures.isEmpty()) {
-            fail(executed + " executed, " + skipped + " skipped, " + failures.size()
-                    + " FAILED:\n" + String.join("\n---\n", failures));
+        if (!result.failures().isEmpty()) {
+            fail(result.executed() + " executed, " + result.skipped() + " skipped, "
+                    + result.failures().size() + " FAILED:\n" + String.join("\n---\n", result.failures()));
         }
         // rowid.test has 8 non-portable records (the ATTACH this harness
         // replaces with createCatalog, DESCRIBE, the struct-rowid pair, and
@@ -187,7 +123,43 @@ final class VgiSqlLogicTestConformanceTest {
         // future edit to this file's portable content, or a regression that
         // silently starts skipping MORE than expected, shows up here rather
         // than as a quietly-shrinking executed count.
-        assertEquals(8, skipped, "expected skip count changed — see NON_PORTABLE_MARKERS");
-        assertEquals(8, executed, "expected executed-record count changed");
+        assertEquals(8, result.skipped(), "expected skip count changed — see NON_PORTABLE_MARKERS");
+        assertEquals(8, result.executed(), "expected executed-record count changed");
+    }
+
+    /**
+     * {@code catalog/window_self_join.test} is a DuckDB optimizer regression
+     * test (its whole point is a C++-side deep-copy bug in a window-function
+     * self-join rewrite), and most of the queries it runs to exercise that
+     * path are plain window-function/correlated-subquery SQL against a real
+     * declarative table — portable, apart from: its {@code ATTACH}/{@code
+     * DETACH} (this harness attaches via {@code createCatalog} instead), its
+     * one query using DuckDB's {@code QUALIFY} clause (Trino has no {@code
+     * QUALIFY} — confirmed by actually running it, not assumed: {@code
+     * mismatched input 'ROW_NUMBER'} where the parser choked past the
+     * unrecognized keyword), and its trailing {@code duckdb_functions()}
+     * introspection check.
+     */
+    private static final List<String> WINDOW_SELF_JOIN_NON_PORTABLE_MARKERS =
+            List.of("ATTACH ", "DETACH", "QUALIFY", "duckdb_functions(");
+
+    @Test
+    @Timeout(180)
+    void windowSelfJoinMatchesTheRealTestFile() throws Exception {
+        Path testFile = Path.of(System.getProperty("user.home"),
+                "Development/vgi/test/sql/integration/catalog/window_self_join.test");
+        Assumptions.assumeTrue(testFile.toFile().isFile(),
+                "~/Development/vgi/test/sql/integration/catalog/window_self_join.test not present");
+
+        SqlLogicTestRunner.Result result = SqlLogicTestRunner.run(runner, session, testFile,
+                "example.", TRINO_CATALOG, WINDOW_SELF_JOIN_NON_PORTABLE_MARKERS);
+
+        if (!result.failures().isEmpty()) {
+            fail(result.executed() + " executed, " + result.skipped() + " skipped, "
+                    + result.failures().size() + " FAILED:\n" + String.join("\n---\n", result.failures()));
+        }
+        // 4 non-portable records: ATTACH, the QUALIFY query, duckdb_functions(), DETACH.
+        assertEquals(4, result.skipped(), "expected skip count changed — see WINDOW_SELF_JOIN_NON_PORTABLE_MARKERS");
+        assertEquals(3, result.executed(), "expected executed-record count changed");
     }
 }

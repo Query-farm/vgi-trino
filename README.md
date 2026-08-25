@@ -486,6 +486,18 @@ the same boundary on static predicate pushdown).
   TABLE-input argument — see *Table functions* above for why these are
   skipped rather than registered wrong.
 - **Write support**, **multi-branch tables** (`catalog_table_scan_branches_get`),
-  **time travel**, **transactions** — VGI supports all four; none are wired
-  up here (write support matches vgi-java's own worker-SDK scope, which is
-  read-only today).
+  **time travel**, **transactions**, **views** — VGI supports all five; none
+  are wired up here (write support matches vgi-java's own worker-SDK scope,
+  which is read-only today).
+- **Custom ATTACH-time options.** `VgiWorkerClient.openAndAttach()` always
+  calls `catalog_attach` with `null` options/init-opaque-data — a worker whose
+  `catalog_attach` validates or depends on caller-supplied options (VGI's
+  attach-options mechanism) has no way to receive any from this connector
+  today. `vgi.catalog-name` is the only per-attach parameter this connector
+  threads through.
+- **Per-query settings and secrets.** `table_function_plan`/`init()` always
+  send `null`/`false` for `settings`/`secrets`/`resolved_secrets_provided` —
+  settings-aware and secret-scoped worker functions have no path to receive
+  either from this connector. Trino has no automatic SET-style pass-through,
+  but its per-session/catalog properties could plausibly be wired to VGI
+  settings; that's unbuilt, not merely untested.
