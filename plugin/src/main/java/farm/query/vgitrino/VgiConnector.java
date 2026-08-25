@@ -3,6 +3,7 @@
 package farm.query.vgitrino;
 
 import farm.query.vgitrino.client.VgiWorkerClient;
+import farm.query.vgitrino.function.VgiAggregateFunctions;
 import farm.query.vgitrino.function.VgiFunctionProvider;
 import farm.query.vgitrino.function.VgiScalarFunctions;
 import farm.query.vgitrino.metadata.VgiMetadata;
@@ -40,6 +41,7 @@ public final class VgiConnector implements Connector {
     private final Set<ConnectorTableFunction> tableFunctions;
     private final VgiScalarFunctions.Registry scalarFunctions;
     private final VgiScalarFunctions.BindCache scalarBindCache;
+    private final VgiAggregateFunctions.Registry aggregateFunctions;
 
     /**
      * @param client the pooled connection to this catalog's VGI worker,
@@ -48,14 +50,16 @@ public final class VgiConnector implements Connector {
      * @param tableFunctions this catalog's discovered, callable table
      *        functions (see {@link farm.query.vgitrino.function.VgiTableFunctions#discover})
      * @param scalarFunctions this catalog's discovered scalar functions (see {@link VgiScalarFunctions#discover})
+     * @param aggregateFunctions this catalog's discovered aggregate functions (see {@link VgiAggregateFunctions#discover})
      */
     public VgiConnector(VgiWorkerClient client, VgiConfig config, Set<ConnectorTableFunction> tableFunctions,
-            VgiScalarFunctions.Registry scalarFunctions) {
+            VgiScalarFunctions.Registry scalarFunctions, VgiAggregateFunctions.Registry aggregateFunctions) {
         this.client = client;
         this.config = config;
         this.tableFunctions = tableFunctions;
         this.scalarFunctions = scalarFunctions;
         this.scalarBindCache = new VgiScalarFunctions.BindCache();
+        this.aggregateFunctions = aggregateFunctions;
     }
 
     @Override
@@ -66,7 +70,7 @@ public final class VgiConnector implements Connector {
 
     @Override
     public ConnectorMetadata getMetadata(ConnectorSession session, ConnectorTransactionHandle transactionHandle) {
-        return new VgiMetadata(client, scalarFunctions);
+        return new VgiMetadata(client, scalarFunctions, aggregateFunctions);
     }
 
     @Override
@@ -101,7 +105,7 @@ public final class VgiConnector implements Connector {
 
     @Override
     public Optional<FunctionProvider> getFunctionProvider() {
-        return Optional.of(new VgiFunctionProvider(client, scalarFunctions, scalarBindCache));
+        return Optional.of(new VgiFunctionProvider(client, scalarFunctions, scalarBindCache, aggregateFunctions));
     }
 
     @Override

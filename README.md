@@ -664,6 +664,70 @@ this), pending either a Trino fix or a different bridging strategy this connecto
   discovery-time WARN logging above), falling back to first-discovered only when both are equally
   (non-)lossless.
 
+### Aggregate functions
+
+VGI aggregates (`vgi_sum`, `vgi_avg`, `vgi_count`, …) are dispatched via `ConnectorMetadata.
+getAggregationFunctionMetadata` + `FunctionProvider.getAggregationImplementation`
+(`VgiAggregateFunctions`/`VgiFunctionProvider`) — a genuinely different Trino SPI surface from
+scalar functions, and a genuinely different VGI wire protocol too: aggregates use their own set of
+plain unary RPCs (`aggregate_bind`/`update`/`combine`/`finalize`/`destructor`), never the
+exchange-mode streaming session scalar functions use.
+
+**Non-decomposable by design, not by omission.** Trino's distributed aggregation model wants to run
+a *partial* aggregation stage per node, ship each node's intermediate state across the network, and
+*combine* them on a final node — which needs a wire mechanism for a portable, execution-independent
+state blob. VGI's `aggregate_combine` doesn't have one: its `merge_batch` carries only `source_group_id`/
+`target_group_id` columns, no state payload at all — it merges two groups' state *within* one
+already-bound `execution_id`, addressed only by group id, on whichever single worker bound that
+execution. There's no RPC that hands the client a state blob a *different* accumulator (a different
+node, a different `execution_id`) could later deserialize and merge. So every VGI aggregate is
+registered with no `combineFunction` and no intermediate type — `AggregationFunctionMetadata.
+isDecomposable()` is defined as "has an intermediate type," so declaring none disables it outright,
+and Trino runs the whole aggregation as a single stage feeding one accumulator. The real cost: no
+partial-aggregation parallelism across nodes for a VGI aggregate. The alternative — guessing at a
+cross-node state-shipping mechanism the protocol doesn't actually provide — would be worse.
+
+**Row-at-a-time `input()`, batched RPCs.** Trino's `AccumulatorCompiler` calls the `input`
+`MethodHandle` once per ROW, with no vectorized calling convention at the implementation level.
+Naively RPC-ing on every call would be a real regression versus scalar functions (called once per
+*output* row; an aggregate's `input()` is called once per *input* row feeding a far smaller number
+of groups). `VgiAggregateFunctions.AggregateState` instead buffers each row in-process into a local
+Arrow batch tagged with a `__vgi_group_id` column — exactly the batched, group-tagged shape VGI's
+own `aggregate_update` already expects — and only calls `aggregate_update` once the buffer crosses a
+size threshold (4096 rows) or `output()` needs to flush whatever's pending before finalizing.
+
+One state class (`AggregateState`, implementing `GroupedAccumulatorState`) serves both grouped
+(`GROUP BY`) and ungrouped aggregation — `AccumulatorStateFactory.createSingleState()`/
+`createGroupedState()` both return the same type by design; the ungrouped case just never calls
+`setGroupId`, leaving every row tagged with the implicit group id 0. `aggregate_bind` happens once,
+eagerly, in the state's constructor, minting one `execution_id` for that accumulator's whole
+lifetime; `FILTER (WHERE ...)`, `DISTINCT`, and an explicit `ORDER BY` inside the aggregate call are
+all handled by Trino's own engine before `input()` is ever called — nothing VGI-specific needed
+there. `OVER` (windowed usage) works too, via Trino's automatic window-accumulator fallback (full
+recompute per frame rather than the optimized incremental path — a performance ceiling, not a
+correctness gap).
+
+**Null handling matches VGI's own default without extra work.** `vgi_sum`'s default null handling
+skips a NULL-valued row entirely (its `update()` is never called for one) — declaring every argument
+non-nullable makes Trino's own generated code skip calling `input()` for a null row in exactly the
+same way, confirmed by reading `AccumulatorCompiler`'s `anyParametersAreNull` gating directly rather
+than assumed.
+
+**Scope — deferred, named explicitly, same discipline as *Scalar functions* above:**
+
+- `vgi_const` (bind-time constant) arguments, varargs, and `any`-typed arguments — skipped at
+  discovery with a WARN, mirroring the scalar-function precedent for the same shapes.
+- A dynamic (bind-time-computed) return type — same ceiling as scalars: Trino resolves a function's
+  return type from its static `Signature` before any RPC happens.
+- More than 4 arguments — `VgiAggregateFunctions` only has hand-written `input` `MethodHandle`s for
+  0–4 arguments (Trino's compiler expects an exact, statically-typed `(State, ValueBlock, int, ...)`
+  parameter list per argument, not a generically collectible shape).
+- `aggregate_destructor` is never called — a known gap, not a correctness risk in the current
+  single-execution design (a finalized group's state is never needed again), but state isn't
+  reclaimed from the worker proactively yet.
+- Settings/secrets for aggregates — `AggregateBindRequest` carries the same `settings`/`secrets`
+  fields scalar functions already use, but this connector doesn't resolve/forward them yet.
+
 ### Dynamic filtering
 
 A join's build-side values reach a VGI scan the same way a literal `WHERE`
@@ -741,11 +805,11 @@ the same boundary on static predicate pushdown).
   `TABLE(...)`-argument/batch-path question for scalar functions (an
   entirely separate design, not this connector's row-at-a-time dispatch)
   is also still undecided.
-- **Aggregate functions.** VGI workers can expose aggregates (`vgi_sum`,
-  `vgi_avg`, `vgi_count`, etc. — confirmed real and unimplemented via the
-  sqllogictest census's `aggregate/*.test` files), and Trino's SPI supports
-  connector-defined aggregates via `FunctionProvider.getAggregationImplementation`
-  — not wired up at all yet, independent of the scalar-function work above.
+- **Aggregate functions.** Plain (non-const, non-vararg, non-`any`-typed, ≤4-argument) aggregates —
+  `vgi_sum`, `vgi_avg`, `vgi_count`, and similar — ARE now supported, non-decomposable (see
+  *Aggregate functions* above for why that's a real protocol ceiling, not a scope choice). Const
+  arguments, varargs, `any`-typed arguments, settings/secrets, and `aggregate_destructor`-driven
+  state cleanup are the named, deferred remainder — see that section's own scope list.
 - **Write support**, **multi-branch tables** (`catalog_table_scan_branches_get`),
   **transactions**, **views** — VGI supports all four; none are wired up here
   (write support matches vgi-java's own worker-SDK scope, which is read-only

@@ -11,6 +11,7 @@ import farm.query.vgi.protocol.TableInfo;
 import farm.query.vgi.protocol.TableScanFunctionGetResponse;
 import farm.query.vgirpc.marshal.RecordCodec;
 import farm.query.vgitrino.client.VgiWorkerClient;
+import farm.query.vgitrino.function.VgiAggregateFunctions;
 import farm.query.vgitrino.function.VgiScalarFunctions;
 import farm.query.vgitrino.types.ArrowSchemaCodec;
 import farm.query.vgitrino.types.VgiColumnNames;
@@ -26,6 +27,7 @@ import io.trino.spi.connector.Constraint;
 import io.trino.spi.connector.ConstraintApplicationResult;
 import io.trino.spi.connector.SchemaTableName;
 import io.trino.spi.connector.TableNotFoundException;
+import io.trino.spi.function.AggregationFunctionMetadata;
 import io.trino.spi.function.BoundSignature;
 import io.trino.spi.function.FunctionDependencyDeclaration;
 import io.trino.spi.function.FunctionId;
@@ -60,14 +62,18 @@ public final class VgiMetadata implements ConnectorMetadata {
 
     private final VgiWorkerClient client;
     private final VgiScalarFunctions.Registry scalarFunctions;
+    private final VgiAggregateFunctions.Registry aggregateFunctions;
 
     /**
      * @param client the pooled connection to this catalog's VGI worker
      * @param scalarFunctions this catalog's discovered scalar functions (see {@link VgiScalarFunctions#discover})
+     * @param aggregateFunctions this catalog's discovered aggregate functions (see {@link VgiAggregateFunctions#discover})
      */
-    public VgiMetadata(VgiWorkerClient client, VgiScalarFunctions.Registry scalarFunctions) {
+    public VgiMetadata(VgiWorkerClient client, VgiScalarFunctions.Registry scalarFunctions,
+            VgiAggregateFunctions.Registry aggregateFunctions) {
         this.client = client;
         this.scalarFunctions = scalarFunctions;
+        this.aggregateFunctions = aggregateFunctions;
     }
 
     @Override
@@ -281,17 +287,39 @@ public final class VgiMetadata implements ConnectorMetadata {
         return columnMetadataFor(field);
     }
 
-    /** Real discovery — see {@link VgiScalarFunctions#discover}; may return more than one overload. */
+    /**
+     * Real discovery — see {@link VgiScalarFunctions#discover}/{@link VgiAggregateFunctions#discover};
+     * may return more than one overload, and scalars/aggregates never collide on {@code
+     * (schemaName, functionName)} since {@link FunctionId}s are minted from disjoint {@code
+     * "vgi:"}/{@code "vgi_agg:"} prefixes, but VGI itself doesn't forbid a schema declaring both a
+     * scalar and an aggregate under the same name — Trino resolves by call shape (e.g. {@code
+     * OVER}/{@code GROUP BY} presence), not by us picking one here, so both sets are always merged.
+     */
     @Override
     public Collection<FunctionMetadata> getFunctions(ConnectorSession session, SchemaFunctionName name) {
-        return scalarFunctions.functionsFor(name.schemaName(), name.functionName());
+        List<FunctionMetadata> merged = new ArrayList<>(
+                scalarFunctions.functionsFor(name.schemaName(), name.functionName()));
+        merged.addAll(aggregateFunctions.functionsFor(name.schemaName(), name.functionName()));
+        return merged;
     }
 
     @Override
     public FunctionMetadata getFunctionMetadata(ConnectorSession session, FunctionId functionId) {
         FunctionMetadata metadata = scalarFunctions.metadataFor(functionId);
+        if (metadata == null) metadata = aggregateFunctions.metadataFor(functionId);
         if (metadata == null) {
             throw new IllegalArgumentException("unknown function id: " + functionId);
+        }
+        return metadata;
+    }
+
+    /** Real discovery — see {@link VgiAggregateFunctions}'s own javadoc for why every VGI aggregate
+     *  is declared non-decomposable (no intermediate type) rather than a design choice made here. */
+    @Override
+    public AggregationFunctionMetadata getAggregationFunctionMetadata(ConnectorSession session, FunctionId functionId) {
+        AggregationFunctionMetadata metadata = aggregateFunctions.aggregationFunctionMetadataFor(functionId);
+        if (metadata == null) {
+            throw new IllegalArgumentException("unknown aggregate function id: " + functionId);
         }
         return metadata;
     }
@@ -299,7 +327,7 @@ public final class VgiMetadata implements ConnectorMetadata {
     @Override
     public FunctionDependencyDeclaration getFunctionDependencies(
             ConnectorSession session, FunctionId functionId, BoundSignature boundSignature) {
-        // VGI scalars call no other Trino function/operator/cast — nothing to declare.
+        // VGI scalars/aggregates call no other Trino function/operator/cast — nothing to declare.
         return FunctionDependencyDeclaration.NO_DEPENDENCIES;
     }
 }

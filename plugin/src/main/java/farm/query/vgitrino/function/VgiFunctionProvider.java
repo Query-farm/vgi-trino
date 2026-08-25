@@ -7,6 +7,7 @@ import farm.query.vgitrino.split.VgiSplit;
 import io.trino.spi.connector.ConnectorSession;
 import io.trino.spi.connector.ConnectorSplit;
 import io.trino.spi.connector.ConnectorTableCredentials;
+import io.trino.spi.function.AggregationImplementation;
 import io.trino.spi.function.BoundSignature;
 import io.trino.spi.function.FunctionDependencies;
 import io.trino.spi.function.FunctionId;
@@ -39,17 +40,20 @@ public final class VgiFunctionProvider implements FunctionProvider {
     private final VgiWorkerClient client;
     private final VgiScalarFunctions.Registry scalarFunctions;
     private final VgiScalarFunctions.BindCache bindCache;
+    private final VgiAggregateFunctions.Registry aggregateFunctions;
 
     /**
      * @param client the pooled connection to this catalog's VGI worker
      * @param scalarFunctions this catalog's discovered scalar functions (see {@link VgiScalarFunctions#discover})
      * @param bindCache the shared, catalog-scoped bind-result cache every scalar call site reuses
+     * @param aggregateFunctions this catalog's discovered aggregate functions (see {@link VgiAggregateFunctions#discover})
      */
     public VgiFunctionProvider(VgiWorkerClient client, VgiScalarFunctions.Registry scalarFunctions,
-            VgiScalarFunctions.BindCache bindCache) {
+            VgiScalarFunctions.BindCache bindCache, VgiAggregateFunctions.Registry aggregateFunctions) {
         this.client = client;
         this.scalarFunctions = scalarFunctions;
         this.bindCache = bindCache;
+        this.aggregateFunctions = aggregateFunctions;
     }
 
     @Override
@@ -114,6 +118,37 @@ public final class VgiFunctionProvider implements FunctionProvider {
         return ScalarFunctionImplementation.builder()
                 .methodHandle(adapted)
                 .instanceFactory(instanceFactory)
+                .build();
+    }
+
+    /**
+     * Build the {@link AggregationImplementation} for one call site — see {@link
+     * VgiAggregateFunctions}'s own javadoc for the non-decomposable, batched-input design this
+     * builds on. Every VGI aggregate is registered with no {@code combineFunction} and no
+     * intermediate type, so Trino runs it as a single stage feeding one accumulator; {@link
+     * VgiAggregateFunctions.StateFactory} mints one {@link VgiAggregateFunctions.AggregateState}
+     * per accumulator, binding a fresh {@code execution_id} eagerly in its constructor.
+     */
+    @Override
+    public AggregationImplementation getAggregationImplementation(
+            FunctionId functionId, BoundSignature boundSignature, FunctionDependencies functionDependencies) {
+        VgiAggregateFunctions.Entry entry = aggregateFunctions.entryFor(functionId);
+        if (entry == null) {
+            throw new IllegalArgumentException("unknown VGI aggregate function id: " + functionId);
+        }
+        List<Type> argumentTypes = boundSignature.getArgumentTypes();
+        Type returnType = boundSignature.getReturnType();
+        VgiAggregateFunctions.CallConfig callConfig =
+                VgiAggregateFunctions.buildCallConfig(entry, argumentTypes, returnType);
+
+        VgiAggregateFunctions.StateFactory stateFactory =
+                new VgiAggregateFunctions.StateFactory(client, callConfig);
+
+        return AggregationImplementation.builder()
+                .inputFunction(VgiAggregateFunctions.inputHandle(argumentTypes.size()))
+                .outputFunction(VgiAggregateFunctions.outputHandle())
+                .accumulatorStateDescriptor(VgiAggregateFunctions.AggregateState.class,
+                        new VgiAggregateFunctions.StateSerializer(), stateFactory)
                 .build();
     }
 }

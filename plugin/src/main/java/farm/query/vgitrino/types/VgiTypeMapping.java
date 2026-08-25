@@ -535,8 +535,13 @@ public final class VgiTypeMapping {
      * {@link Type#getJavaType()} since {@code Type.getObject}/{@code writeObject} are only valid
      * for types whose native representation genuinely IS an object (Slice, SqlRow, Block, Int128,
      * …); a primitive-native type (long/double/boolean) requires its own typed getter/writer.
+     *
+     * <p>Public: also the exact bridge {@code VgiAggregateFunctions} needs between the {@code
+     * (ValueBlock, int position)} pair Trino's aggregation SPI hands an {@code input}/{@code
+     * combine} {@code MethodHandle} and this connector's own boxed-value convention — a {@link
+     * io.trino.spi.block.ValueBlock} is itself a {@link Block}, so no separate helper is needed.
      */
-    private static Object readBoxedValue(Type type, Block block, int position) {
+    public static Object readBoxedValue(Type type, Block block, int position) {
         if (block.isNull(position)) return null;
         Class<?> javaType = type.getJavaType();
         if (javaType == long.class) return type.getLong(block, position);
@@ -545,8 +550,8 @@ public final class VgiTypeMapping {
         return type.getObject(block, position);
     }
 
-    /** The write-side mirror of {@link #readBoxedValue}. */
-    private static void writeBoxedValue(Type type, BlockBuilder builder, Object value) {
+    /** The write-side mirror of {@link #readBoxedValue}, public for the same reason. */
+    public static void writeBoxedValue(Type type, BlockBuilder builder, Object value) {
         if (value == null) {
             builder.appendNull();
             return;
