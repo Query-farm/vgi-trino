@@ -7,6 +7,7 @@ import farm.query.vgi.protocol.BindResponse;
 import farm.query.vgirpc.marshal.RecordCodec;
 import farm.query.vgitrino.VgiConfig;
 import farm.query.vgitrino.client.VgiWorkerClient;
+import farm.query.vgitrino.function.VgiTableFunctionHandle;
 import farm.query.vgitrino.metadata.VgiColumnHandle;
 import farm.query.vgitrino.metadata.VgiTableHandle;
 import io.trino.spi.connector.ColumnHandle;
@@ -16,6 +17,7 @@ import io.trino.spi.connector.ConnectorSplitManager;
 import io.trino.spi.connector.ConnectorSplitSource;
 import io.trino.spi.connector.ConnectorTableHandle;
 import io.trino.spi.connector.ConnectorTransactionHandle;
+import io.trino.spi.function.table.ConnectorTableFunctionHandle;
 
 import java.util.List;
 import java.util.Set;
@@ -91,5 +93,18 @@ public final class VgiSplitManager implements ConnectorSplitManager {
             byte[] serializedBindCall = RecordCodec.serializeToBytes(bindRequest);
             return new VgiSplitSource(client, config, serializedBindCall, bound.opaque_data(), projectionIds);
         });
+    }
+
+    /**
+     * Splits for a {@code TABLE(catalog.schema.fn(...))} call: the bind
+     * already happened in {@link farm.query.vgitrino.function.VgiTableFunction#analyze},
+     * so this just hands its result straight to a {@link VgiSplitSource} —
+     * no extra RPC round trip here.
+     */
+    @Override
+    public ConnectorSplitSource getSplits(
+            ConnectorTransactionHandle transaction, ConnectorSession session, ConnectorTableFunctionHandle handle) {
+        VgiTableFunctionHandle functionHandle = (VgiTableFunctionHandle) handle;
+        return new VgiSplitSource(client, config, functionHandle.bindCall(), functionHandle.bindOpaqueData(), null);
     }
 }

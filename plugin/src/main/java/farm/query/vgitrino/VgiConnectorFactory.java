@@ -3,11 +3,14 @@
 package farm.query.vgitrino;
 
 import farm.query.vgitrino.client.VgiWorkerClient;
+import farm.query.vgitrino.function.VgiTableFunctions;
 import io.trino.spi.connector.Connector;
 import io.trino.spi.connector.ConnectorContext;
 import io.trino.spi.connector.ConnectorFactory;
+import io.trino.spi.function.table.ConnectorTableFunction;
 
 import java.util.Map;
+import java.util.Set;
 
 /**
  * Entry point Trino calls once per {@code etc/catalog/*.properties} file that
@@ -30,6 +33,7 @@ public final class VgiConnectorFactory implements ConnectorFactory {
     public Connector create(String catalogName, Map<String, String> config, ConnectorContext context) {
         VgiConfig vgiConfig = VgiConfig.fromProperties(config);
         VgiWorkerClient client = new VgiWorkerClient(vgiConfig);
-        return new VgiConnector(client, vgiConfig);
+        Set<ConnectorTableFunction> tableFunctions = VgiTableFunctions.discover(client);
+        return new VgiConnector(client, vgiConfig, tableFunctions);
     }
 }

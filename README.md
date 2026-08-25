@@ -16,11 +16,18 @@ SELECT * FROM vgi_example.data.numbers;
 
 ## Status
 
-This is a working v1: catalog/schema/table discovery, real multi-split
-parallel scans via `table_function_plan`, and projection pushdown are
-implemented and verified end to end (`./gradlew :plugin:test`) against both
-the reference Python fixture worker and an in-process split-capable worker.
-Read-only. See **Scope** below for what's deliberately not here yet.
+This is a working v1: catalog/schema/table discovery, callable VGI table
+functions via Trino's `TABLE(catalog.schema.fn(args))` syntax, real
+multi-split parallel scans via `table_function_plan` (for both declarative
+tables and table functions), and projection pushdown are implemented and
+verified end to end (`./gradlew :plugin:test`) against the reference Python
+fixture worker and an in-process split-capable worker. Read-only. See
+**Scope** below for what's deliberately not here yet.
+
+```sql
+-- A callable VGI table function:
+SELECT count(*) FROM TABLE(vgi_example.main.split_sequence(n => 200, splits => 12));
+```
 
 ## Configuration
 
@@ -49,22 +56,27 @@ fixture-worker test; the in-process split test needs nothing external):
 *actual* `.test` files from `~/Development/vgi/test/sql/integration/` — parsed
 by a small in-repo sqllogictest reader, not hand-ported equivalents — with
 their `ATTACH` rewritten to this connector's catalog and their real expected
-output compared against a real query result. Most of the 327-file suite can't
-run against Trino at all, for two reasons neither of which this connector can
-fix alone: ~119 files use DuckDB-only introspection (`duckdb_tables()`,
-`duckdb_databases()`, `CALL enable_logging`, DuckDB's own `EXPLAIN (FORMAT
-JSON)` shape) with no Trino equivalent, and ~161 use table-function CALL
-syntax, which needs Trino's `ConnectorTableFunction` SPI (not implemented —
-see Scope). `table/rowid.test` is the first ported file — 8 of its 16 records
-are portable declarative-table `SELECT`s; the rest are skipped with a reported
-reason (`DESCRIBE`, struct-typed rowid access, the `rowid_sequence(...)` calls
-at the bottom). Running it against a real worker is exactly what caught a real
-bug: this connector was resolving a table's backing scan function in the
-table's OWN schema, but VGI doesn't guarantee that — the fixture's
-`data.rowid_first` scans via `main.rowid_sequence`, a different schema
-entirely — fixed by passing no schema hint and letting the worker's own
-dispatcher search by name, matching vgi-python's own schema-less `Client`
-fallback.
+output compared against a real query result. Only `table/rowid.test` is
+ported so far — 8 of its 16 records are portable declarative-table `SELECT`s;
+the rest are skipped with a reported reason (`DESCRIBE`, struct-typed rowid
+access needing `ROW` type support, the `rowid_sequence(...)` calls, which now
+that table functions exist could be ported too — using DuckDB's `:=` named-arg
+syntax rather than Trino's `=>`, so the harness's naive `example.` rewrite
+alone won't carry them over unmodified). Running the file against a real
+worker is exactly what caught a real bug: this connector was resolving a
+table's backing scan function in the table's OWN schema, but VGI doesn't
+guarantee that — the fixture's `data.rowid_first` scans via
+`main.rowid_sequence`, a different schema entirely — fixed by passing no
+schema hint and letting the worker's own dispatcher search by name, matching
+vgi-python's own schema-less `Client` fallback.
+
+Most of the wider 327-file suite still can't run against Trino verbatim: ~119
+files use DuckDB-only introspection (`duckdb_tables()`, `duckdb_databases()`,
+`CALL enable_logging`, DuckDB's own `EXPLAIN (FORMAT JSON)` shape) with no
+Trino equivalent, ever. The ~161 files using table-function CALL syntax are a
+different story now that `ConnectorTableFunction` support exists (see *Table
+functions* below) — porting those needs a DuckDB-`:=`-to-Trino-`=>` syntax
+translation this harness doesn't do yet, not new connector functionality.
 
 **Local Trino, fast dev loop** (downloads/caches the Trino server tarball once):
 
@@ -93,8 +105,10 @@ plugin's jars get an isolated classloader built from exactly this directory).
 VgiPlugin -> VgiConnectorFactory -> VgiConnector
                                        |-- VgiMetadata            (catalog/schema/table discovery)
                                        |-- VgiSplitManager/Source  (table_function_plan, paginated)
-                                       \-- VgiPageSourceProvider/  (init(), Arrow -> Trino Block)
-                                           VgiPageSource
+                                       |-- VgiPageSourceProvider/  (init(), Arrow -> Trino Block)
+                                       |   VgiPageSource
+                                       \-- VgiFunctionProvider ->  (Trino's PTF SPI hook — see Table
+                                           VgiTableFunction*        functions below)
       \-- VgiWorkerClient: a pool of independently catalog_attach'd connections
 ```
 
@@ -129,6 +143,52 @@ zone, and 128-bit decimals. Anything else (half-precision floats, timestamps
 `UnsupportedOperationException` naming the column and type rather than
 silently mis-typing it.
 
+### Table functions
+
+VGI's callable table functions (`example.sequence(count)`,
+`example.split_sequence(n, splits)`) are reachable from Trino's Polymorphic
+Table Function SPI (`ConnectorTableFunction`, wired in via
+`Connector.getFunctionProvider()` — there's no direct hook on `Connector`
+itself for the split-reading side, `TableFunctionProcessorProvider` /
+`FunctionProvider` is it). `VgiTableFunctions.discover` lists every
+`TABLE_FUNCTION` at connector-creation time and decodes each one's
+`FunctionInfo.arguments` schema into `ScalarArgumentSpecification`s.
+`VgiTableFunction#analyze` calls the real `bind()` for the invocation's actual
+arguments (a function's output columns can depend on them —
+`constant_columns(n, *values)`'s types follow `values` — so the return type is
+declared `GenericTable` and the real `Descriptor` comes from `analyze`, not a
+static declaration), and the resulting handle feeds the exact same
+`VgiSplitSource`/`VgiPageSource` machinery a declarative table scan uses (a new
+`ConnectorSplitManager.getSplits(..., ConnectorTableFunctionHandle)` overload,
+and `VgiTableFunctionSplitProcessor`, the `TableFunctionSplitProcessor`
+counterpart of `VgiPageSource`).
+
+Three real wire-format lessons surfaced only by testing this against the real
+worker, all fixed:
+
+- Trino's PTF binder upper-cases an unquoted call-site argument name before
+  matching it against the declared spec — `ScalarArgumentSpecification` names
+  are registered upper-case, mapped back to VGI's own (case-sensitive) name
+  when building the bind call.
+- A `ScalarArgumentSpecification`'s default value (and `ScalarArgument.getValue()`
+  at call time) must be in the TYPE's own native/internal representation
+  (`Slice` for VARCHAR, raw int bits as a `long` for REAL) — not the plain Java
+  value `ArgumentsEncoder` infers an Arrow type from.
+- VGI's wire shape distinguishes POSITIONAL from NAMED arguments independently
+  of how a Trino caller wrote the call: `sequence`'s sole argument is named
+  `count` but is positional on the wire, so calling it as `sequence(count =>
+  10)` must still reach the worker as a positional value (`ArgumentsEncoder.
+  positional(...)`, in declared order) — sending it named throws `IndexError:
+  Argument 0: index out of range`.
+
+**v1 scope**: only plain-scalar-argument functions register at all — a
+function with a varargs, `any`-typed, or TABLE-input argument (`VgiArgSpec.
+decode` returns `null`) is skipped entirely rather than registered with a
+wrong/partial signature, and a name VGI itself overloads (multiple
+`FunctionInfo` entries under one (schema, name) — Trino's PTF model allows only
+one registration per name, unlike VGI's own arity/type-resolved dispatch) is
+skipped too rather than guessing which overload a caller meant.
+
 ## Scope — what v1 does not do yet
 
 - **Predicate pushdown** (`applyFilter`). Deliberately deferred, not just
@@ -153,9 +213,9 @@ silently mis-typing it.
   `DynamicFilterSnapshot` is accepted but unused; VGI's `refined_filters`/
   `filters_complete` fields exist for exactly this and aren't threaded
   through.
-- **Trino table functions.** VGI's callable table functions (e.g.
-  `example.sequence(n)`) aren't exposed via Trino's `ConnectorTableFunction`
-  SPI — only declarative catalog tables are queryable.
+- **Overloaded table functions**, and any function with a varargs/`any`-typed/
+  TABLE-input argument — see *Table functions* above for why these are
+  skipped rather than registered wrong.
 - **Write support**, **multi-branch tables** (`catalog_table_scan_branches_get`),
   **time travel**, **transactions** — VGI supports all four; none are wired
   up here (write support matches vgi-java's own worker-SDK scope, which is
