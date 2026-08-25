@@ -19,10 +19,10 @@ SELECT * FROM vgi_example.data.numbers;
 This is a working v1: catalog/schema/table discovery, callable VGI table
 functions via Trino's `TABLE(catalog.schema.fn(args))` syntax, real
 multi-split parallel scans via `table_function_plan` (for both declarative
-tables and table functions), and projection *and predicate* pushdown are
-implemented and verified end to end (`./gradlew :plugin:test`) against the
-reference Python fixture worker and an in-process split-capable worker.
-Read-only. See **Scope** below for what's deliberately not here yet.
+tables and table functions), and projection, predicate, *and dynamic-filter*
+pushdown are implemented and verified end to end (`./gradlew :plugin:test`)
+against the reference Python fixture worker and in-process split-capable
+workers. Read-only. See **Scope** below for what's deliberately not here yet.
 
 ```sql
 -- A callable VGI table function:
@@ -238,6 +238,67 @@ desired columns" as an explicit `projection_ids=[]` — which this table's real
 columns," not "no restriction, return everything." Fixed in both places by
 treating an empty desired-columns set as `projection_ids=null` instead.
 
+### Dynamic filtering
+
+A join's build-side values reach a VGI scan the same way a literal `WHERE`
+does: `VgiSplitSource.getNextBatch` and `VgiPageSourceProvider.createPageSource`
+each receive Trino's own `DynamicFilterSnapshot`/`DynamicFilter`, and both
+intersect its `TupleDomain` with the scan's static `applyFilter` constraint
+before running it through the very same `VgiFilterTranslator`/
+`VgiFilterEncoding` a literal predicate uses. There's no separate encoding
+path for "arrived from a join" versus "arrived from a `WHERE` clause" — Trino
+already reduces a join's build side to a `TupleDomain` (a discrete value set
+when small enough, otherwise a min/max range), which is exactly the shape the
+translator already handles.
+
+Two different moments need this, for two different reasons:
+
+- **Plan time** (`VgiSplitSource`): the FIRST `getNextBatch` call (no cursor
+  yet) sends everything currently known as plain `pushdown_filters`; a LATER
+  page sends only what's narrowed further since the previous call, as
+  `refined_filters` — which the protocol documents as narrowing future splits
+  only, so a split already emitted under a looser filter is never invalidated
+  by one. `getRequestedDynamicFilterWaitTimeoutMillis` (new `vgi.
+  dynamic-filtering-wait-timeout-millis` config, default 1000ms) asks Trino to
+  hold that first call until the filter completes or the timeout elapses —
+  without it, a broadcast join's build side often hasn't finished before
+  planning would otherwise start, and a split already emitted can't be
+  narrowed retroactively.
+- **Redemption time** (`VgiPageSourceProvider`): every split's `init()` gets a
+  freshly merged filter at the moment it's actually redeemed, independent of
+  which `table_function_plan` page produced it — this, not the plan-time
+  bookkeeping above, is what actually guarantees a worker with
+  `auto_apply_filters=true` prunes correctly in every split, including ones
+  from later pages a slow-to-collect filter couldn't have reached in time to
+  plan around.
+
+`VgiDynamicFilteringQueryRunnerTest` proves both matter: an in-process
+vgi-java fixture (split-capable, `auto_apply_filters=true`, since the
+reference fixture workers' only comparable function — `split_dynamic_filter`
+— is a callable table FUNCTION, and Trino's PTF SPI has no filter hook at
+all; see *Table functions* below) is forced to paginate `table_function_plan`
+across 6 pages (30 splits, 5 per page) while a real `JOIN` against a small
+`VALUES` build side runs. Every surviving row, from every page, reports the
+identical real filter — not just the first page's rows.
+
+Landing this also surfaced a real, pre-existing gap in `vgi-java` itself:
+`VgiServiceImpl.planRequestOf` decoded `pushdown_filters` but silently dropped
+`refined_filters`/`filters_complete` from every `table_function_plan` request
+— any JVM-hosted worker's `plan()` was simply never told about a
+continuation's narrowing. Fixed upstream (`vgi-java`) by merging the two
+decoded filter lists (both are top-level, implicit-AND lists on the wire, so
+merging is concatenation) into the same `PlanRequest.pushdownFilters` a
+fixture author already reads, and adding `PlanRequest.filtersComplete`.
+
+### Scope
+
+Dynamic filtering here is a plain-table-scan-only feature: `ConnectorTableFunctionHandle`
+is a bare marker interface and `TableFunctionProcessorProvider.getSplitProcessor`
+takes no filter of any kind, so a PTF-sourced split source is always built
+with `TupleDomain.all()` — there is nothing to thread through even in
+principle, not merely something left undone (see *Table functions* below for
+the same boundary on static predicate pushdown).
+
 ## Scope — what v1 does not do yet
 
 - **`http(s)://` transport.** Subprocess, `unix://`, and `tcp://` are
@@ -249,10 +310,8 @@ treating an empty desired-columns set as `projection_ids=null` instead.
   min/max/distinct stats (`table_function_statistics`,
   `catalog_table_column_statistics_get` — both already decodable client-side
   via `ColumnStatisticsDecoder`) aren't wired into `getTableStatistics` yet.
-- **Dynamic filtering.** `ConnectorSplitSource.getNextBatch`'s
-  `DynamicFilterSnapshot` is accepted but unused; VGI's `refined_filters`/
-  `filters_complete` fields exist for exactly this and aren't threaded
-  through.
+- **Predicate/dynamic-filter pushdown for table functions.** Not deferred —
+  impossible via Trino's current PTF SPI; see *Table functions* above.
 - **Overloaded table functions**, and any function with a varargs/`any`-typed/
   TABLE-input argument — see *Table functions* above for why these are
   skipped rather than registered wrong.

@@ -31,6 +31,12 @@ import java.util.Map;
  *        as {@code target_split_bytes}, or {@code null} to let the worker decide
  * @param minSplits parallelism floor passed as {@code min_splits}, or {@code null}
  * @param maxSplitsPerResponse pagination cap per {@code table_function_plan} call
+ * @param dynamicFilteringWaitTimeoutMillis how long {@link farm.query.vgitrino.split.VgiSplitSource}
+ *        asks Trino to hold its first {@code getNextBatch} call so a join's
+ *        dynamic filter can arrive before any split is planned — see
+ *        {@code ConnectorSplitSource.getRequestedDynamicFilterWaitTimeoutMillis}.
+ *        {@code 0} disables waiting (Trino calls back immediately with
+ *        whatever it has, which may be nothing yet)
  */
 public record VgiConfig(
         String location,
@@ -38,13 +44,17 @@ public record VgiConfig(
         int connections,
         Long targetSplitBytes,
         Long minSplits,
-        int maxSplitsPerResponse) {
+        int maxSplitsPerResponse,
+        long dynamicFilteringWaitTimeoutMillis) {
 
     /** Default connection-pool size when {@code vgi.connections} is unset. */
     public static final int DEFAULT_CONNECTIONS = 4;
 
     /** Default {@code max_splits_per_response} when {@code vgi.max-splits-per-response} is unset. */
     public static final int DEFAULT_MAX_SPLITS_PER_RESPONSE = 1000;
+
+    /** Default dynamic-filtering wait, when {@code vgi.dynamic-filtering-wait-timeout-millis} is unset. */
+    public static final long DEFAULT_DYNAMIC_FILTERING_WAIT_TIMEOUT_MILLIS = 1000L;
 
     /**
      * Parse the catalog properties map Trino provides.
@@ -70,7 +80,11 @@ public record VgiConfig(
         Long minSplits = parseLongOrNull(properties.get("vgi.min-splits"));
         int maxSplitsPerResponse = parseInt(
                 properties.get("vgi.max-splits-per-response"), DEFAULT_MAX_SPLITS_PER_RESPONSE);
-        return new VgiConfig(location, catalogName, connections, targetSplitBytes, minSplits, maxSplitsPerResponse);
+        long dynamicFilteringWaitTimeoutMillis = parseLong(
+                properties.get("vgi.dynamic-filtering-wait-timeout-millis"),
+                DEFAULT_DYNAMIC_FILTERING_WAIT_TIMEOUT_MILLIS);
+        return new VgiConfig(location, catalogName, connections, targetSplitBytes, minSplits,
+                maxSplitsPerResponse, dynamicFilteringWaitTimeoutMillis);
     }
 
     private static int parseInt(String value, int fallback) {
@@ -79,5 +93,9 @@ public record VgiConfig(
 
     private static Long parseLongOrNull(String value) {
         return value == null ? null : Long.parseLong(value.trim());
+    }
+
+    private static long parseLong(String value, long fallback) {
+        return value == null ? fallback : Long.parseLong(value.trim());
     }
 }

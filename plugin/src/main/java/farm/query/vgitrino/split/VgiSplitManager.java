@@ -7,7 +7,6 @@ import farm.query.vgi.protocol.BindResponse;
 import farm.query.vgirpc.marshal.RecordCodec;
 import farm.query.vgitrino.VgiConfig;
 import farm.query.vgitrino.client.VgiWorkerClient;
-import farm.query.vgitrino.filter.VgiFilterEncoding;
 import farm.query.vgitrino.function.VgiTableFunctionHandle;
 import farm.query.vgitrino.metadata.VgiColumnHandle;
 import farm.query.vgitrino.metadata.VgiTableHandle;
@@ -20,6 +19,7 @@ import io.trino.spi.connector.ConnectorSplitSource;
 import io.trino.spi.connector.ConnectorTableHandle;
 import io.trino.spi.connector.ConnectorTransactionHandle;
 import io.trino.spi.function.table.ConnectorTableFunctionHandle;
+import io.trino.spi.predicate.TupleDomain;
 import org.apache.arrow.vector.types.pojo.Schema;
 
 import java.util.List;
@@ -79,7 +79,6 @@ public final class VgiSplitManager implements ConnectorSplitManager {
         List<Integer> projectionIds = projectedColumns.isEmpty()
                 ? null : projectedColumns.stream().map(VgiColumnHandle::ordinal).toList();
         Schema fullSchema = ArrowSchemaCodec.deserializeSchema(handle.outputSchema());
-        byte[] pushdownFilters = VgiFilterEncoding.encode(handle.constraint(), fullSchema, projectedColumns);
         return client.withConnection(a -> {
             BindRequest bindRequest = new BindRequest(
                     handle.scanFunctionName(),
@@ -105,7 +104,7 @@ public final class VgiSplitManager implements ConnectorSplitManager {
             BindResponse bound = a.service().bind(bindRequest, null);
             byte[] serializedBindCall = RecordCodec.serializeToBytes(bindRequest);
             return new VgiSplitSource(client, config, serializedBindCall, bound.opaque_data(),
-                    projectionIds, pushdownFilters);
+                    projectionIds, fullSchema, projectedColumns, handle.constraint());
         });
     }
 
@@ -119,9 +118,14 @@ public final class VgiSplitManager implements ConnectorSplitManager {
     public ConnectorSplitSource getSplits(
             ConnectorTransactionHandle transaction, ConnectorSession session, ConnectorTableFunctionHandle handle) {
         VgiTableFunctionHandle functionHandle = (VgiTableFunctionHandle) handle;
-        // No predicate pushdown for table functions in v1 (Trino's PTF calls
-        // don't carry a WHERE-clause constraint the way a table scan does).
+        // No predicate or dynamic-filter pushdown for table functions in v1:
+        // Trino's ConnectorTableFunction SPI (483) has no Constraint/DynamicFilter
+        // hook anywhere in the TABLE(...) call path (ConnectorTableFunctionHandle
+        // is a bare marker interface, and TableFunctionProcessorProvider's split
+        // processor takes no filter of any kind) — there is nothing to thread
+        // through even in principle, not merely something left undone.
+        Schema fullSchema = ArrowSchemaCodec.deserializeSchema(functionHandle.outputSchema());
         return new VgiSplitSource(client, config, functionHandle.bindCall(), functionHandle.bindOpaqueData(),
-                null, null);
+                null, fullSchema, List.of(), TupleDomain.all());
     }
 }

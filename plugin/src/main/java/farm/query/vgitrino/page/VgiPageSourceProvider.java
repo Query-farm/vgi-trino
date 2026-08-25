@@ -17,6 +17,7 @@ import io.trino.spi.connector.ConnectorTableCredentials;
 import io.trino.spi.connector.ConnectorTableHandle;
 import io.trino.spi.connector.ConnectorTransactionHandle;
 import io.trino.spi.connector.DynamicFilter;
+import io.trino.spi.predicate.TupleDomain;
 import org.apache.arrow.vector.types.pojo.Schema;
 
 import java.util.Comparator;
@@ -53,7 +54,16 @@ public final class VgiPageSourceProvider implements ConnectorPageSourceProvider 
                 .sorted(Comparator.comparingInt(VgiColumnHandle::ordinal))
                 .toList();
         Schema fullSchema = ArrowSchemaCodec.deserializeSchema(handle.outputSchema());
-        byte[] pushdownFilters = VgiFilterEncoding.encode(handle.constraint(), fullSchema, sortedColumns);
+        // Merge in whatever of a join's dynamic filter has arrived by the time
+        // this SPECIFIC split is redeemed — best-effort, not awaited here: the
+        // split source's own getRequestedDynamicFilterWaitTimeoutMillis is what
+        // holds the plan phase for the filter, so by the time a split exists to
+        // redeem at all, the filter reaching this point is already as complete
+        // as it's going to get without blocking twice.
+        TupleDomain<VgiColumnHandle> dynamicPredicate =
+                dynamicFilter.getCurrentPredicate().transformKeys(VgiColumnHandle.class::cast);
+        TupleDomain<VgiColumnHandle> merged = handle.constraint().intersect(dynamicPredicate);
+        byte[] pushdownFilters = VgiFilterEncoding.encode(merged, fullSchema, sortedColumns);
         return new VgiPageSource(client, vgiSplit, vgiColumns, handle.outputSchema(), pushdownFilters);
     }
 }
