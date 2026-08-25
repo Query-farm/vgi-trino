@@ -303,7 +303,85 @@ final class SqlLogicTestRunner {
         String rewritten = insertDefaultSchema(sql, trinoCatalog);
         rewritten = wrapBareTableFunctionCalls(rewritten, trinoCatalog);
         rewritten = rewriteRangeCalls(rewritten);
+        rewritten = rewriteBlobHexLiterals(rewritten);
         return rewritten.replace(":=", "=>");
+    }
+
+    /**
+     * Rewrites {@code CAST('\xHH\xHH...' AS VARBINARY)} — DuckDB's {@code \xHH} byte-escape
+     * convention inside a string literal destined for VARBINARY — into Trino's own {@code
+     * X'HHHH...'} hex-literal syntax. Trino's string-literal grammar has no {@code \x} escape at
+     * all, so the original literal is instead taken completely literally: {@code
+     * CAST('\xCA\xFE' AS VARBINARY)} silently casts the 8-character text {@code \xCA\xFE} (a
+     * backslash, an x, four hex-digit characters) to its own UTF-8 bytes — an entirely different,
+     * wrong value — confirmed via a real {@code QUERY_MISMATCH} sample ({@code binary_packet.test}
+     * expected {@code CAFE0102763101}, got the UTF-8 bytes of the literal escape text instead).
+     *
+     * <p>Deliberately narrow: only rewrites a literal whose ENTIRE content is a (possibly empty)
+     * run of {@code \xHH} groups — a mix of plain text and escapes, or any other DuckDB string
+     * escape, is left alone rather than guessing at a more general escape-decoding rule the real
+     * corpus doesn't need.
+     */
+    private static String rewriteBlobHexLiterals(String sql) {
+        String marker = "CAST('";
+        StringBuilder out = new StringBuilder();
+        int i = 0;
+        int n = sql.length();
+        while (i < n) {
+            if (sql.startsWith(marker, i)) {
+                int contentStart = i + marker.length();
+                int closeQuote = findClosingQuote(sql, contentStart);
+                if (closeQuote >= 0) {
+                    String content = sql.substring(contentStart, closeQuote);
+                    int afterQuote = closeQuote + 1;
+                    int afterWhitespace = afterQuote;
+                    while (afterWhitespace < n && Character.isWhitespace(sql.charAt(afterWhitespace))) afterWhitespace++;
+                    String asVarbinary = "AS VARBINARY)";
+                    if (sql.startsWith(asVarbinary, afterWhitespace) && isPureHexEscapeRun(content)) {
+                        out.append("X'").append(decodeHexEscapes(content)).append('\'');
+                        i = afterWhitespace + asVarbinary.length();
+                        continue;
+                    }
+                }
+            }
+            out.append(sql.charAt(i));
+            i++;
+        }
+        return out.toString();
+    }
+
+    /** Index of the {@code '} closing a string literal that started right after {@code openIndex - 1}'s
+     *  opening quote (i.e. {@code openIndex} is the first content character), honoring {@code ''} as an
+     *  escaped quote — or -1 if it never closes. */
+    private static int findClosingQuote(String sql, int openIndex) {
+        for (int k = openIndex; k < sql.length(); k++) {
+            if (sql.charAt(k) == '\'') {
+                if (k + 1 < sql.length() && sql.charAt(k + 1) == '\'') { k++; continue; }
+                return k;
+            }
+        }
+        return -1;
+    }
+
+    private static boolean isPureHexEscapeRun(String content) {
+        if (content.length() % 4 != 0) return false;
+        for (int i = 0; i < content.length(); i += 4) {
+            if (content.charAt(i) != '\\' || content.charAt(i + 1) != 'x'
+                    || Character.digit(content.charAt(i + 2), 16) < 0
+                    || Character.digit(content.charAt(i + 3), 16) < 0) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private static String decodeHexEscapes(String content) {
+        StringBuilder hex = new StringBuilder(content.length());
+        for (int i = 0; i < content.length(); i += 4) {
+            hex.append(Character.toUpperCase(content.charAt(i + 2)));
+            hex.append(Character.toUpperCase(content.charAt(i + 3)));
+        }
+        return hex.toString();
     }
 
     /**

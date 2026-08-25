@@ -71,7 +71,23 @@ final class VgiSqlLogicTestCensusTest {
             // actual physical-plan text, which obviously never matches. Not a connector bug to fix;
             // a structurally different feature between the two engines, matching the "EXPLAIN
             // (FORMAT JSON)" case this broader marker now subsumes.
-            "EXPLAIN ");
+            "EXPLAIN ",
+            // A confirmed, documented Trino SPI ceiling (see the README's "Predicate pushdown"
+            // scope note), not a bug: a PTF-sourced split source is always built with
+            // TupleDomain.all() — ConnectorTableFunctionHandle is a bare marker interface and
+            // TableFunctionProcessorProvider.getSplitProcessor takes no filter of any kind, so
+            // there is nothing to thread through even in principle. Every one of these functions
+            // exists specifically to echo back what filter it received, so "(none)" is the only
+            // possible correct answer today — confirmed by sampling real QUERY_MISMATCH failures,
+            // not assumed. Fixing this needs an upstream Trino SPI change, which is out of scope.
+            "filter_echo(", "split_echo_filters(", "split_dynamic_filter(",
+            // DuckDB's own catalog name (e.g. "example", "v1", "accumulate" from its own ATTACH
+            // statements) is a plain STRING VALUE inside these queries, not an identifier prefix —
+            // the harness's catalog rewrite only ever touches "example." (dot-suffixed, used as a
+            // schema-qualifier), so a bare catalog-name-as-data comparison against
+            // information_schema can never match the renamed Trino catalog ("vgi_example"). A
+            // harness catalog-naming artifact, not a connector information_schema bug.
+            "information_schema");
 
     private VgiWorkerHarness.Handle worker;
     private DistributedQueryRunner runner;

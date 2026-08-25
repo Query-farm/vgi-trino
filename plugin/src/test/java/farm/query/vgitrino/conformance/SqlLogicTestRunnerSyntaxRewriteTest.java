@@ -137,6 +137,28 @@ final class SqlLogicTestRunnerSyntaxRewriteTest {
     }
 
     @Test
+    void rewritesAPureHexEscapeBlobLiteralToTrinoHexSyntax() {
+        assertEquals(
+                "SELECT X'CAFE'",
+                SqlLogicTestRunner.rewriteDuckDbOnlySyntax("SELECT CAST('\\xCA\\xFE' AS VARBINARY)", CATALOG));
+    }
+
+    @Test
+    void rewritesAnEmptyBlobLiteral() {
+        assertEquals(
+                "SELECT X''",
+                SqlLogicTestRunner.rewriteDuckDbOnlySyntax("SELECT CAST('' AS VARBINARY)", CATALOG));
+    }
+
+    @Test
+    void leavesAMixedContentVarbinaryCastAlone() {
+        // Plain text mixed with escapes -- deliberately out of scope, see rewriteBlobHexLiterals's
+        // own javadoc -- must not be corrupted by a partial/incorrect rewrite attempt.
+        String sql = "SELECT CAST('abc\\xCA' AS VARBINARY)";
+        assertEquals(sql, SqlLogicTestRunner.rewriteDuckDbOnlySyntax(sql, CATALOG));
+    }
+
+    @Test
     void leavesAThreeArgRangeCallAlone() {
         // Not observed in the real corpus, and the explicit-step arithmetic is genuinely harder
         // to get right (DuckDB's step-aware exclusive-stop boundary isn't just "stop - step" in
