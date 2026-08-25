@@ -699,13 +699,31 @@ size threshold (4096 rows) or `output()` needs to flush whatever's pending befor
 One state class (`AggregateState`, implementing `GroupedAccumulatorState`) serves both grouped
 (`GROUP BY`) and ungrouped aggregation — `AccumulatorStateFactory.createSingleState()`/
 `createGroupedState()` both return the same type by design; the ungrouped case just never calls
-`setGroupId`, leaving every row tagged with the implicit group id 0. `aggregate_bind` happens once,
-eagerly, in the state's constructor, minting one `execution_id` for that accumulator's whole
-lifetime; `FILTER (WHERE ...)`, `DISTINCT`, and an explicit `ORDER BY` inside the aggregate call are
-all handled by Trino's own engine before `input()` is ever called — nothing VGI-specific needed
-there. `OVER` (windowed usage) works too, via Trino's automatic window-accumulator fallback (full
-recompute per frame rather than the optimized incremental path — a performance ceiling, not a
-correctness gap).
+`setGroupId`, leaving every row tagged with the implicit group id 0. `FILTER (WHERE ...)`,
+`DISTINCT`, and an explicit `ORDER BY` inside the aggregate call are all handled by Trino's own
+engine before `input()` is ever called — nothing VGI-specific needed there. `OVER` (windowed usage)
+works too, via Trino's automatic window-accumulator fallback (full recompute per frame rather than
+the optimized incremental path — a performance ceiling, not a correctness gap).
+
+**Const arguments bind lazily, from the first observed row.** `vgi_const` arguments (e.g. `vgi_percentile`'s
+percentile) ARE supported — VGI's `AggregateBindRequest.arguments` is exactly the const-value
+channel, the same shape scalar functions' `BindRequest.arguments` already uses — but `aggregate_bind`
+has to happen before any row can be processed, and Trino's `AccumulatorStateFactory` methods take no
+arguments at all, so the actual constant VALUE can't be known at state-creation time (Trino doesn't
+distinguish "const" arguments at the SPI level either — one arrives as an ordinary per-row value on
+every `input()` call, same as scalars). `AggregateState` defers `aggregate_bind` until the FIRST row
+actually arrives, reads the constant off that row, and binds once for the accumulator's whole
+lifetime — matching VGI's own bind-once-per-execution semantics exactly. A function with no const
+arguments still binds eagerly at construction. One honest edge case: if an accumulator never
+receives a single row (e.g. aggregating an empty table), the constant is never observed and `output()`
+returns `NULL` directly rather than binding with a fabricated value — correct for every real fixture
+seen, not a general proof for every conceivable aggregate.
+
+**Varargs and `any`-typed arguments** are both supported too, via `Signature.variableArity()`/
+`Signature.typeVariable` exactly mirroring the scalar-function precedent (`effectiveArgs` expands
+the declared argument list to a call site's actual bound arity for the same reason: Arrow field
+names must stay unique, and VGI dispatches a vararg group by column position, not name) — needed for
+real fixtures like `vgi_sum_all`, whose vararg argument is itself any-typed.
 
 **Null handling matches VGI's own default without extra work.** `vgi_sum`'s default null handling
 skips a NULL-valued row entirely (its `update()` is never called for one) — declaring every argument
@@ -715,13 +733,12 @@ than assumed.
 
 **Scope — deferred, named explicitly, same discipline as *Scalar functions* above:**
 
-- `vgi_const` (bind-time constant) arguments, varargs, and `any`-typed arguments — skipped at
-  discovery with a WARN, mirroring the scalar-function precedent for the same shapes.
 - A dynamic (bind-time-computed) return type — same ceiling as scalars: Trino resolves a function's
   return type from its static `Signature` before any RPC happens.
 - More than 4 arguments — `VgiAggregateFunctions` only has hand-written `input` `MethodHandle`s for
   0–4 arguments (Trino's compiler expects an exact, statically-typed `(State, ValueBlock, int, ...)`
-  parameter list per argument, not a generically collectible shape).
+  parameter list per argument, not a generically collectible shape) — this includes a vararg call
+  site whose EXPANDED arity exceeds 4, even if the declared signature itself is small.
 - `aggregate_destructor` is never called — a known gap, not a correctness risk in the current
   single-execution design (a finalized group's state is never needed again), but state isn't
   reclaimed from the worker proactively yet.
@@ -805,11 +822,12 @@ the same boundary on static predicate pushdown).
   `TABLE(...)`-argument/batch-path question for scalar functions (an
   entirely separate design, not this connector's row-at-a-time dispatch)
   is also still undecided.
-- **Aggregate functions.** Plain (non-const, non-vararg, non-`any`-typed, ≤4-argument) aggregates —
-  `vgi_sum`, `vgi_avg`, `vgi_count`, and similar — ARE now supported, non-decomposable (see
-  *Aggregate functions* above for why that's a real protocol ceiling, not a scope choice). Const
-  arguments, varargs, `any`-typed arguments, settings/secrets, and `aggregate_destructor`-driven
-  state cleanup are the named, deferred remainder — see that section's own scope list.
+- **Aggregate functions.** Aggregates with up to 4 arguments — including const/varargs/`any`-typed
+  ones — `vgi_sum`, `vgi_avg`, `vgi_count`, `vgi_percentile`, `vgi_sum_all`, and similar, ARE now
+  supported, non-decomposable (see *Aggregate functions* above for why that's a real protocol
+  ceiling, not a scope choice). A dynamic return type, more than 4 arguments, settings/secrets, and
+  `aggregate_destructor`-driven state cleanup are the named, deferred remainder — see that
+  section's own scope list.
 - **Write support**, **multi-branch tables** (`catalog_table_scan_branches_get`),
   **transactions**, **views** — VGI supports all four; none are wired up here
   (write support matches vgi-java's own worker-SDK scope, which is read-only

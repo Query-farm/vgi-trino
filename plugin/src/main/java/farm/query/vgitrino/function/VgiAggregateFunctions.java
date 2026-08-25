@@ -3,6 +3,7 @@
 package farm.query.vgitrino.function;
 
 import farm.query.vgi.client.ArgumentsEncoder;
+import farm.query.vgi.client.ScalarValue;
 import farm.query.vgi.protocol.AggregateBindRequest;
 import farm.query.vgi.protocol.AggregateBindResponse;
 import farm.query.vgi.protocol.AggregateFinalizeRequest;
@@ -49,6 +50,8 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 
+import static io.trino.spi.type.TypeTemplates.typeVariable;
+
 /**
  * Real VGI aggregate-function discovery and dispatch.
  *
@@ -89,14 +92,45 @@ import java.util.Map;
  * output} needs to flush whatever's pending before finalizing. This is a real fit for VGI's actual
  * wire design, not a workaround bolted on afterward.
  *
+ * <h2>Const arguments: bound lazily, from the first observed row — not at state-creation time</h2>
+ *
+ * <p>{@code vgi_const} arguments (bind-time constants, e.g. {@code vgi_percentile}'s percentile)
+ * ARE supported, but need a different trick than scalar functions use. VGI's own {@code
+ * AggregateBindRequest.arguments} field is exactly the const-value channel — the same shape as
+ * scalar functions' {@code BindRequest.arguments} — but {@code aggregate_bind} has to happen
+ * before any row can be processed, and {@link AccumulatorStateFactory#createSingleState()}/{@code
+ * createGroupedState()} take NO arguments at all, so there's no way to know the actual constant
+ * VALUE at state-creation time. Trino doesn't distinguish a "const" argument at the SPI level
+ * either — it arrives as an ordinary per-row {@code (ValueBlock, position)} pair on every {@code
+ * input()} call, indistinguishable at that point from a genuinely per-row-varying one (the same
+ * fact {@link VgiScalarFunctions.BindCache}'s own javadoc explains for scalars). {@link
+ * AggregateState} instead defers {@code aggregate_bind} until the FIRST row actually arrives,
+ * reads the const argument's value off that row, and binds once for the accumulator's entire
+ * lifetime — matching VGI's own bind-once-per-execution semantics exactly, since a "constant" is
+ * genuinely constant across a whole accumulation by definition. A function with no const arguments
+ * still binds eagerly at construction (unaffected, no lazy-binding overhead). One honest edge case:
+ * if an accumulator NEVER receives a single row for any of its groups (e.g. aggregating an empty
+ * table), the constant's value is never observed and {@code aggregate_bind} never happens at all —
+ * {@link #output} returns {@code NULL} directly in that case rather than binding with a fabricated
+ * value, which is the correct empty-aggregate answer for every real fixture this connector has
+ * seen, though not a general proof it's right for every conceivable aggregate.
+ *
+ * <h2>Varargs</h2>
+ *
+ * <p>Supported via {@link Signature#variableArity()} — {@link #effectiveArgs} expands the
+ * declared, discovery-time argument list to a specific call site's actual bound arity, exactly
+ * mirroring {@link VgiScalarFunctions}'s own {@code effectiveArgs} for the identical reason
+ * (Arrow field names must stay unique; VGI dispatches a vararg group by column position, not
+ * name). A non-trailing vararg argument is skipped at discovery, same validity rule as scalars.
+ *
  * <h2>Deferred, named explicitly (v1 scope)</h2>
  *
  * <ul>
- *   <li>{@code vgi_const} arguments (bind-time constants, e.g. {@code vgi_percentile}), varargs,
- *       and {@code any}-typed arguments — all skipped at discovery with a WARN, mirroring {@link
- *       VgiScalarFunctions}'s own precedent for the same shapes. A dynamic (bind-time-computed)
- *       return type is skipped for the identical reason it's skipped for scalars: Trino resolves a
- *       function's return type from its static {@link Signature} before any RPC happens.</li>
+ *   <li>{@code any}-typed arguments ARE supported, via {@link Signature#typeVariable} exactly like
+ *       {@link VgiScalarFunctions} — needed for real fixtures like {@code vgi_sum_all}, whose
+ *       vararg argument is itself any-typed. A dynamic (bind-time-computed) return type is skipped
+ *       for the identical reason it's skipped for scalars: Trino resolves a function's return type
+ *       from its static {@link Signature} before any RPC happens.</li>
  *   <li>Windowed usage ({@code supports_window}/{@code streaming_partitioned}) — {@code OVER} still
  *       works via Trino's own automatic window-accumulator fallback (full recompute per frame, not
  *       the optimized incremental {@code WindowAccumulator} path — see {@code
@@ -125,8 +159,17 @@ public final class VgiAggregateFunctions {
     // Discovery
     // ------------------------------------------------------------------
 
-    /** One (non-const, non-vararg, non-any-typed) aggregate argument, resolved at discovery time. */
-    record AggregateArg(String name, Type type, Field arrowHint) {}
+    /**
+     * One aggregate argument, resolved at discovery time.
+     *
+     * @param anyType whether this is a {@code vgi_type=any} argument — {@code type} is {@code
+     *        null} and {@code typeVarName} identifies its {@link Signature#typeVariable}, mirroring
+     *        {@code VgiScalarFunctions.ScalarArg} exactly
+     * @param varargs whether this is the trailing {@code vgi_varargs} argument — see {@link
+     *        #effectiveArgs}
+     */
+    record AggregateArg(String name, boolean positional, boolean constArg, boolean anyType, boolean varargs,
+            Type type, String typeVarName, Field arrowHint) {}
 
     /** One registered aggregate: static discovery-time info plus the Trino {@link FunctionMetadata}. */
     record Entry(FunctionId functionId, String schemaName, String functionName,
@@ -209,10 +252,23 @@ public final class VgiAggregateFunctions {
         String context = schemaName + "." + info.name();
         Schema argsSchema = ArrowSchemaCodec.deserializeSchema(info.arguments());
         List<AggregateArg> args = new ArrayList<>();
+        int anyIndex = 0;
         for (Field field : argsSchema == null ? List.<Field>of() : argsSchema.getFields()) {
-            AggregateArg arg = decodeAggregateArg(context, field);
+            AggregateArg arg = decodeAggregateArg(context, field, anyIndex);
             if (arg == null) return null; // reason already logged
+            if (arg.anyType()) anyIndex++;
             args.add(arg);
+        }
+        // A vararg argument must be the LAST one — Signature.variableArity() means "the last
+        // declared argument type repeats," which has no representation for a vararg group followed
+        // by more fixed arguments. Mirrors VgiScalarFunctions' identical check.
+        for (int i = 0; i < args.size() - 1; i++) {
+            if (args.get(i).varargs()) {
+                LOG.warn("VGI aggregate function %s: skipping registration — argument '%s' is vgi_varargs but "
+                        + "isn't the LAST argument; Trino's variable-arity signature only supports a repeating "
+                        + "trailing argument", context, args.get(i).name());
+                return null;
+            }
         }
         if (args.size() > MAX_ARITY) {
             LOG.warn("VGI aggregate function %s: skipping registration — %d arguments exceeds the %d this "
@@ -244,7 +300,16 @@ public final class VgiAggregateFunctions {
         }
 
         Signature.Builder sig = Signature.builder();
-        for (AggregateArg arg : args) sig.argumentType(arg.type());
+        for (AggregateArg arg : args) {
+            if (arg.anyType()) sig.typeVariable(arg.typeVarName());
+        }
+        for (AggregateArg arg : args) {
+            if (arg.anyType()) sig.argumentType(typeVariable(arg.typeVarName()));
+            else sig.argumentType(arg.type());
+        }
+        if (!args.isEmpty() && args.get(args.size() - 1).varargs()) {
+            sig.variableArity();
+        }
         sig.returnType(returnType);
 
         int overloadIndex = overloadCounters.merge(schemaName + ":" + info.name(), 1, Integer::sum) - 1;
@@ -266,7 +331,7 @@ public final class VgiAggregateFunctions {
         return new Entry(functionId, schemaName, info.name(), metadata, args, returnType);
     }
 
-    private static AggregateArg decodeAggregateArg(String context, Field field) {
+    private static AggregateArg decodeAggregateArg(String context, Field field, int anyIndex) {
         Map<String, String> metadata = field.getMetadata();
         String vgiType = metadata == null ? null : metadata.get("vgi_type");
         if ("table".equals(vgiType)) {
@@ -274,20 +339,19 @@ public final class VgiAggregateFunctions {
                     context, field.getName());
             return null;
         }
+        boolean positional = metadata == null || !"named".equals(metadata.get("vgi_arg"));
+        boolean constArg = metadata != null && "true".equals(metadata.get("vgi_const"));
+        boolean varargs = metadata != null && "true".equals(metadata.get("vgi_varargs"));
+        // Same combination scalars reject: a constant vararg has no real fixture and no clear wire
+        // meaning (bind-time constants and a per-row varargs group are two different channels).
+        if (varargs && constArg) {
+            LOG.warn("VGI aggregate function %s: skipping registration — argument '%s' is both vgi_const and "
+                    + "vgi_varargs, a combination with no clear wire meaning", context, field.getName());
+            return null;
+        }
         if ("any".equals(vgiType)) {
-            LOG.warn("VGI aggregate function %s: skipping registration — any-typed arguments are not yet "
-                    + "supported for aggregates", context);
-            return null;
-        }
-        if (metadata != null && "true".equals(metadata.get("vgi_const"))) {
-            LOG.warn("VGI aggregate function %s: skipping registration — bind-time constant ('%s') arguments "
-                    + "are not yet supported for aggregates", context, field.getName());
-            return null;
-        }
-        if (metadata != null && "true".equals(metadata.get("vgi_varargs"))) {
-            LOG.warn("VGI aggregate function %s: skipping registration — varargs are not yet supported for "
-                    + "aggregates", context);
-            return null;
+            return new AggregateArg(field.getName(), positional, constArg, true, varargs, null,
+                    "T" + anyIndex, null);
         }
         Type type;
         try {
@@ -297,7 +361,7 @@ public final class VgiAggregateFunctions {
                     context, field.getName());
             return null;
         }
-        return new AggregateArg(field.getName(), type, field);
+        return new AggregateArg(field.getName(), positional, constArg, false, varargs, type, null, field);
     }
 
     // ------------------------------------------------------------------
@@ -305,26 +369,68 @@ public final class VgiAggregateFunctions {
     // ------------------------------------------------------------------
 
     /**
-     * @param updateSchema the wire schema for {@code aggregate_update}'s {@code input_batch}: this
-     *        call's argument columns, in order, plus the trailing {@link #GROUP_ID_FIELD} column
-     *        every row is tagged with
+     * @param effectiveArgs {@code entry.args()}, expanded to this call site's actual bound arity —
+     *        identical to {@code entry.args()} for a non-variadic function; for a variable-arity
+     *        one, the trailing vararg spec is repeated (each repeat given a distinct synthetic
+     *        name, since Arrow field names must be unique — VGI's own dispatch reads a vararg
+     *        group by BATCH COLUMN POSITION, not name, mirroring {@code
+     *        VgiScalarFunctions.CallConfig}'s identical field)
+     * @param rowArgIndices signature-order indices of the non-const arguments — {@code
+     *        updateSchema}'s columns are these, in this order (excluding the trailing group-id one)
+     * @param constArgIndices signature-order indices of the {@code vgi_const} arguments — read off
+     *        the first observed row and used ONLY to build the lazy {@code aggregate_bind} call
+     *        (see {@link AggregateState})
+     * @param updateSchema the wire schema for {@code aggregate_update}'s {@code input_batch}: the
+     *        ROW (non-const) argument columns, in order, plus the trailing {@link #GROUP_ID_FIELD}
+     *        column every row is tagged with
      * @param bindInputSchema the wire schema {@code aggregate_bind} declares as {@code
-     *        input_schema} — the SAME argument columns, WITHOUT the group-id column (bind describes
-     *        the shape of one group's logical input, not the batched-update wire framing)
+     *        input_schema} — the SAME row-argument columns, WITHOUT the group-id column (bind
+     *        describes the shape of one group's logical input, not the batched-update wire framing,
+     *        and never includes const arguments — those travel via {@code arguments} instead)
      */
-    record CallConfig(Entry entry, List<Type> argumentTypes, Type returnType,
-            Schema updateSchema, Schema bindInputSchema) {}
+    record CallConfig(Entry entry, List<Type> argumentTypes, Type returnType, List<AggregateArg> effectiveArgs,
+            int[] rowArgIndices, int[] constArgIndices, Schema updateSchema, Schema bindInputSchema) {}
 
     public static CallConfig buildCallConfig(Entry entry, List<Type> argumentTypes, Type returnType) {
-        List<Field> argFields = new ArrayList<>(entry.args().size());
-        for (int i = 0; i < entry.args().size(); i++) {
-            AggregateArg spec = entry.args().get(i);
-            argFields.add(VgiTypeMapping.toArrowField(argumentTypes.get(i), spec.name(), spec.arrowHint()));
+        List<AggregateArg> specs = effectiveArgs(entry, argumentTypes.size());
+        List<Integer> rowIdx = new ArrayList<>();
+        List<Integer> constIdx = new ArrayList<>();
+        List<Field> rowFields = new ArrayList<>();
+        for (int i = 0; i < specs.size(); i++) {
+            AggregateArg spec = specs.get(i);
+            if (spec.constArg()) {
+                constIdx.add(i);
+            } else {
+                rowIdx.add(i);
+                rowFields.add(VgiTypeMapping.toArrowField(argumentTypes.get(i), spec.name(), spec.arrowHint()));
+            }
         }
-        Schema bindInputSchema = new Schema(argFields);
-        List<Field> updateFields = new ArrayList<>(argFields);
+        Schema bindInputSchema = new Schema(rowFields);
+        List<Field> updateFields = new ArrayList<>(rowFields);
         updateFields.add(new Field(GROUP_ID_FIELD, FieldType.notNullable(new ArrowType.Int(64, true)), null));
-        return new CallConfig(entry, argumentTypes, returnType, new Schema(updateFields), bindInputSchema);
+        return new CallConfig(entry, argumentTypes, returnType, specs,
+                rowIdx.stream().mapToInt(Integer::intValue).toArray(),
+                constIdx.stream().mapToInt(Integer::intValue).toArray(),
+                new Schema(updateFields), bindInputSchema);
+    }
+
+    /**
+     * Expand {@code entry.args()} to exactly {@code callArity} entries — see {@link CallConfig}'s
+     * {@code effectiveArgs} javadoc.
+     */
+    private static List<AggregateArg> effectiveArgs(Entry entry, int callArity) {
+        List<AggregateArg> declared = entry.args();
+        if (callArity == declared.size()) return declared;
+        AggregateArg varargSpec = declared.get(declared.size() - 1);
+        List<AggregateArg> effective = new ArrayList<>(callArity);
+        effective.addAll(declared.subList(0, declared.size() - 1));
+        int repeatCount = callArity - (declared.size() - 1);
+        for (int i = 0; i < repeatCount; i++) {
+            effective.add(new AggregateArg(varargSpec.name() + "_" + i, varargSpec.positional(),
+                    varargSpec.constArg(), varargSpec.anyType(), true, varargSpec.type(),
+                    varargSpec.typeVarName(), varargSpec.arrowHint()));
+        }
+        return effective;
     }
 
     // ------------------------------------------------------------------
@@ -337,24 +443,34 @@ public final class VgiAggregateFunctions {
     static final class AggregateState implements GroupedAccumulatorState {
         private final VgiWorkerClient client;
         private final CallConfig config;
-        private final byte[] executionId;
-        private final byte[] outputSchemaBytes;
         private final VectorSchemaRoot pending;
+        private byte[] executionId;
+        private byte[] outputSchemaBytes;
+        private boolean bound;
         private int groupId;
         private int pendingRows;
 
         AggregateState(VgiWorkerClient client, CallConfig config) {
             this.client = client;
             this.config = config;
-            byte[] argumentsBytes = ArgumentsEncoder.builder().encode(); // v1: no const args ever
-            byte[] inputSchemaBytes = ArrowSchemaCodec.serializeSchema(config.bindInputSchema());
-            AggregateBindResponse bound = client.withConnection(a -> a.service().aggregate_bind(
-                    new AggregateBindRequest(config.entry().functionName(), argumentsBytes, inputSchemaBytes,
-                            null, null, a.handle(), config.entry().schemaName())));
-            this.executionId = bound.execution_id();
-            this.outputSchemaBytes = bound.output_schema();
             this.pending = VectorSchemaRoot.create(config.updateSchema(), Allocators.root());
             this.pending.allocateNew();
+            // A function with no const arguments needs no observed row to bind correctly — bind
+            // immediately, exactly like v1's original design, rather than deferring for no reason.
+            if (config.constArgIndices().length == 0) {
+                bind(List.of());
+            }
+        }
+
+        private void bind(List<Object> constValues) {
+            byte[] argumentsBytes = encodeConstArgs(config, constValues);
+            byte[] inputSchemaBytes = ArrowSchemaCodec.serializeSchema(config.bindInputSchema());
+            AggregateBindResponse response = client.withConnection(a -> a.service().aggregate_bind(
+                    new AggregateBindRequest(config.entry().functionName(), argumentsBytes, inputSchemaBytes,
+                            null, null, a.handle(), config.entry().schemaName())));
+            this.executionId = response.execution_id();
+            this.outputSchemaBytes = response.output_schema();
+            this.bound = true;
         }
 
         @Override
@@ -373,13 +489,25 @@ public final class VgiAggregateFunctions {
             return 4096L + (long) pendingRows * 64L;
         }
 
-        /** Buffer one row's already-resolved argument values, tagged with the CURRENT group id. */
+        /**
+         * Buffer one row's already-resolved argument values (in SIGNATURE order — every declared
+         * argument, const ones included, since Trino has no concept of "const" at the SPI level),
+         * tagged with the CURRENT group id. A function with const arguments binds lazily here, on
+         * the FIRST call only — see the class javadoc's "Const arguments" section.
+         */
         void addRow(Object[] boxedArgs) {
-            List<Type> types = config.argumentTypes();
-            for (int i = 0; i < types.size(); i++) {
-                VgiTypeMapping.writeValue(types.get(i), pending.getVector(i), pendingRows, boxedArgs[i]);
+            if (!bound) {
+                List<Object> constValues = new ArrayList<>();
+                for (int sigIdx : config.constArgIndices()) constValues.add(boxedArgs[sigIdx]);
+                bind(constValues);
             }
-            ((BigIntVector) pending.getVector(types.size())).setSafe(pendingRows, groupId);
+            int[] rowIdx = config.rowArgIndices();
+            for (int pos = 0; pos < rowIdx.length; pos++) {
+                int sigIdx = rowIdx[pos];
+                VgiTypeMapping.writeValue(config.argumentTypes().get(sigIdx), pending.getVector(pos), pendingRows,
+                        boxedArgs[sigIdx]);
+            }
+            ((BigIntVector) pending.getVector(rowIdx.length)).setSafe(pendingRows, groupId);
             pendingRows++;
             if (pendingRows >= FLUSH_THRESHOLD) flush();
         }
@@ -402,6 +530,11 @@ public final class VgiAggregateFunctions {
          * aggregate_destructor} not being called yet.
          */
         Object finalizeCurrentGroup() {
+            // Never bound at all: this accumulator's entire lifetime saw zero rows across every
+            // group (e.g. aggregating an empty table) — a const argument's value was never
+            // observed, so there is nothing correct to bind with. NULL is the right empty-aggregate
+            // answer for every real fixture this connector has seen; see the class javadoc.
+            if (!bound) return null;
             flush();
             Schema groupIdSchema = new Schema(List.of(new Field("group_id",
                     FieldType.notNullable(new ArrowType.Int(64, true)), null)));
@@ -420,6 +553,35 @@ public final class VgiAggregateFunctions {
                 });
             }
         }
+    }
+
+    /**
+     * Build {@code aggregate_bind}'s {@code arguments} bytes from the observed const values —
+     * mirrors {@code VgiScalarFunctions.BindCache#encodeConstArgs} exactly, including always
+     * encoding a (possibly zero-child) args batch rather than a bare {@code null} (confirmed
+     * necessary for a multi-overload function's worker-side dispatch — see that method's own note).
+     */
+    private static byte[] encodeConstArgs(CallConfig cfg, List<Object> constValues) {
+        ArgumentsEncoder encoder = ArgumentsEncoder.builder();
+        int[] constIdx = cfg.constArgIndices();
+        for (int i = 0; i < constIdx.length; i++) {
+            int sigIndex = constIdx[i];
+            AggregateArg spec = cfg.effectiveArgs().get(sigIndex);
+            Type type = cfg.argumentTypes().get(sigIndex);
+            ScalarValue value = toScalarValue(type, constValues.get(i));
+            if (spec.positional()) encoder.positional(value);
+            else encoder.named(spec.name(), value);
+        }
+        return encoder.encode();
+    }
+
+    /** Build the {@code ArgumentsEncoder}-ready constant — see {@code VgiTypeMapping#toPlainValue}'s
+     *  own javadoc for the one honest caveat (a nested struct/list field's exact width isn't always
+     *  preserved). */
+    private static ScalarValue toScalarValue(Type trinoType, Object boxedValue) {
+        ArrowType arrowType = VgiTypeMapping.toArrowField(trinoType, "value").getType();
+        if (boxedValue == null) return ScalarValue.ofNull(arrowType);
+        return ScalarValue.of(arrowType, VgiTypeMapping.toPlainValue(trinoType, boxedValue));
     }
 
     static final class StateFactory implements AccumulatorStateFactory<AggregateState> {

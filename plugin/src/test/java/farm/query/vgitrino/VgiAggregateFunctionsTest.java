@@ -115,4 +115,56 @@ final class VgiAggregateFunctionsTest {
     void vgiSumOfAllNullsReturnsNull() {
         assertNull(scalar("SELECT vgi_example.main.vgi_sum(x) FROM (VALUES (CAST(NULL AS BIGINT)), (NULL)) t(x)"));
     }
+
+    @Test
+    @Timeout(60)
+    void vgiPercentileHandlesTheConstArgument() {
+        assertEquals(0.0d, scalar(
+                "SELECT vgi_example.main.vgi_percentile(CAST(i AS DOUBLE), 0.0) FROM UNNEST(SEQUENCE(0, 9, 1)) t(i)"));
+        assertEquals(5.0d, scalar(
+                "SELECT vgi_example.main.vgi_percentile(CAST(i AS DOUBLE), 0.5) FROM UNNEST(SEQUENCE(0, 9, 1)) t(i)"));
+    }
+
+    @Test
+    @Timeout(60)
+    void vgiPercentileRebindsWhenTheConstValueChangesAcrossSeparateQueries() {
+        // Each query is its own accumulator/bind (lazy-bind-on-first-row) -- confirms two
+        // different constant values in two separate calls both bind and compute correctly,
+        // not just whichever one happened to run first.
+        assertEquals(9.0d, scalar(
+                "SELECT vgi_example.main.vgi_percentile(CAST(i AS DOUBLE), 0.9) FROM UNNEST(SEQUENCE(0, 9, 1)) t(i)"));
+        assertEquals(0.0d, scalar(
+                "SELECT vgi_example.main.vgi_percentile(CAST(i AS DOUBLE), 0.0) FROM UNNEST(SEQUENCE(0, 9, 1)) t(i)"));
+    }
+
+    @Test
+    @Timeout(60)
+    void vgiSumAllHandlesASingleVarargColumn() {
+        // vgi_sum_all's vararg is any-typed, and its return type is DOUBLE regardless of the
+        // input column's own type (confirmed by direct testing, not assumed).
+        assertEquals(15.0d, scalar(
+                "SELECT vgi_example.main.vgi_sum_all(CAST(i AS BIGINT)) FROM UNNEST(SEQUENCE(1, 5, 1)) t(i)"));
+    }
+
+    @Test
+    @Timeout(60)
+    void vgiSumAllHandlesTwoVarargColumns() {
+        assertEquals(30.0d, scalar(
+                "SELECT vgi_example.main.vgi_sum_all(CAST(i AS BIGINT), CAST(i AS BIGINT)) "
+                        + "FROM UNNEST(SEQUENCE(1, 5, 1)) t(i)"));
+    }
+
+    @Test
+    @Timeout(60)
+    void vgiSumAllHandlesThreeVarargColumnsWithDifferentValues() {
+        // Explicit DOUBLE casts, not bare decimal literals — a bare "1.0" in a VALUES clause
+        // infers as DECIMAL in Trino, which VgiTypeMapping deliberately doesn't map in the
+        // Trino->Arrow direction (a separate, pre-existing, documented limitation, not part of
+        // this test).
+        MaterializedResult result = runner.execute(session,
+                "SELECT vgi_example.main.vgi_sum_all(a, b, c) FROM (VALUES "
+                        + "(CAST(1.0 AS DOUBLE), CAST(2.0 AS DOUBLE), CAST(3.0 AS DOUBLE)), "
+                        + "(CAST(4.0 AS DOUBLE), CAST(5.0 AS DOUBLE), CAST(6.0 AS DOUBLE))) AS t(a, b, c)");
+        assertEquals(21.0d, result.getMaterializedRows().get(0).getField(0));
+    }
 }
