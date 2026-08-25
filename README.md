@@ -36,11 +36,12 @@ Set per catalog in `etc/catalog/<name>.properties`:
 | Property | Required | Description |
 |---|---|---|
 | `connector.name` | yes | `vgi` |
-| `vgi.location` | yes | The worker to attach: a bare shell command (subprocess transport), `unix:///path/to.sock`, or `tcp://host:port`. `http(s)://` is not yet implemented. |
+| `vgi.location` | yes | The worker to attach: a bare shell command (subprocess transport), `unix:///path/to.sock`, `tcp://host:port`, or `http(s)://host:port/path` — an already-running HTTP server, unlike the other three schemes (which each spawn or connect to their own worker instance per pooled connection). |
 | `vgi.catalog-name` | yes | The VGI-side catalog to attach — one of the names the worker's `catalog_catalogs()` advertises (e.g. `example` for the reference fixture worker). **Not** the Trino catalog name (the properties filename) — that's a purely local alias the worker never sees, the same split DuckDB's own `ATTACH 'name' AS alias` makes. |
 | `vgi.connections` | no (default 4) | Size of the pooled-connection set. VGI's RPC is lockstep per connection — one call in flight at a time — so this also caps how many splits can be redeemed concurrently against this catalog. Trino may schedule more concurrent splits than this allows (e.g. a `LIMIT` it can satisfy from the first few splits still starts redeeming others in parallel before it notices) — the excess queues as pending futures, not blocked threads, so raising this changes throughput, not correctness; see *Connection acquisition* below. |
 | `vgi.connection-acquire-timeout-millis` | no (default 30000) | How long the catalog/table-metadata and scan bind+plan calls (`VgiWorkerClient.borrow`, used once per query) wait for a pooled connection before failing. Does NOT bound split redemption itself — that's non-blocking (`borrowAsync`) and has no timeout of its own; see *Connection acquisition* below. |
 | `vgi.max-plan-pages` | no (default 1024) | Bound on `table_function_plan` pagination — a worker that never stops cursoring makes `VgiSplitSource` throw once this many pages have been fetched, naming the cap, rather than follow it forever or silently truncate. Matches the C++ VGI extension's own `vgi_split_plan_max_pages` default. |
+| `vgi.http-bearer-token` | no | Static bearer token sent as `Authorization: Bearer <token>` on every request, for an `http(s)://` `vgi.location` that requires one. Ignored for every other transport. |
 | `vgi.target-split-size-bytes` | no | Passed to `table_function_plan` as `target_split_bytes`. |
 | `vgi.min-splits` | no | Passed as `min_splits`. |
 | `vgi.max-splits-per-response` | no (default 1000) | Pagination cap per `table_function_plan` call — Trino's own `getNextBatch(maxSize)` further clamps this per call. |
@@ -247,6 +248,41 @@ almost immediately under this same contention, since ordinary queueing delay
 alone (each split takes real, if brief, time to drain before its connection
 frees up) far exceeds 1ms.
 
+### Transports
+
+Subprocess, `unix://`, and `tcp://` all wrap `RpcConnection` over an
+`RpcTransport` (a duplex byte stream) — `openTransport` picks the right one
+and `VgiWorkerClient` treats them identically from there. `http(s)://` has
+no such byte stream to speak of (a stream over HTTP is a chain of
+independent request/response pairs, continuity carried by a state token in
+the response body rather than a socket staying open), so it gets its own
+connection type, `HttpRpcConnection` — already implemented in `vgi-rpc-java`
+and designed for exactly this drop-in swap (identical `proxy(Class)`
+surface), which is why wiring it up needed no changes anywhere outside
+`VgiWorkerClient` itself: every call site already goes through `a.service()`,
+transport-agnostic from the start. `Attached.connection` is typed as the
+plain `AutoCloseable` both connection types share — the only thing the pool
+itself needs from it (every RPC goes through `service` instead).
+
+Unlike the byte-stream transports, an `http(s)://` `vgi.location` names an
+already-running, independently-managed server — this connector doesn't spawn
+or own its lifecycle, only connects to it. `vgi.connections` still pools that
+many separate `HttpRpcConnection` instances (each its own `catalog_attach`),
+matching every other transport's model, even though a single instance is
+itself safe to share across concurrent calls — `HttpClient` is thread-safe,
+and only an individual in-flight stream (`HttpRpcStream`) isn't. A single
+shared connection serving unlimited concurrent splits over HTTP, instead of
+pooling N, is a real efficiency opportunity this v1 leaves on the table in
+favor of reusing the exact acquire/release/self-heal machinery every other
+transport already goes through.
+
+Verified end to end (`VgiHttpTransportQueryRunnerTest`) against the reference
+fixture worker running as a real HTTP server (`vgi-fixture-http`, a separate
+process this test starts and tears down itself, since HTTP workers aren't
+spawned per connection): a plain table scan, a filtered scan, a `TABLE(...)`
+call, and a self-join proving multiple pooled connections all independently
+attach successfully.
+
 ### Type mapping
 
 `VgiTypeMapping` covers what VGI's own type helpers and most declarative
@@ -444,10 +480,6 @@ the same boundary on static predicate pushdown).
 
 ## Scope — what v1 does not do yet
 
-- **`http(s)://` transport.** Subprocess, `unix://`, and `tcp://` are
-  implemented (all thin wrappers over `RpcConnection` + an existing
-  `RpcTransport`); HTTP needs its own client (state tokens, request/response
-  framing) that isn't wrapped anywhere yet.
 - **Predicate/dynamic-filter pushdown for table functions.** Not deferred —
   impossible via Trino's current PTF SPI; see *Table functions* above.
 - **Overloaded table functions**, and any function with a varargs/`any`-typed/

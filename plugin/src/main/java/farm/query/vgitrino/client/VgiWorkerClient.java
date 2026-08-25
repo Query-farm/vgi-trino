@@ -6,6 +6,7 @@ import farm.query.vgi.VgiService;
 import farm.query.vgi.protocol.CatalogAttachRequest;
 import farm.query.vgi.protocol.CatalogAttachResult;
 import farm.query.vgirpc.RpcConnection;
+import farm.query.vgirpc.http.HttpRpcConnection;
 import farm.query.vgirpc.transport.RpcTransport;
 import farm.query.vgirpc.transport.SubprocessTransport;
 import farm.query.vgirpc.transport.TcpSocketTransport;
@@ -64,8 +65,18 @@ import java.util.function.Function;
  */
 public final class VgiWorkerClient implements AutoCloseable {
 
-    /** One pooled, attached connection. */
-    public record Attached(RpcConnection connection, VgiService service, CatalogAttachResult attach) {
+    /**
+     * One pooled, attached connection.
+     *
+     * @param connection {@link RpcConnection} for subprocess/{@code unix://}/
+     *        {@code tcp://}, {@link HttpRpcConnection} for {@code http(s)://}
+     *        — {@code AutoCloseable} is the only thing the rest of this class
+     *        needs from it (see {@link #closeQuietly}); every actual RPC call
+     *        goes through {@link #service} instead, which is transport-agnostic
+     *        already (both connection types offer the identical {@code
+     *        proxy(Class)} surface)
+     */
+    public record Attached(AutoCloseable connection, VgiService service, CatalogAttachResult attach) {
         /** @return the {@code attach_opaque_data} handle every subsequent call on this connection echoes */
         public byte[] handle() { return attach.attach_opaque_data(); }
     }
@@ -339,12 +350,51 @@ public final class VgiWorkerClient implements AutoCloseable {
     }
 
     private Attached openAndAttach() {
-        RpcTransport transport = openTransport(config.location());
+        String location = config.location();
+        if (location.startsWith("http://") || location.startsWith("https://")) {
+            return openAndAttachHttp(location);
+        }
+        RpcTransport transport = openTransport(location);
         RpcConnection connection = new RpcConnection(transport);
         VgiService service = connection.proxy(VgiService.class);
         CatalogAttachResult attach = service.catalog_attach(
                 CatalogAttachRequest.of(config.catalogName(), null, null, null), null);
         return new Attached(connection, service, attach);
+    }
+
+    /**
+     * {@code http(s)://} has no {@link RpcTransport} — it's a chain of
+     * independent request/response pairs, not a duplex byte stream — so it
+     * gets its own connection type ({@link HttpRpcConnection}) entirely,
+     * built directly rather than through {@link #openTransport}. Each pooled
+     * {@link Attached} still does its own {@code catalog_attach}, exactly
+     * like the byte-stream transports, even though an {@code
+     * HttpRpcConnection} is itself safe to share across concurrent calls —
+     * pooling {@link VgiConfig#connections()} separate instances anyway
+     * keeps this transport on the SAME acquire/release/self-heal machinery
+     * every other transport already goes through, rather than forking a
+     * second connection-lifecycle model for HTTP alone. (A single shared
+     * instance really could serve unlimited concurrent splits over HTTP —
+     * see the README's Connection acquisition section for why that's a
+     * documented follow-up, not done here.)
+     */
+    private Attached openAndAttachHttp(String location) {
+        HttpRpcConnection.Builder builder = HttpRpcConnection.builder(location);
+        if (config.httpBearerToken() != null) {
+            builder.bearerToken(config.httpBearerToken());
+        }
+        HttpRpcConnection connection = builder.build();
+        boolean ok = false;
+        try {
+            VgiService service = connection.proxy(VgiService.class);
+            CatalogAttachResult attach = service.catalog_attach(
+                    CatalogAttachRequest.of(config.catalogName(), null, null, null), null);
+            Attached a = new Attached(connection, service, attach);
+            ok = true;
+            return a;
+        } finally {
+            if (!ok) closeQuietly(connection);
+        }
     }
 
     private static RpcTransport openTransport(String location) {
@@ -368,11 +418,6 @@ public final class VgiWorkerClient implements AutoCloseable {
                         "failed to connect to VGI worker at " + uri.getHost() + ":" + uri.getPort(), e);
             }
         }
-        if (location.startsWith("http://") || location.startsWith("https://")) {
-            throw new UnsupportedOperationException(
-                    "vgi.location HTTP transport is not yet implemented — use a subprocess "
-                            + "command, unix://path, or tcp://host:port. See the connector README.");
-        }
         // Bare command: run through a shell so the operator's own quoting,
         // env expansion, and PATH lookup behave the way it would on a
         // terminal — matches the DuckDB extension's own LOCATION contract.
@@ -380,8 +425,12 @@ public final class VgiWorkerClient implements AutoCloseable {
     }
 
     private static void closeQuietly(Attached a) {
+        closeQuietly(a.connection());
+    }
+
+    private static void closeQuietly(AutoCloseable a) {
         try {
-            a.connection().close();
+            a.close();
         } catch (Exception ignore) {
             // best-effort — the pool is shrinking either way
         }

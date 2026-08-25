@@ -9,7 +9,6 @@ import farm.query.vgitrino.split.VgiSplit;
 import farm.query.vgitrino.types.ArrowSchemaCodec;
 import farm.query.vgitrino.types.VgiTypeMapping;
 import farm.query.vgirpc.AnnotatedBatch;
-import farm.query.vgirpc.ClientStreamSession;
 import farm.query.vgirpc.RpcStream;
 import farm.query.vgirpc.StreamState;
 import io.trino.spi.Page;
@@ -85,7 +84,7 @@ public final class VgiPageSource implements ConnectorPageSource {
      *  {@link #close} beat redemption to the connection (see the class javadoc). */
     private final CompletableFuture<VgiWorkerClient.Attached> redemption;
 
-    private volatile ClientStreamSession<?> session;
+    private volatile RpcStream<?> session;
     private volatile boolean closeRequested;
     private long completedBytes;
     private long completedPositions;
@@ -151,7 +150,7 @@ public final class VgiPageSource implements ConnectorPageSource {
                     split.token().length == 0 ? null : List.of(split.token()),
                     null);          // row_limit
             RpcStream<? extends StreamState> stream = a.service().init(initRequest, null);
-            this.session = (ClientStreamSession<?>) stream;
+            this.session = stream;
             ok = true;
             return a;
         } finally {

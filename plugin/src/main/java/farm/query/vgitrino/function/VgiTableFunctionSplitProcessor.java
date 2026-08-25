@@ -8,7 +8,6 @@ import farm.query.vgitrino.split.VgiSplit;
 import farm.query.vgitrino.types.ArrowSchemaCodec;
 import farm.query.vgitrino.types.VgiTypeMapping;
 import farm.query.vgirpc.AnnotatedBatch;
-import farm.query.vgirpc.ClientStreamSession;
 import farm.query.vgirpc.RpcStream;
 import farm.query.vgirpc.StreamState;
 import io.trino.spi.Page;
@@ -47,7 +46,7 @@ public final class VgiTableFunctionSplitProcessor implements TableFunctionSplitP
     private final CompletableFuture<VgiWorkerClient.Attached> connectionFuture;
     private final CompletableFuture<VgiWorkerClient.Attached> redemption;
 
-    private volatile ClientStreamSession<?> session;
+    private volatile RpcStream<?> session;
     private volatile boolean closeRequested;
     private boolean finished;
     private volatile boolean connectionHealthy = true;
@@ -89,7 +88,7 @@ public final class VgiTableFunctionSplitProcessor implements TableFunctionSplitP
                     split.token().length == 0 ? null : List.of(split.token()),
                     null);          // row_limit
             RpcStream<? extends StreamState> stream = a.service().init(initRequest, null);
-            this.session = (ClientStreamSession<?>) stream;
+            this.session = stream;
             ok = true;
             return a;
         } finally {

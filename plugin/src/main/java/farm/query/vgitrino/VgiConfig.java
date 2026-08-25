@@ -14,8 +14,10 @@ import java.util.Map;
  * {@code vgi.location}.
  *
  * @param location the worker to attach: a bare shell command (subprocess
- *        transport), {@code unix:///path/to.sock}, or {@code tcp://host:port}.
- *        {@code http(s)://} is not yet supported — see the connector README.
+ *        transport), {@code unix:///path/to.sock}, {@code tcp://host:port},
+ *        or {@code http(s)://host:port/path} — an already-running HTTP
+ *        server, unlike the other three schemes, which each spawn or connect
+ *        to their own worker instance per pooled connection
  * @param catalogName the VGI-side catalog name to request from
  *        {@code catalog_attach} — one of the names {@code catalog_catalogs()}
  *        advertises (e.g. {@code "example"} for the reference fixture worker),
@@ -57,6 +59,10 @@ import java.util.Map;
  *        rows, with no error — which is worse, so this throws instead once hit,
  *        naming the cap in the message. Mirrors the C++ VGI extension's own
  *        {@code vgi_split_plan_max_pages} setting (default 1024, matched here)
+ * @param httpBearerToken a static bearer token sent as {@code Authorization:
+ *        Bearer <token>} on every request, for an {@code http(s)://} {@link
+ *        #location} that requires one, or {@code null} for none. Ignored
+ *        for every other transport scheme
  */
 public record VgiConfig(
         String location,
@@ -67,7 +73,8 @@ public record VgiConfig(
         int maxSplitsPerResponse,
         long dynamicFilteringWaitTimeoutMillis,
         long connectionAcquireTimeoutMillis,
-        int maxPlanPages) {
+        int maxPlanPages,
+        String httpBearerToken) {
 
     /** Default connection-pool size when {@code vgi.connections} is unset. */
     public static final int DEFAULT_CONNECTIONS = 4;
@@ -95,7 +102,8 @@ public record VgiConfig(
         String location = properties.get("vgi.location");
         if (location == null || location.isBlank()) {
             throw new IllegalArgumentException(
-                    "vgi.location is required (a subprocess command, unix://path, or tcp://host:port)");
+                    "vgi.location is required (a subprocess command, unix://path, tcp://host:port, "
+                            + "or http(s)://host:port/path)");
         }
         String catalogName = properties.get("vgi.catalog-name");
         if (catalogName == null || catalogName.isBlank()) {
@@ -115,9 +123,10 @@ public record VgiConfig(
                 properties.get("vgi.connection-acquire-timeout-millis"),
                 DEFAULT_CONNECTION_ACQUIRE_TIMEOUT_MILLIS);
         int maxPlanPages = parseInt(properties.get("vgi.max-plan-pages"), DEFAULT_MAX_PLAN_PAGES);
+        String httpBearerToken = properties.get("vgi.http-bearer-token");
         return new VgiConfig(location, catalogName, connections, targetSplitBytes, minSplits,
                 maxSplitsPerResponse, dynamicFilteringWaitTimeoutMillis, connectionAcquireTimeoutMillis,
-                maxPlanPages);
+                maxPlanPages, httpBearerToken);
     }
 
     private static int parseInt(String value, int fallback) {
