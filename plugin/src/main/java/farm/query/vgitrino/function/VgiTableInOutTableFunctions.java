@@ -61,6 +61,16 @@ public final class VgiTableInOutTableFunctions {
      *       TableInput} argument at all — those are {@link
      *       VgiTableInOutFunctions#discover}'s and {@link
      *       VgiTableFunctions#discover}'s jobs respectively;</li>
+     *   <li>anything whose {@code function_type} is {@code "TABLE_BUFFERING"} — a {@code
+     *       TableBufferingFunction} (e.g. {@code sum_all_columns}) has the SAME wire shape at
+     *       discovery time ({@code input_from_args=false}, exactly one real {@code TableInput}
+     *       argument) but drives a genuinely different Sink+Combine+Source protocol
+     *       ({@code TABLE_BUFFERING}/{@code TABLE_BUFFERING_FINALIZE} init phases, not this
+     *       kind's {@code INPUT}/{@code FINALIZE}) — registering it here would send phase
+     *       {@code "FINALIZE"} to a worker method that only understands {@code
+     *       "TABLE_BUFFERING"}/{@code "TABLE_BUFFERING_FINALIZE"}, crashing at query time with
+     *       {@code ValueError: Unsupported init phase for TableBufferingFunction}. {@link
+     *       VgiTableBufferingFunctions#discover} handles it instead.</li>
      *   <li>a function with an unsupported non-table argument (varargs, {@code
      *       any}-typed) — see {@link VgiArgSpec#decode};</li>
      *   <li>more than one {@code TableInput} argument — VGI's own {@code
@@ -87,6 +97,10 @@ public final class VgiTableInOutTableFunctions {
                 for (byte[] item : functions.items()) {
                     FunctionInfo info = RecordCodec.deserializeFromBytes(item, FunctionInfo.class);
                     if (info.input_from_args()) continue; // blended — VgiTableInOutFunctions handles it
+                    // TableBufferingFunction — same shape at this point (input_from_args=false, one
+                    // TableInput arg) but a genuinely different wire protocol; see this method's own
+                    // javadoc. VgiTableBufferingFunctions.discover handles it instead.
+                    if ("TABLE_BUFFERING".equalsIgnoreCase(info.function_type())) continue;
                     byKey.computeIfAbsent(schemaName + "." + info.name(), k -> new ArrayList<>()).add(info);
                 }
             }

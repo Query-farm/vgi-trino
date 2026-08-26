@@ -39,10 +39,14 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
  * resolution {@code VgiScalarFunctions} already uses) never forwards a
  * credential a function didn't statically declare needing — see {@code
  * VgiScalarFunctions.BindCache#resolveSecretFields}'s own javadoc for why
- * that gate is deliberate, not an oversight. {@code sum_all_columns} is a
- * `TableBufferingFunction` (a third, distinct VGI kind with its own {@code
- * TABLE_BUFFERING}/{@code TABLE_BUFFERING_FINALIZE} phases) and was never in
- * scope here regardless of finalize support.
+ * that gate is deliberate, not an oversight. {@code sum_all_columns}/{@code
+ * sum_all_columns_simple_distributed} are {@code TableBufferingFunction}s (a
+ * third, distinct VGI kind with its own {@code TABLE_BUFFERING}/{@code
+ * TABLE_BUFFERING_FINALIZE} phases, not this kind's {@code INPUT}/{@code
+ * FINALIZE}) — out of scope here, covered instead by {@code
+ * VgiTableBufferingFunctionsTest} against {@link
+ * farm.query.vgitrino.function.VgiTableBufferingFunctions}/{@link
+ * farm.query.vgitrino.function.VgiTableBufferingDataProcessor}.
  */
 final class VgiTableInOutTableFunctionsTest {
 

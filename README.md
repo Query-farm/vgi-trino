@@ -520,6 +520,46 @@ wrong/partial signature, and a name VGI itself overloads (multiple
 one registration per name, unlike VGI's own arity/type-resolved dispatch) is
 skipped too rather than guessing which overload a caller meant.
 
+**`vgi_varargs` is a confirmed SPI ceiling for table functions, traced end to
+end, not assumed.** Unlike a scalar function's `Signature.variableArity()` (a
+real `MethodHandle`-collector mechanism — see *Scalar functions* below),
+Trino's table-function argument model has no variadic concept at all:
+`ArgumentSpecification`/`ScalarArgumentSpecification` (trino-spi 483) carry
+only a name, a `required` flag, an optional default, and (for the scalar
+kind) exactly one concrete `Type` — never a repeatable one — and
+`AbstractConnectorTableFunction` registers one fixed argument list for the
+function's entire lifetime. The engine code that actually binds a
+`TABLE(...)` call's arguments against that declared list —
+`StatementAnalyzer.analyzeArguments`, trino-main
+`io/trino/sql/analyzer/StatementAnalyzer.java:1925-1987` — throws
+`INVALID_ARGUMENTS` the instant a call passes more arguments than the
+declared list's size (line 1927), and binds a positional call strictly by
+index (line 1974), filling only pre-declared trailing slots left
+unspecified via `analyzeDefault` (lines 1980-1983) — never a repeating
+group. There is no mechanism, at any layer, for one declared argument to
+stand for "zero or more actual arguments."
+
+The one partial workaround this SPI does structurally allow — N *fixed*
+optional trailing slots of one shared `Type`, up to a hardcoded cap, using
+`ScalarArgumentSpecification.defaultValue()` to make each optional (a
+caller supplying fewer gets the rest defaulted to `null`, which
+`VgiTableFunction#analyze` already omits from the wire encoding, so the
+bytes sent match what a true repeating argument would have produced for
+that arity) — was checked against the real corpus before writing any code,
+and would fix nothing real: `constant_columns`, the corpus's actual
+varargs-not-registered failure (135 occurrences), declares its trailing
+argument `Any`-typed (vgi-python's `ConstantColumnsFunctionArguments.
+values`), and real call sites mix types *within one call* (e.g.
+`constant_columns(2, 100, 'test', 3.14, 999)`) — a fixed-cap workaround
+needs one declared `Type` per slot, and Trino's table-function SPI has no
+analogue of `Signature.typeVariable()` at all, so no `Type` could even be
+declared, cap or no cap. The corpus's only other two producer-mode varargs
+table functions are *already* unregisterable for reasons unrelated to
+varargs: `repeat_value`'s int/string overloads collide under one name
+(the pre-existing overload-collision skip above), and `union_varargs`'s
+argument is Arrow-Union-typed, a type `VgiTypeMapping` doesn't map at all.
+Full finding and file:line citations in `VgiArgSpec.decode`'s own javadoc.
+
 ### Table-in-out ("blended") functions — literal call shape
 
 VGI's `RowTransformFunction` ("blended") kind serves three call shapes from one
@@ -630,6 +670,20 @@ on `init`) — VGI's server-side state store is keyed by `execution_id`, not by 
 worker process, so passing a fresh/`null` one would silently correlate to an empty accumulator
 instead of throwing.
 
+**A real `TableFunctionProcessorState` SPI contract, confirmed the hard way.** The FINALIZE
+drain loop must never return `Processed.usedInput()` with no page in response to a call it
+received with `input == null` — confirmed directly against the real Trino engine
+(`RegularTableFunctionPartition.toOutputPages`): it tracks whether the just-fed input was
+`null`, and throws `"When function got no input, it should either produce output or return
+Blocked state"` unconditionally — not a race — the instant such a call returns a bare
+`Processed` with no result. A mid-stream zero-row (but not-EOS) `tick()` is exactly that shape.
+Since `Blocked` needs a real `CompletableFuture` this synchronous blocking-transport design
+doesn't have, the fix is to never surface that intermediate state to Trino at all: loop
+internally on a zero-row tick (still a real blocking network round trip each iteration, not a
+local busy-spin) until a real page or true completion is reached. This shipped silently broken
+until a full corpus run under load happened to hit a genuine mid-stream zero-row tick — every
+prior manual/targeted test had, by chance, always gotten a real page on the very first tick.
+
 **Settings and secrets.** `required_settings`/`required_secrets` (the real fixture's
 `filter_by_setting`/`secret_in_out`) resolve in `analyze()` exactly like a scalar function's —
 reusing `VgiScalarFunctions.BindCache#resolveSettings`/`#resolveSecretFields` verbatim, since
@@ -646,9 +700,107 @@ supplied it.
 **v1 scope otherwise**: mirrors the other table-function classes' constraints (varargs/
 `any`-typed non-table arguments skipped, overloaded names skipped, more than one `TableInput`
 argument rejected defensively — VGI's own validation already prevents registering one).
-`SumAllColumnsFunction`/`SumAllColumnsSimpleDistributed` stay out of reach regardless of
+`SumAllColumnsFunction`/`SumAllColumnsSimpleDistributed` stay out of reach here regardless of
 finalize support — they're really a `TableBufferingFunction`, a third, distinct VGI kind with
-its own `TABLE_BUFFERING`/`TABLE_BUFFERING_FINALIZE` phases, not `INPUT`/`FINALIZE`.
+its own `TABLE_BUFFERING`/`TABLE_BUFFERING_FINALIZE` phases, not `INPUT`/`FINALIZE`. See the
+next section for that kind's own support.
+
+### Table-in-out functions — `TableBufferingFunction` (Sink+Combine+Source)
+
+VGI's THIRD table-in-out kind — `TableBufferingFunction` — is routed by the C++ extension
+through an entirely different DuckDB physical operator (`PhysicalVgiTableBufferingFunction`, a
+Sink+Combine+Source operator) because the function must see **every** input row before
+producing any output at all: buffer-then-emit, global aggregation, sort-then-emit.
+`sum_all_columns`/`sum_all_columns_simple_distributed` are the real fixtures. At discovery
+time this kind is indistinguishable from a classic one by shape alone (`input_from_args=false`,
+exactly one real `TableInput` argument) — the only field that tells them apart is
+`FunctionInfo.function_type` (`"TABLE"` vs `"TABLE_BUFFERING"`, confirmed against the real
+worker SDK's `CatalogFunctionType` enum, set automatically from the class hierarchy). Before
+`VgiTableBufferingFunctions` existed, `VgiTableInOutTableFunctions.discover` had no way to tell
+the two apart and mis-registered every `TableBufferingFunction` as a classic one, crashing at
+query time with `ValueError: Unsupported init phase for TableBufferingFunction` the moment this
+connector sent phase `"FINALIZE"` to a worker method that only understands `"TABLE_BUFFERING"`/
+`"TABLE_BUFFERING_FINALIZE"` — confirmed the single most common census failure reason (110
+occurrences) across the full `vgi/test/sql/integration/` corpus before this connector's fix.
+`VgiTableInOutTableFunctions.discover` now explicitly skips `function_type == "TABLE_BUFFERING"`
+so the two discovery classes partition disjointly.
+
+**Wire shape — genuinely different, not just a different phase name.** Confirmed directly from
+the real worker SDK (`~/Development/vgi-python/vgi/table_buffering_function.py`/`vgi/worker.py`),
+not assumed:
+
+- **Sink** — `table_buffering_process` is a plain UNARY RPC (one input batch in, an opaque
+  worker-chosen `state_id` back), called once per input batch — NOT a streaming `exchange()`
+  turn the way classic table-in-out's `INPUT` phase is.
+- **Combine** — `table_buffering_combine` is another unary RPC, called EXACTLY ONCE after all
+  input, handing the worker every `state_id` collected from every Sink call; the worker's
+  `combine()` callback merges/groups them into `finalize_state_ids`.
+- **Source** — one streaming producer-mode `init(phase=TABLE_BUFFERING_FINALIZE,
+  finalize_state_id=...)` call PER returned `finalize_state_id`, drained via `tick()` exactly
+  like classic table-in-out's `FINALIZE` phase.
+
+This makes `VgiTableBufferingDataProcessor` look far more like `VgiAggregateFunctions`'
+unary-RPC-per-call design (`aggregate_update`/`aggregate_combine`/`aggregate_finalize`) than like
+`VgiTableInOutDataProcessor`'s long-lived streaming session: each Sink call and the one Combine
+call borrow-and-release a (possibly different) pooled connection independently via
+`client.withConnection`, exactly like `VgiAggregateFunctions#aggregate_update`/`#aggregate_combine`
+already do. Only the Source phase needs connection affinity — one held connection per
+`finalize_state_id`'s `tick()` sequence, mirroring `VgiTableInOutDataProcessor`'s FINALIZE-phase
+drain loop exactly (one-tick-per-call, never looping internally past a stream transition).
+
+**Establishing `execution_id`.** The one place a stream IS opened for the Sink phase: a single,
+lazy `init(phase=TABLE_BUFFERING)` call (on the first real page, or at end-of-input if the scan
+saw zero rows) opens an exchange-mode stream — the worker selects exchange mode whenever
+`bind_call.input_schema` is non-null, same as classic's `INPUT` phase — but this connector never
+exchanges real data on it: it reads `execution_id` off the stream's `GlobalInitResponse` header,
+then immediately calls `session.close()` to drain it (send EOS, discard the — always empty —
+output), freeing the connection for the unary RPCs that follow. This mirrors the real C++
+extension's own `drain_init_stream` helper verbatim (see
+`PhysicalVgiTableBufferingFunction::Sink`'s own comment: "the init RPC opens a Stream on the
+wire; for TABLE_BUFFERING we don't use it — all subsequent traffic is unary RPCs"). Every
+`table_buffering_process`/`table_buffering_combine`/`table_buffering_destructor` request after
+that carries this same `execution_id` — VGI's server-side state store (`BoundStorage`) is keyed
+by it, not by connection or worker process, which is exactly what lets each unary call land on
+any pooled connection. A monotonically increasing `batch_index` counter is supplied on every
+Sink call, trivially valid for `Meta.requires_input_batch_index=True` functions since a single
+Trino partition delivers every page to this processor strictly in order on one thread.
+
+**Distributed combine — genuinely supported, not merely non-decomposable.** Unlike
+`VgiAggregateFunctions`' `aggregate_combine` (which this connector's own research found has no
+portable cross-node state-shipping mechanism, so aggregates are deliberately registered
+non-decomposable, single-stage), `TableBufferingFunction`'s `combine()` is a REAL, first-class
+RPC the worker always runs, merging every `state_id` collected from every Sink call into the
+`finalize_state_ids` the Source phase drains. This connector calls it unconditionally, on the
+full, real list of `state_id`s it collected — there is no scoped-down or partial version of the
+protocol here. What IS scoped down is concurrency: since Trino only creates multiple partitions
+for a table-function call under an explicit `PARTITION BY` (which this registration, like classic
+table-in-out's, does not request), `VgiTableBufferingDataProcessor` always drives the entire
+Sink phase serially from one partition — the same "single-worker" case the real C++ extension
+itself exercises whenever a query runs with a single DuckDB thread. That is a complete, honest
+implementation of the wire protocol, not a fallback: `combine()` still runs, over however many
+`state_id`s a serial Sink phase produced (one per input batch, not necessarily one in total), so
+a worker's `combine()` callback is exercised exactly as designed. What this connector does NOT
+attempt is fanning the Sink phase itself out across multiple concurrent connections the way the
+C++ operator's multi-threaded `Sink()` does — nothing in Trino's `TableFunctionDataProcessor`
+SPI offers a parallel-partition hook for a data-driven (`TableArgumentSpecification`) call to fan
+out on (any such call routes through the single, serial data-processor path, never a split-based
+one — see the classic table-in-out section above).
+
+**Settings and secrets.** `required_settings`/`required_secrets` resolve in `analyze()` exactly
+like classic table-in-out's, reusing `VgiScalarFunctions.BindCache` verbatim.
+
+**A genuine SPI gap, inherited from classic table-in-out.** `TableFunctionDataProcessor`
+declares no `close()`/lifecycle hook — if Trino abandons a partition mid-Source-phase (e.g. a
+`LIMIT` satisfied elsewhere) before this processor reaches `FINISHED` on its own, the
+currently-held finalize-stream connection leaks until GC. The Sink phase itself never holds a
+connection between calls, so it has no such exposure.
+
+**Same `Processed.usedInput()`-with-no-page SPI contract classic table-in-out's own section
+documents applies here too** — the Source-phase drain loop never returns that shape for a
+null-input call, looping internally on a zero-row tick instead. See classic table-in-out's own
+"real `TableFunctionProcessorState` SPI contract" note above for the full explanation (both
+processors share the same bug fix, confirmed the same way — a full corpus run under load, not a
+targeted test, is what actually exercises a genuine mid-stream zero-row tick).
 
 ### Predicate pushdown
 
@@ -1038,7 +1190,12 @@ the same boundary on static predicate pushdown).
   impossible via Trino's current PTF SPI; see *Table functions* above.
 - **Overloaded table functions**, and any function with a varargs/`any`-typed/
   TABLE-input argument — see *Table functions* above for why these are
-  skipped rather than registered wrong.
+  skipped rather than registered wrong. Varargs specifically is a confirmed
+  SPI ceiling (Trino's table-function argument model has no variadic concept
+  at all, traced end to end against the real engine code) that also happens
+  to be moot for the real corpus — every vararg producer table function
+  there is blocked by a second, independent reason even where the varargs
+  ceiling is set aside; see *Table functions* above for the full finding.
 - **Scalar functions with a dynamic (bind-time-computed) return type, a
   colliding overload set, or a 128-bit decimal argument/return** — see
   *Scalar functions* above for why each is skipped rather than registered

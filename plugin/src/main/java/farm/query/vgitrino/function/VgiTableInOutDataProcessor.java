@@ -216,24 +216,37 @@ public final class VgiTableInOutDataProcessor implements TableFunctionDataProces
         }
     }
 
-    /** One {@code tick()} of the FINALIZE-phase producer stream — {@code finish()} may legally take
-     *  several of these to drain fully (see this class's own javadoc). */
+    /**
+     * Drains the FINALIZE-phase producer stream — {@code finish()} may legally take several
+     * {@code tick()}s to drain fully (see this class's own javadoc) — LOOPING on a zero-row tick
+     * rather than returning it to Trino, since this method is only ever reached with {@code
+     * input == null} (true end-of-input). Confirmed against the real Trino engine ({@code
+     * RegularTableFunctionPartition.toOutputPages}): it throws {@code "When function got no
+     * input, it should either produce output or return Blocked state"} — unconditionally, not a
+     * race — the instant a null-input call returns a bare {@code Processed} with no page. A
+     * mid-stream zero-row (but not-EOS) tick is exactly that shape, so it must never be returned
+     * directly; retrying the tick in the same call (still a real blocking network round trip, not
+     * a local busy-spin) is the correct fix, since {@code Blocked} would need a real {@code
+     * CompletableFuture} this synchronous transport doesn't have.
+     */
     private TableFunctionProcessorState drainFinalizeOnce(VgiWorkerClient.Attached connection) {
-        try {
-            AnnotatedBatch out = session.tick();
-            int rowCount = out.root().getRowCount();
-            if (rowCount == 0) {
-                return TableFunctionProcessorState.Processed.usedInput();
+        while (true) {
+            try {
+                AnnotatedBatch out = session.tick();
+                int rowCount = out.root().getRowCount();
+                if (rowCount == 0) {
+                    continue;
+                }
+                return TableFunctionProcessorState.Processed.produced(toPage(out.root(), rowCount));
+            } catch (NoSuchElementException endOfStream) {
+                finishAndRelease(connection);
+                return TableFunctionProcessorState.Finished.FINISHED;
+            } catch (RuntimeException e) {
+                finished = true;
+                connectionHealthy = false;
+                client.release(connection, false);
+                throw e;
             }
-            return TableFunctionProcessorState.Processed.produced(toPage(out.root(), rowCount));
-        } catch (NoSuchElementException endOfStream) {
-            finishAndRelease(connection);
-            return TableFunctionProcessorState.Finished.FINISHED;
-        } catch (RuntimeException e) {
-            finished = true;
-            connectionHealthy = false;
-            client.release(connection, false);
-            throw e;
         }
     }
 

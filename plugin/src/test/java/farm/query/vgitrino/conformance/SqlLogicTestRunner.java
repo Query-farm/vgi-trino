@@ -57,6 +57,38 @@ final class SqlLogicTestRunner {
         int skipped = 0;
         List<String> failures = new ArrayList<>();
 
+        // A file whose own header declares `require-env VGI_TEST_DEDICATED_WORKER` MUST be
+        // skipped whole, not executed — confirmed the hard way: table_buffering_pool_recovery.test
+        // and table_buffering_worker_crash.test both call crash_on_process(...), which SIGKILLs the
+        // live worker PROCESS. Their own headers document this is "not safe under shared-worker
+        // transports" and gate it behind this exact env var for that reason. This runner (unlike
+        // the real DuckDB sqllogictest harness) otherwise parses every require/require-env line as
+        // an opaque Kind.OTHER record and never acts on ANY of them — deliberately: every OTHER
+        // require-env this corpus uses just selects which specialized worker/config a file targets,
+        // and this connector always replays against the plain shared example fixture worker
+        // regardless, so an unmet one of those simply fails its statements normally (already
+        // accounted for in the census's ordinary failure buckets) rather than corrupting shared
+        // state. VGI_TEST_DEDICATED_WORKER is the one exception: ignoring it let this connector's
+        // whole shared worker POOL get SIGKILLed mid-census, permanently exhausting it and hanging
+        // every subsequent table-in-out-family query for the rest of the run (confirmed via a live
+        // jstack: the census's own client thread blocked forever reading an HTTP response for a
+        // query whose server-side VgiTableInOutTableFunction.analyze() was itself blocked forever in
+        // VgiWorkerClient.borrow() — a real ~46-minute total stall, not a slow query). This
+        // environment never sets VGI_TEST_DEDICATED_WORKER (there is no dedicated-worker mode here),
+        // so any file requiring it is skipped in full — mirroring how nonPortableMarkers already
+        // skips a record rather than running it.
+        boolean requiresDedicatedWorker = records.stream()
+                .anyMatch(r -> r.kind() == SqlLogicTestFile.Kind.OTHER
+                        && r.directiveLine().strip().equals("require-env VGI_TEST_DEDICATED_WORKER"));
+        if (requiresDedicatedWorker && System.getenv("VGI_TEST_DEDICATED_WORKER") == null) {
+            long executableRecordCount = records.stream()
+                    .filter(r -> r.kind() == SqlLogicTestFile.Kind.QUERY
+                            || r.kind() == SqlLogicTestFile.Kind.STATEMENT_OK
+                            || r.kind() == SqlLogicTestFile.Kind.STATEMENT_ERROR)
+                    .count();
+            return new Result(0, (int) executableRecordCount, List.of());
+        }
+
         // First pass: apply every rewrite EXCEPT the :: cast one, and collect the retained
         // (non-skipped) records so their SQL can be cast-rewritten as one batch — sqlglot is a
         // Python subprocess, and spawning one per record (rather than once per file) would be
@@ -484,6 +516,12 @@ final class SqlLogicTestRunner {
      *       common failure mode found by sampling the census's {@code UNSUPPORTED} bucket — {@code
      *       example.double(...)}, {@code example.sum_values(...)}, and others). See {@link
      *       #insertDefaultSchema} for the {@code DEFAULT_SCHEMA} assumption this rewrite makes.</li>
+     *   <li>A call mixing bare positional arguments with {@code name => value} ones — legal in
+     *       DuckDB (e.g. {@code sequence(10, batch_size := 0)}), but Trino rejects ANY such mix
+     *       outright ({@code "All arguments must be passed by name or all must be passed
+     *       positionally"} — confirmed the single most common failure reason across the whole
+     *       census before this rewrite existed). See {@link #normalizeMixedPositionalNamedArgs}
+     *       for the exact, deliberately conservative shape this handles.</li>
      * </ul>
      *
      * <p>This is a best-effort textual rewrite, not a SQL parser: it only recognizes a table
@@ -499,7 +537,114 @@ final class SqlLogicTestRunner {
         rewritten = wrapBareTableFunctionCalls(rewritten, trinoCatalog);
         rewritten = rewriteRangeCalls(rewritten);
         rewritten = rewriteAtClause(rewritten);
-        return rewritten.replace(":=", "=>");
+        rewritten = rewritten.replace(":=", "=>");
+        return normalizeMixedPositionalNamedArgs(rewritten);
+    }
+
+    /**
+     * One parsed call argument: an optional {@code "name => "} label (empty string if this
+     * argument is positional) plus its value text.
+     *
+     * @param label the exact {@code "name => "} text to keep if this argument stays named, or
+     *        {@code ""} if positional
+     * @param value the argument's value text, already recursively normalized (see {@link
+     *        #normalizeMixedPositionalNamedArgs})
+     * @param named whether this argument had a {@code name =>} label at all
+     */
+    private record NamedArg(String label, String value, boolean named) {}
+
+    /** Splits one already-{@code splitTopLevelArgs}-delimited argument into its {@code name => }
+     *  label (if any) and value, recursively normalizing the value's own nested calls. */
+    private static NamedArg parseArgument(String arg) {
+        String trimmed = arg.strip();
+        int idx = 0;
+        while (idx < trimmed.length() && isIdentChar(trimmed.charAt(idx))) idx++;
+        if (idx > 0) {
+            int j = idx;
+            while (j < trimmed.length() && Character.isWhitespace(trimmed.charAt(j))) j++;
+            if (trimmed.startsWith("=>", j)) {
+                String value = trimmed.substring(j + 2).strip();
+                return new NamedArg(trimmed.substring(0, idx) + " => ",
+                        normalizeMixedPositionalNamedArgs(value), true);
+            }
+        }
+        return new NamedArg("", normalizeMixedPositionalNamedArgs(trimmed), false);
+    }
+
+    /**
+     * Rewrites {@code some_call(pos1, pos2, name1 => val1, name2 => val2)} — zero or more bare
+     * positional arguments followed by zero or more {@code name => value} ones, in that order —
+     * into all-positional form (dropping the {@code name => } labels), the shape Trino requires
+     * when a call has ANY positional argument at all. Recurses into every argument's own nested
+     * calls first, so a mixed-arg call buried inside another call's argument is normalized too.
+     *
+     * <p>Deliberately does nothing for any OTHER shape: a call with no named arguments (already
+     * fine), one with no positional arguments (an all-named call is legal in Trino as-is, no
+     * violation to fix), or one where a positional argument appears AFTER a named one (DuckDB
+     * allows arbitrary reordering by name; blindly stripping labels there could silently swap two
+     * arguments' values into the wrong slots — safer to leave it failing than to guess wrong).
+     * Applied to every {@code identifier(...)} call in the whole SQL text, not just ones after
+     * {@code FROM}/{@code JOIN} — a plain scalar function call anywhere in a {@code SELECT} list
+     * can mix positional/named args exactly the same way a table function call can.
+     *
+     * <p>Safe to run against arbitrary SQL text even where it doesn't apply: a call with no
+     * {@code name => value}-shaped argument (every ordinary Trino/DuckDB function call, since
+     * {@code =>} is not standard SQL syntax outside this rewrite's own output) is left completely
+     * unchanged.
+     */
+    static String normalizeMixedPositionalNamedArgs(String sql) {
+        StringBuilder out = new StringBuilder();
+        int i = 0;
+        int n = sql.length();
+        while (i < n) {
+            char c = sql.charAt(i);
+            boolean identStart = isIdentChar(c) && (i == 0 || !isIdentChar(sql.charAt(i - 1)));
+            if (!identStart) {
+                out.append(c);
+                i++;
+                continue;
+            }
+            int callStart = i;
+            while (i < n && isIdentChar(sql.charAt(i))) i++;
+            if (i >= n || sql.charAt(i) != '(') {
+                out.append(sql, callStart, i);
+                continue;
+            }
+            int openParen = i;
+            int closeParen = findMatchingParen(sql, openParen);
+            if (closeParen < 0) {
+                out.append(sql, callStart, i);
+                continue;
+            }
+            List<String> rawArgs = splitTopLevelArgs(sql.substring(openParen + 1, closeParen));
+            List<NamedArg> args = new ArrayList<>(rawArgs.size());
+            for (String rawArg : rawArgs) args.add(parseArgument(rawArg));
+
+            boolean namedSeenSoFar = false;
+            boolean namedAfterPositional = false; // a positional arg appears AFTER a named one
+            boolean anyPositional = false;
+            boolean anyNamed = false;
+            for (NamedArg arg : args) {
+                if (arg.named()) {
+                    anyNamed = true;
+                    namedSeenSoFar = true;
+                } else {
+                    anyPositional = true;
+                    if (namedSeenSoFar) namedAfterPositional = true;
+                }
+            }
+            boolean stripLabels = anyPositional && anyNamed && !namedAfterPositional;
+
+            out.append(sql, callStart, openParen + 1);
+            for (int k = 0; k < args.size(); k++) {
+                if (k > 0) out.append(", ");
+                NamedArg arg = args.get(k);
+                out.append(arg.named() && !stripLabels ? arg.label() + arg.value() : arg.value());
+            }
+            out.append(')');
+            i = closeParen + 1;
+        }
+        return out.toString();
     }
 
     /**

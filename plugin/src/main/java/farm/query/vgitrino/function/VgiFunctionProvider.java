@@ -77,10 +77,15 @@ public final class VgiFunctionProvider implements FunctionProvider {
             @Override
             public TableFunctionDataProcessor getDataProcessor(
                     ConnectorSession session, ConnectorTableFunctionHandle functionHandle) {
-                // Reached only for a classic (TableInput-argument) table-in-out call — verified
+                // Reached only for a TableInput-argument table-in-out-family call — verified
                 // against the real Trino engine that a function with any TableArgumentSpecification is
                 // ALWAYS routed here, never through getSplitProcessor (see VgiTableInOutTableFunction's
-                // own javadoc) — so this handle type is the only one ever seen here.
+                // own javadoc) — so these two handle types are the only ones ever seen here: classic
+                // (INPUT/FINALIZE streaming exchange) or table-buffering (Sink+Combine+Source, see
+                // VgiTableBufferingFunction's own javadoc for why the two need distinct processors).
+                if (functionHandle instanceof VgiTableBufferingFunctionHandle h) {
+                    return new VgiTableBufferingDataProcessor(client, h);
+                }
                 VgiTableInOutTableFunctionHandle h = (VgiTableInOutTableFunctionHandle) functionHandle;
                 return new VgiTableInOutDataProcessor(client, h);
             }
@@ -124,6 +129,11 @@ public final class VgiFunctionProvider implements FunctionProvider {
         MethodHandle rawHandle = needsSession
                 ? VgiScalarFunctions.methodHandle(argumentTypes.size())
                 : VgiScalarFunctions.methodHandleNoSession(argumentTypes.size());
+        // Narrow each boxed-argument parameter from bare Object to its real wrapper type (Long,
+        // Slice, ...) — see VgiScalarFunctions.retypeBoxedArguments's own javadoc for why a
+        // NULL_FLAG-requesting call site otherwise silently skips unboxing and crashes later with
+        // "Expected argument type to be long, but is class java.lang.Object".
+        rawHandle = VgiScalarFunctions.retypeBoxedArguments(rawHandle, needsSession ? 2 : 1, argumentTypes);
         MethodHandle instanceFactory = VgiScalarFunctions.instanceFactory(client, callConfig, bindCache);
 
         InvocationConvention actualConvention = new InvocationConvention(

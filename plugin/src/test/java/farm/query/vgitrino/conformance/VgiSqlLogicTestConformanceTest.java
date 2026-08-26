@@ -23,6 +23,7 @@ import java.util.List;
 import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.fail;
 
 /**
@@ -156,6 +157,41 @@ abstract class VgiSqlLogicTestConformanceTest {
      */
     private static final List<String> WINDOW_SELF_JOIN_NON_PORTABLE_MARKERS =
             List.of("ATTACH ", "DETACH", "QUALIFY", "duckdb_functions(");
+
+    /**
+     * {@code table_in_out/table_buffering_pool_recovery.test} and its sibling {@code
+     * table_buffering_worker_crash.test} both call {@code crash_on_process(...)}, which SIGKILLs
+     * the live worker PROCESS — their own headers document this as "not safe under shared-worker
+     * transports" and gate it behind {@code require-env VGI_TEST_DEDICATED_WORKER} for exactly that
+     * reason. This connector replays the WHOLE corpus against one shared worker pool (see {@link
+     * VgiSqlLogicTestCensusTest}'s own javadoc), never setting that env var — before {@link
+     * SqlLogicTestRunner#run} learned to honor it, running this file for real SIGKILLed the shared
+     * pool and permanently hung every subsequent table-in-out-family query for the rest of the test
+     * run (confirmed via a live jstack: the client blocked forever reading an HTTP response for a
+     * query whose server-side analyze() was itself blocked forever in {@code
+     * VgiWorkerClient.borrow()} — a real, unrecoverable stall, not a slow query). Asserts the whole
+     * file is skipped (0 executed) rather than exercising the crash for real inside a unit test.
+     */
+    @Test
+    @Timeout(60)
+    void dedicatedWorkerOnlyFilesAreSkippedWholeNotExecuted() throws Exception {
+        Path poolRecovery = Path.of(System.getProperty("user.home"),
+                "Development/vgi/test/sql/integration/table_in_out/table_buffering_pool_recovery.test");
+        Path workerCrash = Path.of(System.getProperty("user.home"),
+                "Development/vgi/test/sql/integration/table_in_out/table_buffering_worker_crash.test");
+        Assumptions.assumeTrue(poolRecovery.toFile().isFile() && workerCrash.toFile().isFile(),
+                "table_buffering_pool_recovery.test / table_buffering_worker_crash.test not present");
+        Assumptions.assumeTrue(System.getenv("VGI_TEST_DEDICATED_WORKER") == null,
+                "VGI_TEST_DEDICATED_WORKER is set in this environment — the skip this test asserts wouldn't apply");
+
+        for (Path testFile : List.of(poolRecovery, workerCrash)) {
+            SqlLogicTestRunner.Result result =
+                    SqlLogicTestRunner.run(runner, session, testFile, "example.", TRINO_CATALOG, List.of());
+            assertEquals(0, result.executed(), testFile + ": expected the whole file to be skipped, not executed");
+            assertTrue(result.skipped() > 0, testFile + ": expected a positive skip count");
+            assertTrue(result.failures().isEmpty(), testFile + ": expected no failures — file should never run");
+        }
+    }
 
     @Test
     @Timeout(180)

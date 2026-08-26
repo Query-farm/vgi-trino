@@ -831,6 +831,54 @@ public final class VgiScalarFunctions {
         return INVOKE_NO_SESSION.asCollector(Object[].class, arity);
     }
 
+    /**
+     * Narrow {@code handle}'s {@code argumentTypes.size()} trailing boxed-argument parameters —
+     * declared bare {@code Object} by {@link #methodHandle}/{@link #methodHandleNoSession}'s
+     * {@code asCollector} — to each argument's REAL wrapper type ({@code Long} for a {@code
+     * bigint}/{@code integer}/{@code smallint}/{@code tinyint} argument, {@code Double} for
+     * {@code double}, {@code Boolean} for {@code boolean}, {@code Slice} for {@code
+     * varchar}/{@code varbinary}, etc. — whatever {@link Type#getJavaType()} boxes to).
+     *
+     * <p>Required because {@code io.trino.spi.function.ScalarFunctionAdapter#adapt} — specifically its private {@code
+     * boxedToNullFlagFilter}, reached whenever a call site requests the {@code NULL_FLAG}
+     * argument convention instead of {@code BOXED_NULLABLE} directly — decides whether to unbox
+     * an argument by inspecting the HANDLE'S OWN declared parameter {@code Class}, not the
+     * runtime value: {@code isWrapperType(methodHandle.type().parameterType(parameterIndex))}. A
+     * bare {@code Object}-declared parameter fails that check (only a real wrapper class like
+     * {@code Long.class} passes {@code isWrapperType}), so the needed unbox is silently skipped
+     * even though the value flowing through really is a {@code Long}/etc. — Trino's own post-adapt
+     * verification ({@code FunctionManager}) then throws {@code "Expected argument type to be
+     * long, but is class java.lang.Object"} the first time a call site actually requests {@code
+     * NULL_FLAG} (confirmed against the real trino-spi source, not assumed).
+     *
+     * <p>Safe via {@link MethodHandle#asType}: {@code asType} converts each incoming argument from
+     * the NEW (narrower, e.g. {@code Long}) parameter type to this handle's original ({@code
+     * Object}) parameter type before invoking the underlying implementation — a trivial reference
+     * widening (every subtype is assignable to {@code Object}) that can never throw {@code
+     * ClassCastException}, regardless of whether the real runtime value happens to match. The
+     * return type is left untouched ({@code Object}, matching {@code NULLABLE_RETURN}'s own
+     * convention already).
+     *
+     * @param handle the raw handle from {@link #methodHandle}/{@link #methodHandleNoSession}
+     * @param leadingParamCount how many non-argument parameters precede the boxed arguments —
+     *        2 ({@code Invoker, ConnectorSession}) for {@link #methodHandle}, 1 ({@code Invoker})
+     *        for {@link #methodHandleNoSession}
+     * @param argumentTypes this call site's bound argument types, in order
+     * @return the same handle, retyped
+     */
+    public static MethodHandle retypeBoxedArguments(MethodHandle handle, int leadingParamCount, List<Type> argumentTypes) {
+        MethodType type = handle.type();
+        for (int i = 0; i < argumentTypes.size(); i++) {
+            type = type.changeParameterType(leadingParamCount + i, wrapJavaType(argumentTypes.get(i)));
+        }
+        return handle.asType(type);
+    }
+
+    /** {@code type.getJavaType()}, boxed if primitive — mirrors {@code ScalarFunctionAdapter}'s own private {@code wrap} helper. */
+    private static Class<?> wrapJavaType(Type type) {
+        return MethodType.methodType(type.getJavaType()).wrap().returnType();
+    }
+
     /** {@link #invoke} for a function with no {@code required_settings}/{@code required_secrets} at all. */
     private static Object invokeNoSession(Invoker invoker, Object[] args) {
         return invoke(invoker, null, args);

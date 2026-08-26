@@ -24,10 +24,53 @@ final class SqlLogicTestRunnerSyntaxRewriteTest {
 
     @Test
     void rewritesNamedArgumentSyntax() {
+        // sequence(10, batch_size := 0) mixes a positional arg with a named one -- DuckDB allows
+        // this, Trino doesn't (see normalizeMixedPositionalNamedArgsStripsATrailingNamedLabel),
+        // so the := -> => conversion is followed by normalizeMixedPositionalNamedArgs stripping
+        // the now-redundant label entirely, leaving an all-positional call.
         assertEquals(
-                "SELECT * FROM TABLE(vgi_example.main.sequence(10, batch_size => 0))",
+                "SELECT * FROM TABLE(vgi_example.main.sequence(10, 0))",
                 SqlLogicTestRunner.rewriteDuckDbOnlySyntax(
                         "SELECT * FROM vgi_example.main.sequence(10, batch_size := 0)", CATALOG));
+    }
+
+    @Test
+    void normalizeMixedPositionalNamedArgsStripsATrailingNamedLabel() {
+        // Confirmed against the real corpus (unary_error_propagation.test): "All arguments must
+        // be passed by name or all must be passed positionally" was the single most common
+        // failure reason before this rewrite existed.
+        assertEquals("f(1, 2, 3)", SqlLogicTestRunner.normalizeMixedPositionalNamedArgs("f(1, b => 2, c => 3)"));
+    }
+
+    @Test
+    void normalizeMixedPositionalNamedArgsLeavesAnAllPositionalCallAlone() {
+        assertEquals("f(1, 2, 3)", SqlLogicTestRunner.normalizeMixedPositionalNamedArgs("f(1, 2, 3)"));
+    }
+
+    @Test
+    void normalizeMixedPositionalNamedArgsLeavesAnAllNamedCallAlone() {
+        // No positional argument at all -- Trino has nothing to object to, nothing to strip.
+        assertEquals("f(a => 1, b => 2)", SqlLogicTestRunner.normalizeMixedPositionalNamedArgs("f(a => 1, b => 2)"));
+    }
+
+    @Test
+    void normalizeMixedPositionalNamedArgsLeavesAPositionalArgAfterANamedOneAlone() {
+        // A positional arg AFTER a named one could mean the named one reordered it -- stripping
+        // labels here could silently swap values into the wrong slots, so this shape is left
+        // failing rather than guessed at.
+        assertEquals("f(a => 1, 2)", SqlLogicTestRunner.normalizeMixedPositionalNamedArgs("f(a => 1, 2)"));
+    }
+
+    @Test
+    void normalizeMixedPositionalNamedArgsRecursesIntoNestedCalls() {
+        assertEquals("f(1, g(4, 5))",
+                SqlLogicTestRunner.normalizeMixedPositionalNamedArgs("f(1, g(4, y => 5))"));
+    }
+
+    @Test
+    void normalizeMixedPositionalNamedArgsIsANoOpOnOrdinarySql() {
+        String sql = "SELECT a, b FROM t WHERE x IN (1, 2, 3) AND y = CAST(z AS INTEGER)";
+        assertEquals(sql, SqlLogicTestRunner.normalizeMixedPositionalNamedArgs(sql));
     }
 
     @Test

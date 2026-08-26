@@ -116,6 +116,38 @@ final class VgiScalarFunctionsTest {
 
     @Test
     @Timeout(60)
+    void nestedScalarCallArgumentRequestsTheNullFlagConvention() {
+        // A NESTED call's result, unlike a bare column reference, is not an InputReferenceNode —
+        // BytecodeUtils.getPreferredArgumentConvention (trino-main) picks NULL_FLAG, not
+        // BLOCK_POSITION/BOXED_NULLABLE, for exactly this shape (any nullable, non-input-reference
+        // argument, arity <= 64). Before VgiScalarFunctions.retypeBoxedArguments existed, the raw
+        // MethodHandle's boxed-argument parameters were bare Object (not the real wrapper type
+        // NULL_FLAG-adaptation checks for via isWrapperType), so ScalarFunctionAdapter silently
+        // skipped unboxing and Trino's own post-adapt verification crashed with "Expected argument
+        // type to be long, but is class java.lang.Object" the first time a query used this shape.
+        MaterializedResult result = runner.execute(session,
+                "SELECT vgi_example.main.multiply(vgi_example.main.multiply(x, 2), 3) FROM "
+                        + "(VALUES (1), (2), (3)) AS t(x)");
+        assertEquals(6L, result.getMaterializedRows().get(0).getField(0));
+        assertEquals(12L, result.getMaterializedRows().get(1).getField(0));
+        assertEquals(18L, result.getMaterializedRows().get(2).getField(0));
+    }
+
+    @Test
+    @Timeout(60)
+    void caseExpressionArgumentRequestsTheNullFlagConvention() {
+        // Same NULL_FLAG-triggering shape as the nested-call test above, via a different
+        // non-InputReferenceNode argument expression (a CASE expression).
+        MaterializedResult result = runner.execute(session,
+                "SELECT vgi_example.main.multiply(CASE WHEN x > 0 THEN x ELSE 0 END, 5) FROM "
+                        + "(VALUES (1), (2), (3)) AS t(x)");
+        assertEquals(5L, result.getMaterializedRows().get(0).getField(0));
+        assertEquals(10L, result.getMaterializedRows().get(1).getField(0));
+        assertEquals(15L, result.getMaterializedRows().get(2).getField(0));
+    }
+
+    @Test
+    @Timeout(60)
     void geoDistanceStructHandlesRowArguments() {
         Object result = scalar("SELECT vgi_example.main.geo_distance_struct("
                 + "CAST(ROW(0.0, 0.0) AS ROW(lat DOUBLE, lon DOUBLE)), "

@@ -29,7 +29,13 @@ public final class VgiTableFunctions {
      * Skipped, rather than registered wrong or crashing catalog creation:
      * <ul>
      *   <li>a function with an unsupported argument (varargs, {@code any}-typed,
-     *       TABLE input) — see {@link VgiArgSpec#decode};</li>
+     *       TABLE input) — see {@link VgiArgSpec#decode}. {@code vgi_varargs} in
+     *       particular is a confirmed Trino table-function SPI ceiling, traced
+     *       end to end against the real engine code, not a scope choice — see
+     *       {@link VgiArgSpec#decode}'s own javadoc for the full finding
+     *       (including why the real corpus's vararg table functions would stay
+     *       unregisterable even under a partial workaround this SPI does
+     *       structurally allow);</li>
      *   <li>an OVERLOADED function name — VGI resolves overloads by argument
      *       count/type at bind time (mirroring Java method overloading), but
      *       Trino's {@code ConnectorTableFunction} model requires exactly one

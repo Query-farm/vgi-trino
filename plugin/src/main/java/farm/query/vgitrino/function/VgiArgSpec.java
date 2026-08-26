@@ -66,6 +66,79 @@ public record VgiArgSpec(String name, Type type, boolean hasDefault, Object defa
      * check {@link #tableArg} themselves and skip registering the whole
      * function, rather than silently drop one argument from its signature.
      *
+     * <h2>{@code vgi_varargs} is a confirmed Trino table-function SPI ceiling, not
+     * a scope choice — traced end to end, not assumed</h2>
+     *
+     * <p>Unlike a scalar function ({@link VgiScalarFunctions}'s {@code
+     * Signature.variableArity()}, a real {@code MethodHandle}-collector mechanism),
+     * Trino's table-function argument model has no variadic concept whatsoever.
+     * {@code io.trino.spi.function.table.ArgumentSpecification} (trino-spi 483)
+     * carries only a name, a {@code required} flag, and an optional default —
+     * {@code ScalarArgumentSpecification} adds exactly one concrete {@code Type},
+     * never a repeatable one. {@code AbstractConnectorTableFunction} registers one
+     * fixed {@code List<ArgumentSpecification>} for the function's entire lifetime
+     * — there is no per-call-site re-declaration the way a scalar function's
+     * {@code getScalarFunctionImplementation} gets one. And the engine code that
+     * actually binds a {@code TABLE(...)} call's arguments against that declared
+     * list — {@code StatementAnalyzer.analyzeArguments}, trino-main
+     * {@code io/trino/sql/analyzer/StatementAnalyzer.java:1925-1987} — throws
+     * {@code INVALID_ARGUMENTS} ("Too many arguments...") the instant
+     * {@code arguments.size() > argumentSpecifications.size()} (line 1927), and a
+     * positional call binds strictly by index (line 1974: {@code
+     * argumentSpecifications.get(i)}), filling only the DECLARED, PRE-EXISTING
+     * trailing slots that were left unspecified via {@code analyzeDefault} (lines
+     * 1980-1983) — never a repeating group. There is no mechanism, at any layer,
+     * for one declared argument to stand for "zero or more actual arguments."
+     *
+     * <p>The one real (if partial) workaround this SPI structurally allows — since
+     * {@code ScalarArgumentSpecification.defaultValue()} makes a trailing slot
+     * optional (line 1980's positional-default fill) — would be registering N
+     * FIXED optional trailing slots, all sharing one declared {@code Type}, up to
+     * some hardcoded cap; a caller supplying fewer than N gets the rest defaulted
+     * to {@code null}, which {@link VgiTableFunction#analyze} already omits from
+     * the wire encoding (a null-valued {@code ScalarArgument} is skipped before
+     * {@code ArgumentsEncoder.positional}), so the bytes actually sent would match
+     * what a true repeating argument would have produced for that arity — a
+     * genuinely honest partial mechanism, in principle. It was not built, because
+     * checking it against the real corpus first (per this connector's own
+     * discipline — see the README's "Scope" section) showed it would fix nothing
+     * real:
+     *
+     * <ul>
+     *   <li>{@code constant_columns} — the corpus's actual varargs-not-registered
+     *       failure (135 occurrences) — declares its trailing argument {@code
+     *       Any}-typed (vgi-python {@code vgi/_test_fixtures/table/pairs.py}'s
+     *       {@code ConstantColumnsFunctionArguments.values}: {@code
+     *       Annotated<tuple<Any, ...>, Arg(1, varargs=True, ...)>}), and real call
+     *       sites mix types WITHIN one call (e.g. {@code constant_columns(2, 100,
+     *       'test', 3.14, 999)} — int64, string, double, int64 in one invocation).
+     *       A fixed-cap workaround needs ONE declared {@code Type} per slot;
+     *       Trino's table-function SPI has no analogue of {@code
+     *       Signature.typeVariable()} at all (no type-variable concept anywhere in
+     *       {@code ArgumentSpecification}), so there is no {@code Type} that could
+     *       even be declared for this argument, cap or no cap.</li>
+     *   <li>The corpus's only other two producer-mode varargs table functions are
+     *       ALREADY unregisterable for reasons that have nothing to do with
+     *       varargs: {@code repeat_value}'s int/string overloads ({@code
+     *       RepeatValueIntArgs}/{@code RepeatValueStrArgs}, same {@code pairs.py})
+     *       register under the identical name, tripping {@link
+     *       VgiTableFunctions#discover}'s pre-existing overload-collision skip;
+     *       {@code union_varargs}'s argument ({@code UnionVarargsArgs}, same file)
+     *       is Arrow-Union-typed, a type {@link
+     *       farm.query.vgitrino.types.VgiTypeMapping} does not map at all,
+     *       independent of its varargs shape.</li>
+     * </ul>
+     *
+     * <p>So a fixed-cap workaround would add real code and a real (if honest)
+     * semantic compromise to fix zero real fixtures — every real vararg
+     * table function in the corpus is blocked by a second, independent
+     * ceiling even where this one is set aside. This is why {@code
+     * vgi_varargs} is documented here as a confirmed SPI ceiling rather than
+     * implemented around: not because no partial mechanism exists, but
+     * because building one against no real, testable fixture would be
+     * exactly the kind of "registered wrong" this class's own discipline
+     * exists to avoid.
+     *
      * @param field the argument's Arrow field, from the decoded
      *        {@code FunctionInfo.arguments} schema
      * @return the decoded spec, or {@code null} if unsupported

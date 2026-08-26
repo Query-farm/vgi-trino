@@ -22,9 +22,13 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.TreeMap;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 import java.util.stream.Stream;
 
 /**
@@ -113,12 +117,30 @@ final class VgiSqlLogicTestCensusTest {
             "vgi_catalogs(",
             // DuckDB's own runtime-tuning PRAGMA-like statements (no SESSION keyword, no such
             // session property in Trino at all) — harmless, unrelated to anything this connector
-            // does, same category as duckdb_tables()/etc.
-            "SET threads", "SET vgi_streaming_window",
+            // does, same category as duckdb_tables()/etc. The vgi_result_cache_* family (dir/
+            // max_bytes/max_entry_bytes/disk_max_bytes — confirmed real corpus spellings via
+            // cache/spill_correctness.test etc.) is DuckDB/VGI's own native result-cache tuning,
+            // same non-portable category.
+            "SET threads", "SET vgi_streaming_window", "SET vgi_result_cache",
             // Trino has no CREATE TEMP/TEMPORARY TABLE at all (matches the existing "no write
             // support" scope gap, not a new one) — "TEMP", not "TEMPORARY", is the real corpus
             // spelling.
             "CREATE TEMP ",
+            // Trino's grammar has no COPY statement at all (confirmed directly against the real
+            // ANTLR grammar, SqlBase.g4 — zero references to the keyword) — a hard parser-level
+            // ceiling, not a connector gap; this connector's own copy_from/copy_to BindRequest
+            // wire fields exist for a DIFFERENT reason (a function-backed table's own scan bind
+            // can carry COPY context when DuckDB itself drives one), not because Trino SQL has a
+            // COPY statement for this connector to implement.
+            "COPY ",
+            // Trino has no CREATE SECRET/DROP SECRET DDL — VGI secrets reach this connector via
+            // ConnectorIdentity.getExtraCredentials() (see the README's "Settings and secrets"
+            // sections), never a DuckDB-style secret-management statement.
+            "CREATE SECRET ", "DROP SECRET ",
+            // A DuckDB/VGI-extension-native debug procedure (disables internal request logging) —
+            // no Trino Procedure SPI implementation exists for it, nor should one: it's a pure
+            // test/debug utility with no data-visible effect, same category as duckdb_tables()/etc.
+            "CALL disable_logging(",
             // A worker whose behavior is defined by a literal source-code-string argument at
             // runtime — gated behind require-env VGI_WORKER_SUPPORTS_DYNAMIC_CODE and explicitly
             // excluded from this connector's static-registration model (a function's shape must be
@@ -145,7 +167,23 @@ final class VgiSqlLogicTestCensusTest {
         runner.createCatalog(TRINO_CATALOG, VgiConnectorFactory.NAME, Map.of(
                 "vgi.location", worker.location(),
                 "vgi.catalog-name", VGI_CATALOG_NAME,
-                "vgi.connections", "4"));
+                // 4 was too small for a single long-lived catalog replaying the WHOLE corpus,
+                // including several deliberate combine/finalize-crash TableBufferingFunction
+                // fixtures (buffered_combine_crash.test/buffered_finalize_crash.test) — each crash
+                // is expected to evict+replace one pool slot (VgiWorkerClient.release's own
+                // self-heal), but a replacement mint can itself transiently fail under this whole
+                // Gradle test JVM's heavy concurrent subprocess-spawn load, "honestly losing" that
+                // slot for the rest of the census's lifetime (see VgiWorkerClient.release's own
+                // javadoc for why that trade-off is deliberate, not a bug). With only 4 slots, a
+                // handful of such honest losses over a 328-file run is enough to reach TRUE zero
+                // available connections — confirmed via a live jstack showing VgiWorkerClient.borrow()
+                // permanently blocked in VgiTableBufferingFunction.analyze() for a later, unrelated
+                // query, degrading the rest of the run to one 30s connection-acquire timeout per
+                // remaining table-in-out-family statement (invisible in the worker's own RPC log,
+                // since it never reaches a real RPC call). 16 gives enough headroom to absorb the
+                // small number of crash fixtures this corpus actually contains without ever
+                // reaching real exhaustion in one run.
+                "vgi.connections", "16"));
     }
 
     @AfterAll
@@ -171,11 +209,15 @@ final class VgiSqlLogicTestCensusTest {
         List<String> worstFiles = new ArrayList<>();
         List<String> queryMismatchSamples = new ArrayList<>();
         List<String> parseErrorSamples = new ArrayList<>();
+        List<String> otherRuntimeErrorSamples = new ArrayList<>();
 
+        int filesUsingADetectedAlias = 0;
         for (Path file : files) {
             SqlLogicTestRunner.Result result;
             try {
-                result = SqlLogicTestRunner.run(runner, session, file, "example.", TRINO_CATALOG, NON_PORTABLE_MARKERS);
+                String vgiCatalogRef = detectExampleCatalogAlias(file) + ".";
+                if (!vgiCatalogRef.equals("example.")) filesUsingADetectedAlias++;
+                result = SqlLogicTestRunner.run(runner, session, file, vgiCatalogRef, TRINO_CATALOG, NON_PORTABLE_MARKERS);
             } catch (RuntimeException | IOException e) {
                 // The file itself didn't even parse/replay — count every one of its failures as one bucket entry.
                 failureBuckets.merge("FILE-LEVEL ERROR: " + e.getClass().getSimpleName(), 1, Integer::sum);
@@ -197,6 +239,9 @@ final class VgiSqlLogicTestCensusTest {
                     if (classify(failure).startsWith("PARSE_ERROR") && parseErrorSamples.size() < 60) {
                         parseErrorSamples.add(INTEGRATION_ROOT.relativize(file) + ":\n" + failure);
                     }
+                    if (classify(failure).equals("OTHER_RUNTIME_ERROR") && otherRuntimeErrorSamples.size() < 80) {
+                        otherRuntimeErrorSamples.add(INTEGRATION_ROOT.relativize(file) + ":\n" + failure);
+                    }
                 }
             }
         }
@@ -208,6 +253,7 @@ final class VgiSqlLogicTestCensusTest {
         report.append("records skipped (known non-portable): ").append(totalSkipped).append('\n');
         report.append("records FAILED: ").append(totalFailed).append('\n');
         report.append("files with zero failures: ").append(filesFullyClean).append(" / ").append(files.size()).append('\n');
+        report.append("files using a detected non-'example' catalog alias: ").append(filesUsingADetectedAlias).append('\n');
         report.append("--- failure buckets ---\n");
         failureBuckets.forEach((bucket, count) -> report.append(String.format("%6d  %s%n", count, bucket)));
         report.append("--- top 30 distinct failure reasons (across all buckets) ---\n");
@@ -219,9 +265,52 @@ final class VgiSqlLogicTestCensusTest {
         queryMismatchSamples.forEach(s -> report.append(s).append("\n---\n"));
         report.append("--- PARSE_ERROR samples (").append(parseErrorSamples.size()).append(") ---\n");
         parseErrorSamples.forEach(s -> report.append(s).append("\n---\n"));
+        report.append("--- OTHER_RUNTIME_ERROR samples (").append(otherRuntimeErrorSamples.size()).append(") ---\n");
+        otherRuntimeErrorSamples.forEach(s -> report.append(s).append("\n---\n"));
         report.append("--- files with failures (").append(worstFiles.size()).append(") ---\n");
         worstFiles.forEach(f -> report.append(f).append('\n'));
         System.out.println(report);
+    }
+
+    /** Matches {@code ATTACH '<catalog-name>[?query-string]' AS <alias>} — the {@code
+     *  query-string} suffix (e.g. {@code ?location=...&pool=false}) is real corpus syntax (see
+     *  {@code connection_string.test}) that must not leak into the captured catalog name. */
+    private static final Pattern ATTACH_PATTERN =
+            Pattern.compile("ATTACH\\s+'([^'?]*)[^']*'\\s+AS\\s+(\\w+)");
+
+    /**
+     * If {@code file} attaches VGI's real {@code 'example'} catalog under exactly ONE alias, and
+     * attaches no OTHER catalog at all, returns that alias (so the file's own queries — which use
+     * that alias throughout, e.g. {@code ex.some_function(...)} — get correctly rewritten to the
+     * Trino catalog name). Falls back to {@code "example"} otherwise (today's long-standing
+     * default), which is always safe: a file using the literal {@code example} alias already
+     * matches it, and a file attaching more than one catalog is an already-documented,
+     * out-of-scope multi-catalog-alias case regardless (see {@code accumulate(}/{@code
+     * echo_attach_options(}'s own {@link #NON_PORTABLE_MARKERS} entries) — this detection doesn't
+     * change anything about how those are handled, it only widens what a SINGLE-alias file needs.
+     *
+     * <p>Confirmed against the real corpus this genuinely matters: 74 files (as of this writing)
+     * attach {@code 'example'} under a non-{@code "example"} alias — mostly {@code ex} (62 files),
+     * some {@code acme}/{@code badenum}/{@code svc} — with no other catalog in the same file, and
+     * every one of them was previously unreachable (every query in the file failed with
+     * {@code Catalog '<alias>' not found}, since the hardcoded {@code "example."} rewrite target
+     * never matched their SQL at all).
+     */
+    private static String detectExampleCatalogAlias(Path file) throws IOException {
+        String text = Files.readString(file);
+        Matcher m = ATTACH_PATTERN.matcher(text);
+        Set<String> aliasesForExample = new HashSet<>();
+        Set<String> otherCatalogNames = new HashSet<>();
+        while (m.find()) {
+            String catalogName = m.group(1);
+            String alias = m.group(2);
+            if (catalogName.equals("example")) aliasesForExample.add(alias);
+            else otherCatalogNames.add(catalogName);
+        }
+        if (aliasesForExample.size() == 1 && otherCatalogNames.isEmpty()) {
+            return aliasesForExample.iterator().next();
+        }
+        return "example";
     }
 
     /**
