@@ -42,17 +42,29 @@ import org.apache.arrow.vector.types.pojo.Field;
  *        functions (every {@code ScalarArgumentSpecification} is already
  *        bind-time-only there); read by {@code VgiScalarFunctions} to split an
  *        invocation's arguments into the bind-cache key vs. the per-row batch.
+ * @param tableArg whether this is a {@code vgi_type=table} argument (VGI's
+ *        {@code TableInput} — the classic, non-blended table-in-out kind's
+ *        streaming-table argument). {@link #type} is {@code null} whenever
+ *        this is {@code true} — a table argument has no single Trino scalar
+ *        type. A plain {@link VgiTableFunction}/blended {@code
+ *        VgiTableInOutFunction} can't express this and must skip registering
+ *        the whole function when any decoded argument comes back with this
+ *        set; only {@code VgiTableInOutTableFunctions} uses it.
  */
 public record VgiArgSpec(String name, Type type, boolean hasDefault, Object defaultValue, boolean positional,
-        boolean constArg) {
+        boolean constArg, boolean tableArg) {
 
     /**
      * Decode one argument field, or return {@code null} if this argument's
-     * shape isn't supported yet (varargs, {@code any}-typed, or a TABLE input
-     * — none of which a plain {@code ScalarArgumentSpecification} can express).
-     * The caller should skip registering the whole function when any argument
-     * comes back {@code null}, rather than silently drop one argument from its
-     * signature.
+     * shape isn't supported at all (varargs or {@code any}-typed — neither
+     * has a Trino representation anywhere in this connector yet). A {@code
+     * vgi_type=table} argument DOES decode successfully now (with {@link
+     * #tableArg} set and {@link #type} {@code null}) — unlike varargs/{@code
+     * any}, it has a real Trino representation ({@code
+     * TableArgumentSpecification}), just not one every caller of this method
+     * can use; callers that can't (a plain table function, blended) must
+     * check {@link #tableArg} themselves and skip registering the whole
+     * function, rather than silently drop one argument from its signature.
      *
      * @param field the argument's Arrow field, from the decoded
      *        {@code FunctionInfo.arguments} schema
@@ -60,10 +72,19 @@ public record VgiArgSpec(String name, Type type, boolean hasDefault, Object defa
      */
     public static VgiArgSpec decode(Field field) {
         var metadata = field.getMetadata();
+        boolean tableArg = false;
         if (metadata != null) {
             if ("true".equals(metadata.get("vgi_varargs"))) return null;
             String vgiType = metadata.get("vgi_type");
-            if ("any".equals(vgiType) || "table".equals(vgiType)) return null;
+            if ("any".equals(vgiType)) return null;
+            tableArg = "table".equals(vgiType);
+        }
+        boolean positional = metadata == null || !"named".equals(metadata.get("vgi_arg"));
+        boolean constArg = metadata != null && "true".equals(metadata.get("vgi_const"));
+        if (tableArg) {
+            // No Trino Type, no default — TableArgumentSpecification is always required=true,
+            // defaultValue=null (verified against the real SPI: its constructor hard-codes this).
+            return new VgiArgSpec(field.getName(), null, false, null, positional, constArg, true);
         }
         Type type;
         try {
@@ -71,13 +92,11 @@ public record VgiArgSpec(String name, Type type, boolean hasDefault, Object defa
         } catch (UnsupportedOperationException e) {
             return null;
         }
-        boolean positional = metadata == null || !"named".equals(metadata.get("vgi_arg"));
-        boolean constArg = metadata != null && "true".equals(metadata.get("vgi_const"));
         String defaultJson = metadata == null ? null : metadata.get("vgi_default");
         if (defaultJson == null) {
-            return new VgiArgSpec(field.getName(), type, false, null, positional, constArg);
+            return new VgiArgSpec(field.getName(), type, false, null, positional, constArg, false);
         }
-        return new VgiArgSpec(field.getName(), type, true, coerceDefault(defaultJson, type), positional, constArg);
+        return new VgiArgSpec(field.getName(), type, true, coerceDefault(defaultJson, type), positional, constArg, false);
     }
 
     /**

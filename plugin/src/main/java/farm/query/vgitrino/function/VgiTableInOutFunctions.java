@@ -111,6 +111,16 @@ public final class VgiTableInOutFunctions {
                 String context = info.schema_name() + "." + info.name();
                 List<VgiArgSpec> argSpecs = decodeArgs(info.arguments());
                 if (argSpecs == null) continue; // unsupported argument shape — reason already logged
+                if (argSpecs.stream().anyMatch(VgiArgSpec::tableArg)) {
+                    // Should never actually happen — VGI's own resolve_metadata already rejects a
+                    // blended (input_from_args=true) function that also declares a TableInput arg
+                    // (metadata.py: "...must not declare a TableInput arg — its positional args ARE
+                    // the input columns.") — defensive, not an observed shape.
+                    LOG.warn("VGI table-in-out function %s: skipping registration — advertises "
+                            + "input_from_args AND a TableInput argument, a combination the wire itself "
+                            + "should already reject", context);
+                    continue;
+                }
                 if (argSpecs.stream().noneMatch(VgiArgSpec::positional)) {
                     LOG.warn("VGI table-in-out function %s: skipping registration — no positional "
                             + "argument (a blended function needs at least one row-input column)", context);

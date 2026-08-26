@@ -43,7 +43,11 @@ public final class VgiTableFunctions {
      * ("table-in-out") function — a fundamentally different wire shape ({@code
      * VgiTableInOutFunctions}'s literal-call exchange, not this class's producer-mode
      * {@code table_function_plan}/split scan) — and is skipped here, not registered wrong;
-     * {@link VgiTableInOutFunctions#discover} handles it instead.
+     * {@link VgiTableInOutFunctions#discover} handles it instead. A function with a
+     * {@code vgi_type=table} argument (VGI's classic, non-blended table-in-out kind —
+     * see {@link VgiArgSpec#tableArg}) is skipped the same way; {@code
+     * VgiTableInOutTableFunctions#discover} handles it instead, since a plain {@link
+     * VgiTableFunction} only knows how to build {@code ScalarArgumentSpecification}s.
      *
      * @param client the pooled connection to attach and query
      * @return the callable table functions this connector can support
@@ -73,6 +77,7 @@ public final class VgiTableFunctions {
                 FunctionInfo info = overloads.get(0);
                 List<VgiArgSpec> argSpecs = decodeArgs(info.arguments());
                 if (argSpecs == null) continue; // unsupported argument shape
+                if (argSpecs.stream().anyMatch(VgiArgSpec::tableArg)) continue; // classic table-in-out
                 out.add(new VgiTableFunction(client, info.schema_name(), info.name(), argSpecs));
             }
             return out;

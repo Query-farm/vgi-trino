@@ -7,6 +7,7 @@ import farm.query.vgitrino.function.VgiAggregateFunctions;
 import farm.query.vgitrino.function.VgiScalarFunctions;
 import farm.query.vgitrino.function.VgiTableFunctions;
 import farm.query.vgitrino.function.VgiTableInOutFunctions;
+import farm.query.vgitrino.function.VgiTableInOutTableFunctions;
 import io.trino.spi.connector.Connector;
 import io.trino.spi.connector.ConnectorContext;
 import io.trino.spi.connector.ConnectorFactory;
@@ -38,11 +39,13 @@ public final class VgiConnectorFactory implements ConnectorFactory {
         VgiConfig vgiConfig = VgiConfig.fromProperties(config);
         VgiWorkerClient client = new VgiWorkerClient(vgiConfig);
         Set<ConnectorTableFunction> tableFunctions = new HashSet<>(VgiTableFunctions.discover(client));
-        // Regular (producer-mode) and table-in-out (blended, literal-call) functions register
-        // through the exact same Connector.getTableFunctions() Set — Trino has no separate
-        // surface for a second "kind" of table function; the two discover() calls already
-        // partition disjointly on FunctionInfo.input_from_args (see each class's own javadoc).
+        // Regular (producer-mode), blended (literal-call), and classic (TableInput-argument)
+        // table-in-out functions all register through the exact same Connector.getTableFunctions()
+        // Set — Trino has no separate surface for a second/third "kind" of table function; the three
+        // discover() calls already partition disjointly on FunctionInfo.input_from_args and whether a
+        // TableInput argument is present (see each class's own javadoc).
         tableFunctions.addAll(VgiTableInOutFunctions.discover(client));
+        tableFunctions.addAll(VgiTableInOutTableFunctions.discover(client));
         VgiScalarFunctions.Registry scalarFunctions = VgiScalarFunctions.discover(client);
         VgiAggregateFunctions.Registry aggregateFunctions = VgiAggregateFunctions.discover(client);
         return new VgiConnector(client, vgiConfig, tableFunctions, scalarFunctions, aggregateFunctions);

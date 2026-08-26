@@ -533,6 +533,57 @@ registration per name) is skipped entirely rather than guessing, and a blended f
 with zero positional arguments is rejected defensively (VGI's own `resolve_metadata`
 already prevents registering one, so this should never be observed in practice).
 
+### Table-in-out functions — CLASSIC (real `TABLE` argument)
+
+VGI's OTHER table-in-out kind — `TableInOutGenerator`/`TableInOutFunction` — takes a real
+`TableInput` argument instead of blended's positional-args-are-the-row shape: `SELECT * FROM
+TABLE(cat.main.echo(TABLE(some_query)))`, `TABLE(cat.main.repeat_inputs(3, TABLE(some_query)))`
+(the `TableInput` argument isn't always argument 0). Unlike blended's column/`LATERAL` shapes,
+this one IS representable — verified directly against the real Trino engine
+(`io.trino.operator.LocalExecutionPlanner.visitTableFunctionProcessor`) that a function
+declaring any `TableArgumentSpecification` is *always* routed through
+`TableFunctionDataProcessor` (page-driven), never `TableFunctionSplitProcessor` (split-driven)
+— so `VgiSplitManager` is never involved for this kind of call at all, and VGI's own
+per-substream model (one independent worker connection per execution) maps directly onto
+"one `getDataProcessor` call per Trino partition, one borrowed connection each."
+
+**Wire shape.** Same `bind()`/`init(phase=INPUT)`/exchange primitives as everywhere else, but
+genuinely incremental this time: `VgiTableInOutTableFunction#analyze` binds once (its
+`input_schema` built from the `TableArgument`'s real `RowType`, declared via
+`TableFunctionAnalysis.requiredColumns` — always every column, since VGI's classic mode has no
+partial-projection concept of its own), then `VgiTableInOutDataProcessor` — one instance per
+partition, mirroring `VgiTableFunctionSplitProcessor`'s async connection-acquisition pattern —
+drives a genuinely long-lived streaming session: `init(phase=INPUT)` once, then one
+`exchange()` turn (write the page as a batch, read the matching output) per `process(List<Optional<Page>>)`
+call, until Trino signals true end-of-input (`input == null`), at which point `session.close()`
+signals EOS and releases the connection. `TableArgument` (verified against the real SPI) carries
+only a `RowType` plus `PARTITION BY`/`ORDER BY` column names — no reference to the source
+connector at all — so this connector cannot push anything besides column pruning into wherever
+those rows actually come from; the engine delivers them later as plain, already-narrowed `Page`s.
+The registered `TableArgumentSpecification` uses `.keepWhenEmpty()` (matching Trino's own
+reference `IdentityFunction`/`RepeatFunction` test implementations) rather than
+`.rowSemantics()` — no `PARTITION BY`/`ORDER BY` requirement on the caller, whole relation as one
+partition when neither is specified, which is the closest honest match to VGI's own
+no-partition-concept-at-all model.
+
+**A genuine SPI gap, not a bug**: unlike `TableFunctionSplitProcessor`, the real
+`TableFunctionDataProcessor` interface declares no `close()`/lifecycle hook at all — verified by
+reading the SPI source directly. If Trino ever abandons a partition before this processor
+returns `FINISHED` on its own (e.g. a `LIMIT` satisfied by an earlier partition), there is no
+notification and the borrowed connection leaks until GC — a real ceiling of this Trino version's
+SPI, not something `VgiTableInOutDataProcessor` can fix; every other connection this connector
+borrows has a real release path, this is the one documented exception.
+
+**v1 scope**: only a function with NO finalize phase registers at all
+(`VgiTableInOutTableFunctions#discover` skips `has_finalize=true` explicitly) — VGI's
+cross-batch-accumulation shape (`SubstreamPartialSumFunction`/`MultiBatchFinishFunction`) needs
+a second `init(phase=FINALIZE)` turn on the same connection/`execution_id` after input
+end-of-stream, which isn't implemented yet; `filter_by_setting`/`secret_in_out` (need
+settings/secrets wiring for this call shape) are similarly out of scope for now. Otherwise
+mirrors the other table-function classes' constraints (varargs/`any`-typed non-table arguments
+skipped, overloaded names skipped, more than one `TableInput` argument rejected defensively
+— VGI's own validation already prevents registering one).
+
 ### Predicate pushdown
 
 `VgiMetadata.applyFilter` intersects Trino's `Constraint.getSummary()`

@@ -17,6 +17,7 @@ import io.trino.spi.function.InvocationConvention;
 import io.trino.spi.function.ScalarFunctionAdapter;
 import io.trino.spi.function.ScalarFunctionImplementation;
 import io.trino.spi.function.table.ConnectorTableFunctionHandle;
+import io.trino.spi.function.table.TableFunctionDataProcessor;
 import io.trino.spi.function.table.TableFunctionProcessorProvider;
 import io.trino.spi.function.table.TableFunctionSplitProcessor;
 import io.trino.spi.type.Type;
@@ -71,6 +72,17 @@ public final class VgiFunctionProvider implements FunctionProvider {
                 }
                 VgiTableFunctionHandle h = (VgiTableFunctionHandle) functionHandle;
                 return new VgiTableFunctionSplitProcessor(client, (VgiSplit) split, h.outputSchema());
+            }
+
+            @Override
+            public TableFunctionDataProcessor getDataProcessor(
+                    ConnectorSession session, ConnectorTableFunctionHandle functionHandle) {
+                // Reached only for a classic (TableInput-argument) table-in-out call — verified
+                // against the real Trino engine that a function with any TableArgumentSpecification is
+                // ALWAYS routed here, never through getSplitProcessor (see VgiTableInOutTableFunction's
+                // own javadoc) — so this handle type is the only one ever seen here.
+                VgiTableInOutTableFunctionHandle h = (VgiTableInOutTableFunctionHandle) functionHandle;
+                return new VgiTableInOutDataProcessor(client, h);
             }
         };
     }

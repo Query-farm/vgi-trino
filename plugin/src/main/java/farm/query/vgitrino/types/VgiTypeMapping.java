@@ -2,8 +2,10 @@
 
 package farm.query.vgitrino.types;
 
+import farm.query.vgirpc.wire.Allocators;
 import io.airlift.slice.Slice;
 import io.airlift.slice.Slices;
+import io.trino.spi.Page;
 import io.trino.spi.block.ArrayValueBuilder;
 import io.trino.spi.block.Block;
 import io.trino.spi.block.BlockBuilder;
@@ -44,6 +46,7 @@ import org.apache.arrow.vector.UInt2Vector;
 import org.apache.arrow.vector.UInt4Vector;
 import org.apache.arrow.vector.VarBinaryVector;
 import org.apache.arrow.vector.VarCharVector;
+import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.arrow.vector.complex.FixedSizeListVector;
 import org.apache.arrow.vector.complex.ListVector;
 import org.apache.arrow.vector.complex.StructVector;
@@ -52,6 +55,7 @@ import org.apache.arrow.vector.types.TimeUnit;
 import org.apache.arrow.vector.types.pojo.ArrowType;
 import org.apache.arrow.vector.types.pojo.Field;
 import org.apache.arrow.vector.types.pojo.FieldType;
+import org.apache.arrow.vector.types.pojo.Schema;
 
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
@@ -617,5 +621,36 @@ public final class VgiTypeMapping {
             }
             default -> boxedValue; // Boolean/Long/Double already match ScalarValue's expectations
         };
+    }
+
+    /**
+     * Convert a whole Trino {@link Page} (multiple rows, multiple columns) into a fresh, independently
+     * owned Arrow batch — the batched counterpart of {@link #writeValue}, used only by {@code
+     * VgiTableInOutDataProcessor} to convert an incoming table-argument page into the Arrow batch VGI's
+     * classic (non-blended) table-in-out exchange writes per call. Built cell-by-cell via {@link
+     * #readBoxedValue}/{@link #writeValue} (no bulk vector copy) — the same boxed-value bridge already
+     * used for a single row elsewhere in this class, just looped over every row of every column.
+     *
+     * @param arrowSchema the destination batch's schema (matching {@code columnTypes} column-for-column)
+     * @param columnTypes each column's Trino type, in {@code page}'s column order
+     * @param page the page to convert
+     * @return a new {@link VectorSchemaRoot}, allocated from {@link Allocators#root()} — the caller owns
+     *         and must close it
+     */
+    public static VectorSchemaRoot pageToBatch(Schema arrowSchema, List<Type> columnTypes, Page page) {
+        VectorSchemaRoot root = VectorSchemaRoot.create(arrowSchema, Allocators.root());
+        root.allocateNew();
+        int rowCount = page.getPositionCount();
+        for (int col = 0; col < columnTypes.size(); col++) {
+            Block block = page.getBlock(col);
+            FieldVector vector = root.getVector(col);
+            Type type = columnTypes.get(col);
+            for (int row = 0; row < rowCount; row++) {
+                writeValue(type, vector, row, readBoxedValue(type, block, row));
+            }
+            vector.setValueCount(rowCount);
+        }
+        root.setRowCount(rowCount);
+        return root;
     }
 }
