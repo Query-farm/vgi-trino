@@ -12,6 +12,9 @@ import io.trino.testing.MaterializedRow;
 import java.io.IOException;
 import java.math.BigDecimal;
 import java.nio.file.Path;
+import java.time.LocalDateTime;
+import java.time.ZoneOffset;
+import java.time.ZonedDateTime;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
@@ -260,11 +263,36 @@ final class SqlLogicTestRunner {
      *       mismatches needed — {@code geo_centroid_struct}/{@code geo_centroid_list}/{@code
      *       rowid_struct} all return a bare, non-nested struct) — a struct nested inside an
      *       array/another struct falls back to the plain {@code List} rendering, a known, narrower
-     *       gap than fixing every nesting depth would need.</li>
+     *       gap than fixing every nesting depth would need. A REAL query (as opposed to this
+     *       class's own hand-built unit-test values) materializes a struct as {@code
+     *       io.trino.testing.MaterializedRow}, not a plain {@link List} at all — its OWN {@code
+     *       toString()} also happens to render as a bracket-joined list, indistinguishable from a
+     *       genuine array — so both shapes are accepted here.</li>
      *   <li>A {@link Double} — Java's default {@code Double.toString()} switches to scientific
      *       notation above a certain magnitude ({@code 1.1997E7}); DuckDB always prints the full
      *       plain decimal expansion ({@code 11994000.0}) — confirmed against a real sample
      *       ({@code table/projected_data.test}).</li>
+     *   <li>A {@link LocalDateTime} (TIMESTAMP) — {@code Object.toString()} gives Java's ISO-8601
+     *       form: a {@code T} separator, and trailing zero seconds/fraction components dropped
+     *       entirely ({@code 2026-05-06T12:00}, {@code 2026-05-06T12:34:56.123}). DuckDB always
+     *       uses a space separator and always shows a full {@code HH:mm:ss} even when the seconds
+     *       are exactly {@code :00} — confirmed against a real sample ({@code
+     *       filter_pushdown/temporal.test}: expected {@code 2026-05-06 12:00:00}, this harness
+     *       previously rendered {@code 2026-05-06T12:00}). The fractional-second suffix is shown
+     *       only when non-zero, at up to microsecond precision (DuckDB's own TIMESTAMP
+     *       resolution) — but, unlike Java's 3/6/9-digit-grouped convention, with trailing zeros
+     *       stripped down to exactly the significant digits, confirmed directly against a real
+     *       {@code duckdb} CLI session ({@code CAST('...00.100' AS TIMESTAMP)} displays as {@code
+     *       .1}, not {@code .100000} or Java's own {@code .100}). See {@link #formatTimestamp}.</li>
+     *   <li>A {@link ZonedDateTime} (TIMESTAMP WITH TIME ZONE) — same space/{@code HH:mm:ss}/
+     *       fraction rules as above, plus DuckDB's plain offset suffix ({@code +HH} for a
+     *       whole-hour offset, {@code +HH:mm} otherwise) in place of Java's {@code
+     *       ZonedDateTime.toString()} zone-id-bracket suffix ({@code Z[UTC]}, {@code +01:00} —
+     *       confirmed against the same real sample: expected {@code 2026-05-06 12:00:00+00}, this
+     *       harness previously rendered {@code 2026-05-06T12:00Z[UTC]}). The bare-vs-colon offset
+     *       split is confirmed directly against a real {@code duckdb} CLI session with a
+     *       fractional-hour {@code TimeZone} set ({@code Asia/Kolkata}'s {@code +05:30} prints
+     *       with minutes; {@code UTC}'s {@code +00} prints bare). See {@link #formatOffset}.</li>
      * </ul>
      */
     static String formatCell(Type type, Object value) {
@@ -280,17 +308,39 @@ final class SqlLogicTestRunner {
         if (value instanceof Double d) {
             return formatDouble(d);
         }
-        if (type instanceof RowType rowType && value instanceof List<?> fieldValues) {
-            List<RowType.Field> fields = rowType.getFields();
-            StringBuilder struct = new StringBuilder("{");
-            for (int i = 0; i < fields.size() && i < fieldValues.size(); i++) {
-                if (i > 0) struct.append(", ");
-                String fieldName = fields.get(i).getName().orElse("field" + i);
-                Object fieldValue = fieldValues.get(i);
-                String fieldText = fieldValue instanceof Double d ? formatDouble(d) : String.valueOf(fieldValue);
-                struct.append('\'').append(fieldName).append("': ").append(fieldText);
+        if (value instanceof LocalDateTime dt) {
+            return formatTimestamp(dt);
+        }
+        if (value instanceof ZonedDateTime zdt) {
+            return formatTimestamp(zdt.toLocalDateTime()) + formatOffset(zdt.getOffset());
+        }
+        if (type instanceof RowType rowType) {
+            // A struct's boxed representation is a plain java.util.List when it came from a
+            // hand-built value (e.g. this class's own unit tests), but a REAL query executed via
+            // DistributedQueryRunner materializes it as io.trino.testing.MaterializedRow instead —
+            // a distinct wrapper class (getFields()/getField(int), no List superinterface at all).
+            // The original List-only check silently fell through to the plain value.toString()
+            // branch below for every live struct-returning query — confirmed the hard way against
+            // the real fixture (scalar/geo_centroid.test's geo_centroid_struct/geo_centroid_list):
+            // MaterializedRow.toString() ALSO happens to render as a bracket-joined list
+            // ("[3.0, 4.0]"), which is exactly the reported "returns an array instead of a struct"
+            // symptom — a formatCell gap, not a connector value-mapping bug (VgiTypeMapping/
+            // VgiScalarFunctions already produce a genuine RowType/SqlRow value; only this
+            // rendering step never recognized MaterializedRow as one).
+            List<?> fieldValues = value instanceof MaterializedRow row ? row.getFields()
+                    : value instanceof List<?> list ? list : null;
+            if (fieldValues != null) {
+                List<RowType.Field> fields = rowType.getFields();
+                StringBuilder struct = new StringBuilder("{");
+                for (int i = 0; i < fields.size() && i < fieldValues.size(); i++) {
+                    if (i > 0) struct.append(", ");
+                    String fieldName = fields.get(i).getName().orElse("field" + i);
+                    Object fieldValue = fieldValues.get(i);
+                    String fieldText = fieldValue instanceof Double d ? formatDouble(d) : String.valueOf(fieldValue);
+                    struct.append('\'').append(fieldName).append("': ").append(fieldText);
+                }
+                return struct.append('}').toString();
             }
-            return struct.append('}').toString();
         }
         return value.toString();
     }
@@ -304,6 +354,55 @@ final class SqlLogicTestRunner {
         if (Double.isNaN(d) || Double.isInfinite(d)) return Double.toString(d);
         String plain = new BigDecimal(Double.toString(d)).stripTrailingZeros().toPlainString();
         return plain.contains(".") ? plain : plain + ".0";
+    }
+
+    /** DuckDB's TIMESTAMP display convention — see {@link #formatCell}'s own javadoc for the real
+     *  mismatch this fixes: a space separator (never Java's {@code T}), always a full {@code
+     *  HH:mm:ss}, and a fractional-second suffix only when non-zero. */
+    private static String formatTimestamp(LocalDateTime dt) {
+        StringBuilder text = new StringBuilder(26);
+        text.append(String.format(Locale.ROOT, "%04d-%02d-%02d %02d:%02d:%02d",
+                dt.getYear(), dt.getMonthValue(), dt.getDayOfMonth(),
+                dt.getHour(), dt.getMinute(), dt.getSecond()));
+        appendFractionalSeconds(text, dt.getNano());
+        return text.toString();
+    }
+
+    /** Appends {@code .<digits>} to {@code text} for a non-zero fractional second, at up to
+     *  microsecond precision (DuckDB's own TIMESTAMP resolution) with trailing zeros stripped
+     *  entirely — e.g. nano-of-second {@code 100_000_000} (a tenth of a second) becomes {@code
+     *  .1}, not Java's own 3-digit-grouped {@code .100} — confirmed against a real {@code duckdb}
+     *  CLI session (see {@link #formatCell}'s javadoc). Appends nothing at all when the value has
+     *  no fractional second, or when it rounds away to nothing at microsecond precision. */
+    private static void appendFractionalSeconds(StringBuilder text, int nanoOfSecond) {
+        if (nanoOfSecond == 0) return;
+        int micros = nanoOfSecond / 1000;
+        String sixDigits = String.format(Locale.ROOT, "%06d", micros);
+        int end = sixDigits.length();
+        while (end > 0 && sixDigits.charAt(end - 1) == '0') end--;
+        if (end == 0) return;
+        text.append('.').append(sixDigits, 0, end);
+    }
+
+    /** DuckDB's plain {@code TIMESTAMP WITH TIME ZONE} offset suffix — {@code +HH} for a
+     *  whole-hour offset, {@code +HH:mm} (and, in the (unobserved in the real corpus but handled
+     *  for correctness) sub-minute case, {@code +HH:mm:ss}) otherwise — never Java's {@code
+     *  ZonedDateTime.toString()} zone-id-bracket suffix. See {@link #formatCell}'s javadoc for the
+     *  real {@code duckdb} CLI session that confirmed the bare-vs-colon split. */
+    private static String formatOffset(ZoneOffset offset) {
+        int totalSeconds = offset.getTotalSeconds();
+        char sign = totalSeconds < 0 ? '-' : '+';
+        int abs = Math.abs(totalSeconds);
+        int hours = abs / 3600;
+        int minutes = (abs % 3600) / 60;
+        int seconds = abs % 60;
+        StringBuilder text = new StringBuilder(9);
+        text.append(sign).append(String.format(Locale.ROOT, "%02d", hours));
+        if (minutes != 0 || seconds != 0) {
+            text.append(':').append(String.format(Locale.ROOT, "%02d", minutes));
+            if (seconds != 0) text.append(':').append(String.format(Locale.ROOT, "%02d", seconds));
+        }
+        return text.toString();
     }
 
     /** A copy of {@code rows}, sorted into a stable, arbitrary total order — for comparing an
@@ -707,6 +806,13 @@ final class SqlLogicTestRunner {
         return args;
     }
 
+    /**
+     * Wraps a bare {@code trinoCatalog.schema.function(args)} call immediately after {@code FROM}/
+     * {@code JOIN} in Trino's required {@code TABLE(...)}, and — since a table-in-out function's
+     * {@code TableInput} argument needs the SAME treatment one level down — also rewraps any
+     * argument that is itself, in its entirety, a bare {@code (SELECT ...)}/{@code (WITH ...)}
+     * subquery into {@code TABLE(...)} (see {@link #wrapTableArgumentIfSubquery}).
+     */
     private static String wrapBareTableFunctionCalls(String sql, String trinoCatalog) {
         StringBuilder out = new StringBuilder();
         int i = 0;
@@ -744,11 +850,44 @@ final class SqlLogicTestRunner {
             int closeParen = findMatchingParen(sql, p);
             if (closeParen < 0) continue;
 
-            String call = sql.substring(i, closeParen + 1);
+            // A table-in-out call's TableInput argument is DuckDB's bare `(SELECT ...)`/`(WITH
+            // ...)` subquery — always positional (VGI's own resolve_metadata requires this), never
+            // named — but Trino requires the wrapper's OWN TABLE(...) argument to say so too:
+            // `echo((SELECT 1 AS a))` must become `TABLE(echo(TABLE(SELECT 1 AS a)))`, not just
+            // `TABLE(echo((SELECT 1 AS a)))` (confirmed via the real corpus — the latter fails with
+            // "Invalid argument DATA. Expected table, got expression", the single most common
+            // failure in the whole census before this rewrite existed). A plain scalar argument
+            // (`repeat_inputs(3, ...)`) is untouched — wrapTableArgumentIfSubquery only rewrites an
+            // argument that IS, in its entirety, a parenthesized SELECT/WITH.
+            List<String> args = splitTopLevelArgs(sql.substring(p + 1, closeParen));
+            StringBuilder rebuiltArgs = new StringBuilder();
+            for (int k = 0; k < args.size(); k++) {
+                if (k > 0) rebuiltArgs.append(", ");
+                rebuiltArgs.append(wrapTableArgumentIfSubquery(args.get(k)));
+            }
+            String call = sql.substring(i, p + 1) + rebuiltArgs + ")";
             out.append("TABLE(").append(call).append(")");
             i = closeParen + 1;
         }
         return out.toString();
+    }
+
+    /**
+     * If {@code arg}, in its ENTIRETY, is a parenthesized {@code SELECT}/{@code WITH} — DuckDB's
+     * bare-subquery convention for a table-in-out function's {@code TableInput} argument — rewrite
+     * it as Trino's required {@code TABLE(...)} form. Any other argument shape (a plain scalar
+     * expression, or an already-{@code TABLE(...)}-wrapped one) is returned unchanged.
+     */
+    private static String wrapTableArgumentIfSubquery(String arg) {
+        String trimmed = arg.strip();
+        if (!trimmed.startsWith("(")) return arg;
+        int close = findMatchingParen(trimmed, 0);
+        if (close != trimmed.length() - 1) return arg; // the parens don't span the whole argument
+        String inner = trimmed.substring(1, close).strip();
+        if (matchKeyword(inner, 0, "SELECT") >= 0 || matchKeyword(inner, 0, "WITH") >= 0) {
+            return "TABLE(" + inner + ")";
+        }
+        return arg;
     }
 
     /** Matches {@code keyword} as a whole word at {@code i}; returns the index just past it, or -1. */

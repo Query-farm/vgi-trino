@@ -81,7 +81,7 @@ final class VgiSqlLogicTestCensusTest {
             // exists specifically to echo back what filter it received, so "(none)" is the only
             // possible correct answer today — confirmed by sampling real QUERY_MISMATCH failures,
             // not assumed. Fixing this needs an upstream Trino SPI change, which is out of scope.
-            "filter_echo(", "split_echo_filters(", "split_dynamic_filter(",
+            "filter_echo(", "filter_echo_partitioned(", "split_echo_filters(", "split_dynamic_filter(",
             "order_echo(", "value_prune(", "filtered_columns_echo(",
             // DuckDB's own catalog name (e.g. "example", "v1", "accumulate" from its own ATTACH
             // statements) is a plain STRING VALUE inside these queries, not an identifier prefix —

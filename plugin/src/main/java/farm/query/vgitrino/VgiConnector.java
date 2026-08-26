@@ -6,6 +6,7 @@ import farm.query.vgitrino.client.VgiWorkerClient;
 import farm.query.vgitrino.function.VgiAggregateFunctions;
 import farm.query.vgitrino.function.VgiFunctionProvider;
 import farm.query.vgitrino.function.VgiScalarFunctions;
+import farm.query.vgitrino.function.VgiTableScanFunctions;
 import farm.query.vgitrino.metadata.VgiMetadata;
 import farm.query.vgitrino.page.VgiPageSourceProvider;
 import farm.query.vgitrino.split.VgiSplitManager;
@@ -44,6 +45,7 @@ public final class VgiConnector implements Connector {
     private final VgiScalarFunctions.BindCache scalarBindCache;
     private final VgiAggregateFunctions.Registry aggregateFunctions;
     private final Set<String> tableInOutRequiredSettingNames;
+    private final VgiTableScanFunctions.Registry scanFunctions;
 
     /**
      * @param client the pooled connection to this catalog's VGI worker,
@@ -56,10 +58,13 @@ public final class VgiConnector implements Connector {
      * @param tableInOutRequiredSettingNames the union of every discovered classic table-in-out
      *        function's {@code required_settings} names (see {@link
      *        farm.query.vgitrino.function.VgiTableInOutTableFunction#requiredSettingNames})
+     * @param scanFunctions every discovered {@code TABLE_FUNCTION}'s {@code required_settings}/
+     *        {@code required_secrets}, keyed by name — what a DECLARATIVE table's backing scan
+     *        function needs (see {@link VgiTableScanFunctions#discover})
      */
     public VgiConnector(VgiWorkerClient client, VgiConfig config, Set<ConnectorTableFunction> tableFunctions,
             VgiScalarFunctions.Registry scalarFunctions, VgiAggregateFunctions.Registry aggregateFunctions,
-            Set<String> tableInOutRequiredSettingNames) {
+            Set<String> tableInOutRequiredSettingNames, VgiTableScanFunctions.Registry scanFunctions) {
         this.client = client;
         this.config = config;
         this.tableFunctions = tableFunctions;
@@ -67,6 +72,7 @@ public final class VgiConnector implements Connector {
         this.scalarBindCache = new VgiScalarFunctions.BindCache();
         this.aggregateFunctions = aggregateFunctions;
         this.tableInOutRequiredSettingNames = tableInOutRequiredSettingNames;
+        this.scanFunctions = scanFunctions;
     }
 
     @Override
@@ -77,7 +83,7 @@ public final class VgiConnector implements Connector {
 
     @Override
     public ConnectorMetadata getMetadata(ConnectorSession session, ConnectorTransactionHandle transactionHandle) {
-        return new VgiMetadata(client, scalarFunctions, aggregateFunctions);
+        return new VgiMetadata(client, scalarFunctions, aggregateFunctions, scanFunctions);
     }
 
     @Override
@@ -97,15 +103,17 @@ public final class VgiConnector implements Connector {
 
     /**
      * One nullable, unhidden string session property per distinct {@code required_settings} name
-     * across every discovered scalar OR classic table-in-out function — {@code SET SESSION
-     * <catalog>.<name> = '<value>'} is how a query supplies a VGI setting a function needs (see
-     * {@code VgiScalarFunctions.BindCache}'s own note on why session-scoped values, not
-     * connector-startup ones, are the right Trino analog for VGI's per-call settings).
+     * across every discovered scalar, classic table-in-out, OR declarative-table-backing scan
+     * function — {@code SET SESSION <catalog>.<name> = '<value>'} is how a query supplies a VGI
+     * setting a function needs (see {@code VgiScalarFunctions.BindCache}'s own note on why
+     * session-scoped values, not connector-startup ones, are the right Trino analog for VGI's
+     * per-call settings).
      */
     @Override
     public List<PropertyMetadata<?>> getSessionProperties() {
         Set<String> names = new LinkedHashSet<>(scalarFunctions.requiredSettingNames());
         names.addAll(tableInOutRequiredSettingNames);
+        names.addAll(scanFunctions.requiredSettingNames());
         return names.stream()
                 .map(name -> PropertyMetadata.stringProperty(name, "VGI function setting '" + name + "'",
                         null, false))

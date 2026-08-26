@@ -13,6 +13,7 @@ import farm.query.vgirpc.marshal.RecordCodec;
 import farm.query.vgitrino.client.VgiWorkerClient;
 import farm.query.vgitrino.function.VgiAggregateFunctions;
 import farm.query.vgitrino.function.VgiScalarFunctions;
+import farm.query.vgitrino.function.VgiTableScanFunctions;
 import farm.query.vgitrino.types.ArrowSchemaCodec;
 import farm.query.vgitrino.types.VgiColumnNames;
 import farm.query.vgitrino.types.VgiTypeMapping;
@@ -63,17 +64,21 @@ public final class VgiMetadata implements ConnectorMetadata {
     private final VgiWorkerClient client;
     private final VgiScalarFunctions.Registry scalarFunctions;
     private final VgiAggregateFunctions.Registry aggregateFunctions;
+    private final VgiTableScanFunctions.Registry scanFunctions;
 
     /**
      * @param client the pooled connection to this catalog's VGI worker
      * @param scalarFunctions this catalog's discovered scalar functions (see {@link VgiScalarFunctions#discover})
      * @param aggregateFunctions this catalog's discovered aggregate functions (see {@link VgiAggregateFunctions#discover})
+     * @param scanFunctions every discovered {@code TABLE_FUNCTION}'s {@code required_settings}/{@code
+     *        required_secrets}, keyed by name — see {@link VgiTableScanFunctions#discover}
      */
     public VgiMetadata(VgiWorkerClient client, VgiScalarFunctions.Registry scalarFunctions,
-            VgiAggregateFunctions.Registry aggregateFunctions) {
+            VgiAggregateFunctions.Registry aggregateFunctions, VgiTableScanFunctions.Registry scanFunctions) {
         this.client = client;
         this.scalarFunctions = scalarFunctions;
         this.aggregateFunctions = aggregateFunctions;
+        this.scanFunctions = scanFunctions;
     }
 
     @Override
@@ -131,9 +136,15 @@ public final class VgiMetadata implements ConnectorMetadata {
                     a.handle(), tableName.getSchemaName(), tableName.getTableName(), atUnit, atValue, null, null);
             byte[] bindArguments = ScanFunctionArguments.toBindArguments(scan.arguments());
 
+            // catalog_table_scan_function_get's own response carries no required_settings/
+            // required_secrets (see VgiTableScanFunctions' javadoc) — recover them from the
+            // once-per-catalog-attach TABLE_FUNCTION discovery pass instead of an extra RPC here.
+            VgiTableScanFunctions.Entry scanRequirements = scanFunctions.entryFor(scan.function_name());
+
             return new VgiTableHandle(info.schema_name(), info.name(),
                     scan.function_name(), bindArguments, info.columns(), info.cardinality_estimate(),
-                    TupleDomain.all(), atUnit, atValue);
+                    TupleDomain.all(), atUnit, atValue,
+                    scanRequirements.requiredSettings(), scanRequirements.requiredSecrets());
         });
     }
 
@@ -266,7 +277,8 @@ public final class VgiMetadata implements ConnectorMetadata {
         }
         VgiTableHandle newHandle = new VgiTableHandle(handle.schemaName(), handle.tableName(),
                 handle.scanFunctionName(), handle.scanFunctionArguments(), handle.outputSchema(),
-                handle.cardinalityEstimate(), merged, handle.atUnit(), handle.atValue());
+                handle.cardinalityEstimate(), merged, handle.atUnit(), handle.atValue(),
+                handle.requiredSettings(), handle.requiredSecrets());
         // remainingFilter is the SAME summary we were just given, unchanged:
         // this connector never declares a filter exactly applied (see
         // VgiFilterTranslator's javadoc for why), so Trino must still check

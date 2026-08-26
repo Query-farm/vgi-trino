@@ -167,4 +167,95 @@ final class VgiAggregateFunctionsTest {
                         + "(CAST(4.0 AS DOUBLE), CAST(5.0 AS DOUBLE), CAST(6.0 AS DOUBLE))) AS t(a, b, c)");
         assertEquals(21.0d, result.getMaterializedRows().get(0).getField(0));
     }
+
+    // ------------------------------------------------------------------
+    // OVER (...) — windowed usage. See VgiAggregateFunctions' class javadoc,
+    // "Windowed usage" section, for the full root-cause writeup: Trino's
+    // automatic per-frame-recompute window fallback (no combineFunction, no
+    // windowAccumulator override) genuinely DOES work correctly for a VGI
+    // aggregate whose update()/finalize() implement real, general-purpose
+    // "compute the aggregate over an arbitrary row subset" semantics — but it
+    // is a real correctness gap, not merely a performance ceiling, for a VGI
+    // aggregate (like vgi_window_median) whose only correct implementation
+    // lives behind VGI's separate windowed-aggregate RPC family
+    // (aggregate_window_init/aggregate_window), which this connector cannot
+    // reach: that protocol is entirely absent from the farm.query:vgi Java
+    // SDK this connector depends on (confirmed directly against the
+    // vgi-0.27.0.jar class list — no AggregateWindow* types, no
+    // aggregate_window* method on VgiService), and separately, Trino's own
+    // engine (LocalExecutionPlanner) hardcodes every FunctionKind.AGGREGATE
+    // resolved function's OVER (...) usage to go through
+    // AggregationImplementation/AggregationWindowFunctionSupplier regardless
+    // — FunctionProvider.getWindowFunctionSupplier is never consulted for an
+    // aggregate-kind function, only for genuinely WINDOW-kind ones
+    // (rank/lag/etc.), so there is no engine-level hook to reach a different
+    // RPC family for these calls even if the SDK had them.
+    // ------------------------------------------------------------------
+
+    @Test
+    @Timeout(60)
+    void vgiSumOverASlidingWindowFrameComputesCorrectly() {
+        // ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING is a genuinely sliding (shrinking-then-growing)
+        // frame -- Trino's AggregateWindowFunction.buildNewFrame takes the "couldn't/didn't want to
+        // modify" branch on every row (no removeInputFunction registered) and creates a FRESH
+        // AggregateState -- a fresh aggregate_bind/aggregate_update/aggregate_finalize sequence --
+        // for every single output row. vgi_sum's update()/finalize() genuinely recompute the sum of
+        // whatever rows they're given, so this produces the correct centered 3-row moving sum.
+        MaterializedResult result = runner.execute(session,
+                "SELECT x, vgi_example.main.vgi_sum(CAST(x AS BIGINT)) "
+                        + "OVER (ORDER BY x ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) "
+                        + "FROM UNNEST(SEQUENCE(1, 5, 1)) AS t(x) ORDER BY x");
+        List<MaterializedRow> rows = result.getMaterializedRows();
+        // x:      1  2  3  4  5
+        // window: 1+2, 1+2+3, 2+3+4, 3+4+5, 4+5
+        long[] expected = {3L, 6L, 9L, 12L, 9L};
+        assertEquals(5, rows.size());
+        for (int i = 0; i < expected.length; i++) {
+            assertEquals(expected[i], rows.get(i).getField(1), "row " + i);
+        }
+    }
+
+    @Test
+    @Timeout(60)
+    void vgiSumOverAGrowingWindowFrameComputesCorrectly() {
+        // ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW is growing-only: frameStart never moves,
+        // so AggregateWindowFunction.processRow takes the "same or expanding frame" branch and keeps
+        // accumulating into the SAME AggregateState/accumulator instance for the whole partition
+        // (only ever calling accumulate(currentEnd+1, frameEnd), never rebuilding) -- a meaningfully
+        // different code path from the sliding-frame case above (fresh accumulator every row).
+        MaterializedResult result = runner.execute(session,
+                "SELECT x, vgi_example.main.vgi_sum(CAST(x AS BIGINT)) "
+                        + "OVER (ORDER BY x ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) "
+                        + "FROM UNNEST(SEQUENCE(1, 5, 1)) AS t(x) ORDER BY x");
+        List<MaterializedRow> rows = result.getMaterializedRows();
+        long[] expected = {1L, 3L, 6L, 10L, 15L};
+        assertEquals(5, rows.size());
+        for (int i = 0; i < expected.length; i++) {
+            assertEquals(expected[i], rows.get(i).getField(1), "row " + i);
+        }
+    }
+
+    @Test
+    @Timeout(60)
+    void vgiWindowMedianOverASlidingFrameReturnsNullNotRealMedians() {
+        // Ground truth for a genuine, documented ceiling -- NOT the fix target. This is the exact
+        // query from vgi's corpus (test/sql/integration/aggregate/window.test), which expects real
+        // medians ([1.0, 2.0], [2.0, 2.5], [3.0, 3.0], [4.0, 4.0], [5.0, 5.0], [5.5, ... ]) when run
+        // against the C++ extension's native windowed-aggregate dispatch. Run through vgi-trino, it
+        // returns NULL for every row: vgi_window_median's update()/finalize() (the only RPCs this
+        // connector can reach for OVER usage, per Trino's own per-frame recompute fallback) are a
+        // deliberate no-op stub in the fixture -- its real median logic lives ONLY behind the
+        // window() callback, reachable only via VGI's separate aggregate_window_init/aggregate_window
+        // RPCs, which this connector's Java SDK dependency doesn't expose at all. See the class
+        // javadoc's "Windowed usage" section and the block comment above this test group.
+        MaterializedResult result = runner.execute(session,
+                "SELECT x, vgi_example.main.vgi_window_median(CAST(x AS DOUBLE)) "
+                        + "OVER (ORDER BY x ROWS BETWEEN 2 PRECEDING AND 2 FOLLOWING) "
+                        + "FROM UNNEST(SEQUENCE(1, 7, 1)) AS t(x) ORDER BY x");
+        List<MaterializedRow> rows = result.getMaterializedRows();
+        assertEquals(7, rows.size());
+        for (MaterializedRow row : rows) {
+            assertNull(row.getField(1), "expected NULL (the documented ceiling), not a real median");
+        }
+    }
 }

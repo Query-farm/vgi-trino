@@ -9,6 +9,7 @@ import farm.query.vgitrino.function.VgiTableFunctions;
 import farm.query.vgitrino.function.VgiTableInOutFunctions;
 import farm.query.vgitrino.function.VgiTableInOutTableFunction;
 import farm.query.vgitrino.function.VgiTableInOutTableFunctions;
+import farm.query.vgitrino.function.VgiTableScanFunctions;
 import io.trino.spi.connector.Connector;
 import io.trino.spi.connector.ConnectorContext;
 import io.trino.spi.connector.ConnectorFactory;
@@ -50,6 +51,11 @@ public final class VgiConnectorFactory implements ConnectorFactory {
         tableFunctions.addAll(tableInOutTableFunctions);
         VgiScalarFunctions.Registry scalarFunctions = VgiScalarFunctions.discover(client);
         VgiAggregateFunctions.Registry aggregateFunctions = VgiAggregateFunctions.discover(client);
+        // A declarative table's backing scan function's required_settings/required_secrets live
+        // only on FunctionInfo (via catalog_schema_contents_functions), never on
+        // catalog_table_scan_function_get's own response — see VgiTableScanFunctions' javadoc.
+        // Discovered once here so VgiMetadata#getTableHandle needs no extra per-query RPC for it.
+        VgiTableScanFunctions.Registry scanFunctions = VgiTableScanFunctions.discover(client);
         // A classic table-in-out function's required_settings names need to reach
         // VgiConnector.getSessionProperties() too, exactly like a scalar function's — collected here
         // since VgiTableInOutTableFunctions.discover returns a bare Set<ConnectorTableFunction>, not a
@@ -61,6 +67,6 @@ public final class VgiConnectorFactory implements ConnectorFactory {
             }
         }
         return new VgiConnector(client, vgiConfig, tableFunctions, scalarFunctions, aggregateFunctions,
-                tableInOutRequiredSettingNames);
+                tableInOutRequiredSettingNames, scanFunctions);
     }
 }

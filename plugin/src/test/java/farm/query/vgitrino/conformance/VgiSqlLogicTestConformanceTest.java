@@ -176,4 +176,74 @@ abstract class VgiSqlLogicTestConformanceTest {
         assertEquals(4, result.skipped(), "expected skip count changed — see WINDOW_SELF_JOIN_NON_PORTABLE_MARKERS");
         assertEquals(3, result.executed(), "expected executed-record count changed");
     }
+
+    /**
+     * {@code scalar/geo_centroid.test} exercises {@code geo_centroid_struct}/{@code
+     * geo_centroid_list}/{@code geo_centroid_fixed} — three varargs scalar functions that each
+     * return a bare {@code STRUCT(lat DOUBLE, lon DOUBLE)} — and is the real-corpus proof for two
+     * genuine bugs this file's adoption found (neither a connector value-mapping bug: {@code
+     * VgiTypeMapping}/{@code VgiScalarFunctions} always produced a correct {@code RowType}/{@code
+     * SqlRow} value and correct arithmetic throughout):
+     * <ul>
+     *   <li>{@code VgiScalarFunctions.BindCache}'s cache key omitted the call site's bound argument
+     *       types, so calling a variable-arity function (no {@code vgi_const} args, so {@code
+     *       constArgValues} is always empty) at two different arities within one session — exactly
+     *       what this file's four {@code geo_centroid_struct} queries do (arity 1, 2, 3, then 2
+     *       again) — reused the FIRST arity's stale {@code bind()} result for the second, crashing
+     *       {@code init()} with a real worker-side {@code TypeError: Input schema mismatch}. Fixed
+     *       by adding {@code CallConfig.argumentTypes()} to {@code BindCache.CacheKey}.</li>
+     *   <li>{@link SqlLogicTestRunner#formatCell} detected a struct value via {@code value
+     *       instanceof List<?>} — true for the hand-built {@link java.util.List} its OWN unit test
+     *       ({@link SqlLogicTestRunnerComparisonTest#formatCellRendersARowAsAStructLiteral}) used,
+     *       but a REAL query executed via {@code DistributedQueryRunner} materializes a {@link
+     *       io.trino.spi.type.RowType} value as {@code io.trino.testing.MaterializedRow} instead — a
+     *       distinct wrapper class, not a {@code List} — so the check silently never matched, and
+     *       every live struct-returning query fell through to {@code MaterializedRow.toString()}'s
+     *       OWN bracket-joined rendering ({@code "[3.0, 4.0]"}), indistinguishable from a genuine
+     *       array. This is the exact "returns an array instead of a struct" symptom, and it is a
+     *       test-harness display gap, not a connector bug. Fixed by also accepting {@code
+     *       MaterializedRow.getFields()}.</li>
+     * </ul>
+     * {@code geo_centroid_fixed}'s four queries are separately excluded ({@code
+     * GEO_CENTROID_NON_PORTABLE_MARKERS}): the corpus casts its argument as DuckDB's fixed-size
+     * {@code DOUBLE[2]} array-cast syntax, which {@code CastRewriter} doesn't translate into valid
+     * Trino cast syntax ({@code mismatched input '['}) — a separate, pre-existing sqlglot-rewrite
+     * gap unrelated to either bug above, out of scope here.
+     *
+     * <p>Skipped entirely on the {@code http(s)://} transport subclass ({@link
+     * VgiSqlLogicTestConformanceHttpTest}): confirmed via a real failure sample that {@code
+     * VgiScalarFunctions#invoke}'s {@code (ClientStreamSession<?>) stream} cast — unmodified by
+     * either fix above — throws a real {@code ClassCastException} for EVERY scalar function call
+     * over HTTP ({@code init()} returns {@code farm.query.vgirpc.http.HttpRpcStream} there, which
+     * doesn't extend {@code ClientStreamSession}). A genuine, pre-existing scalar-function/HTTP-
+     * transport gap this file's other two hand-curated tests never exercised (neither calls a
+     * scalar function at all) — worth its own follow-up, but out of scope for the two bugs above.
+     */
+    private static final List<String> GEO_CENTROID_NON_PORTABLE_MARKERS =
+            List.of("ATTACH ", "DETACH", "geo_centroid_fixed(");
+
+    @Test
+    @Timeout(180)
+    void geoCentroidMatchesTheRealTestFile() throws Exception {
+        Path testFile = Path.of(System.getProperty("user.home"),
+                "Development/vgi/test/sql/integration/scalar/geo_centroid.test");
+        Assumptions.assumeTrue(testFile.toFile().isFile(),
+                "~/Development/vgi/test/sql/integration/scalar/geo_centroid.test not present");
+        Assumptions.assumeTrue(!worker.location().startsWith("http"),
+                "scalar functions don't work over http(s):// yet — VgiScalarFunctions#invoke's "
+                        + "ClientStreamSession cast doesn't handle HttpRpcStream (a separate, "
+                        + "pre-existing gap; see this test's own javadoc)");
+
+        SqlLogicTestRunner.Result result = SqlLogicTestRunner.run(runner, session, testFile,
+                "example.", TRINO_CATALOG, GEO_CENTROID_NON_PORTABLE_MARKERS);
+
+        if (!result.failures().isEmpty()) {
+            fail(result.executed() + " executed, " + result.skipped() + " skipped, "
+                    + result.failures().size() + " FAILED:\n" + String.join("\n---\n", result.failures()));
+        }
+        // 6 non-portable records: ATTACH, DETACH, and the 4 geo_centroid_fixed queries.
+        assertEquals(6, result.skipped(), "expected skip count changed — see GEO_CENTROID_NON_PORTABLE_MARKERS");
+        // 4 queries each for geo_centroid_struct/geo_centroid_list.
+        assertEquals(8, result.executed(), "expected executed-record count changed");
+    }
 }

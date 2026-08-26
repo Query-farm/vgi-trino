@@ -279,6 +279,47 @@ splitting returns the framework's own "whole scan" sentinel (a single split
 with an empty token) — the split source recognizes it and the page source
 falls back to a plain, non-split `init()`.
 
+**Settings and secrets for declarative tables.** A DECLARATIVE table's backing scan function
+(`Table(function=...)`, scanned via a bare `SELECT * FROM catalog.schema.name`, never a `TABLE(...)`
+call) has its `required_settings`/`required_secrets` resolved into the FIRST `bind()` this
+manager's plain-table `getSplits` issues — reusing `VgiScalarFunctions.BindCache#resolveSettings`/
+`#resolveSecretFields`/`#encodeSecrets` verbatim, exactly like a scalar function's or classic
+table-in-out's. The one real wrinkle: `catalog_table_scan_function_get` (the RPC that resolves a
+table's backing function) carries no `required_settings`/`required_secrets` fields at all — only
+`function_name`/`arguments`/`required_extensions` (confirmed against the real wire record,
+`TableScanFunctionGetResponse.java`). Those two fields exist only on `FunctionInfo`, discoverable
+through `catalog_schema_contents_functions(type=TABLE_FUNCTION)` — `VgiTableScanFunctions.discover`
+makes one more pass over that same data once at catalog-attach time (no extra per-query RPC),
+keyed by function name alone since `TableScanFunctionGetResponse` never says which schema its
+function lives in (the reference fixture's `data.rowid_first` scans via `main.rowid_sequence`, a
+different schema than the table's own — the same reason `BindRequest.schema_name` is left `null`
+for the plain-table bind call below).
+
+That static wiring alone is not enough for every real fixture, though — confirmed the hard way
+against `secret_demo_table` (backed by `secret_demo`), whose `on_bind` resolves its secret fully
+dynamically via `SecretsAccessor.get()`, with no static `Secret()`/`Meta.required_secrets`
+declaration at all: `resolve_metadata(SecretDemoFunction).required_secrets == []`, live-checked
+against the fixture. VGI's own bind wire protocol has a second, genuinely dynamic channel for
+exactly this case: a first `bind()` whose `on_bind` couldn't resolve a needed secret returns a
+**secret scope request** instead of a normal response — `BindResponse.lookup_secret_types`/
+`lookup_scopes`/`lookup_names` non-empty, `output_schema` empty — and the caller must resolve
+exactly those (never a static declaration) and retry with `resolved_secrets_provided=true`, the
+same two-phase dance the real C++ extension implements in `vgi_bind_protocol.cpp`
+(`TryParseBindSecretScopeResponse`/its retry loop). `getSplits` now does this too: on a non-empty
+`lookup_secret_types`, it resolves those exact requests from the session's extra credentials
+(the same `vgi_secret.<key>.<field>` convention) and reissues `bind()` once, resolved.
+
+One more real wrinkle inside that retry, found only by tracing the actual failure past a bind
+that looked correct: the secret this connector resolves and hands back must ALSO carry a
+synthetic `"type"` field (value = the secret type, e.g. `vgi_example`) inside its own field dict —
+`vgi-python`'s `ResolvedSecrets.of_type()` (what `initial_state()` calls to read the secret back at
+process time — a different, later accessor than the `on_bind`-time one) filters on exactly that
+field, which the real DuckDB C++ extension always attaches when it resolves a `CREATE SECRET` but
+which `#resolveSecretFields`/`#encodeSecrets` (built for a *static* `Secret()`-annotated scalar
+argument, always read by plain dict key, never by `of_type()`) never added on their own. Synthesized
+here, scoped to this two-phase-retry code path only — never touching the shared `BindCache` helpers
+themselves, so the already-working static path (`secret_field`/`return_secret_value`) is untouched.
+
 ### Connection acquisition
 
 `VgiWorkerClient` pools `vgi.connections` independent worker connections
@@ -848,9 +889,47 @@ One state class (`AggregateState`, implementing `GroupedAccumulatorState`) serve
 `createGroupedState()` both return the same type by design; the ungrouped case just never calls
 `setGroupId`, leaving every row tagged with the implicit group id 0. `FILTER (WHERE ...)`,
 `DISTINCT`, and an explicit `ORDER BY` inside the aggregate call are all handled by Trino's own
-engine before `input()` is ever called — nothing VGI-specific needed there. `OVER` (windowed usage)
-works too, via Trino's automatic window-accumulator fallback (full recompute per frame rather than
-the optimized incremental path — a performance ceiling, not a correctness gap).
+engine before `input()` is ever called — nothing VGI-specific needed there.
+
+**`OVER (...)` (windowed usage) — correct for some VGI aggregates, a genuine ceiling for others.**
+No VGI aggregate declares a `combineFunction` or a hand-compiled `WindowAccumulator` override (see
+above — the latter is only reachable via a real compiled Java class implementing `removeInput`,
+never from a dynamically-discovered `AccumulatorStateFactory` like this connector's), so Trino falls
+back to its own generic per-frame-recompute strategy: confirmed directly by reading
+`AggregateWindowFunction`/`AggregationWindowFunctionSupplier` in `io.trino.operator.window`, every
+frame that isn't a pure growing extension of the previous one discards and rebuilds the whole
+accumulator — a fresh `aggregate_bind`, every buffered row re-sent via `aggregate_update`, a fresh
+`aggregate_finalize`, once per *output* row.
+
+That recompute-per-frame strategy is a legitimate, Trino-SPI-supported way to answer `OVER (...)`
+for a non-decomposable aggregate, and it genuinely works today for any VGI aggregate whose
+`update`/`finalize` implement real "compute the aggregate over whatever rows you're handed"
+semantics — confirmed directly: `vgi_sum` produces correct results under both a sliding frame
+(`ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING`) and a growing one (`ROWS BETWEEN UNBOUNDED PRECEDING
+AND CURRENT ROW`), see `VgiAggregateFunctionsTest`. It does **not**, and cannot, work for a VGI
+aggregate whose only correct implementation lives behind VGI's *separate* windowed-aggregate RPC
+family (`aggregate_window_init`/`aggregate_window`/`aggregate_window_batch`/
+`aggregate_window_destructor` — ship the partition once, then evaluate each output row's frame via
+explicit subframe ranges). The real `vgi_window_median` fixture is exactly this case: its
+`update`/`finalize` are a deliberate no-op (mirroring how DuckDB's own C++ extension always prefers
+the `window()` callback for `OVER (...)` and only falls back to `update`/`combine`/`finalize` for
+non-window aggregation), so `example.main.vgi_window_median(x) OVER (...)` reliably returns `NULL`
+for every row through this connector — never the real median.
+
+This is a genuine ceiling, not an unfinished feature, for two independent reasons: (1) the
+`aggregate_window_init`/`aggregate_window` RPC family is entirely absent from the `farm.query:vgi`
+Java SDK this connector depends on — no `AggregateWindow*` protocol types, no `aggregate_window*`
+method on `VgiService` — confirmed against both the published jar and a from-source `vgi-java`
+checkout, so it's a real capability gap, not an unpublished-release lag. (2) Even with those RPCs
+available, Trino's own engine (`LocalExecutionPlanner`) hardcodes every `FunctionKind.AGGREGATE`
+function's `OVER (...)` usage to go through `AggregationImplementation` — `FunctionProvider.
+getWindowFunctionSupplier` is never consulted for an aggregate-kind function, only for a genuinely
+`FunctionKind.WINDOW`-registered one (`rank`, `lag`, and similar) — so there is no engine-level hook
+by which this connector could route an aggregate's window usage through a different RPC family even
+once the SDK gap above closes. `supports_window`/`streaming_partitioned` (real, if currently unread,
+`FunctionInfo` metadata fields) couldn't disambiguate the two cases at discovery time either way —
+`vgi_window_sum` (real fallback, correct today) and `vgi_window_median` (stub fallback, always
+`NULL`) both set them identically.
 
 **Const arguments bind lazily, from the first observed row.** `vgi_const` arguments (e.g. `vgi_percentile`'s
 percentile) ARE supported — VGI's `AggregateBindRequest.arguments` is exactly the const-value
@@ -972,9 +1051,13 @@ the same boundary on static predicate pushdown).
 - **Aggregate functions.** Aggregates with up to 4 arguments — including const/varargs/`any`-typed
   ones — `vgi_sum`, `vgi_avg`, `vgi_count`, `vgi_percentile`, `vgi_sum_all`, and similar, ARE now
   supported, non-decomposable (see *Aggregate functions* above for why that's a real protocol
-  ceiling, not a scope choice). A dynamic return type, more than 4 arguments, settings/secrets, and
-  `aggregate_destructor`-driven state cleanup are the named, deferred remainder — see that
-  section's own scope list.
+  ceiling, not a scope choice). `OVER (...)` usage is correct for a VGI aggregate whose
+  `update`/`finalize` implement real arbitrary-subset semantics (e.g. `vgi_sum`), but is a genuine,
+  unfixable-from-here ceiling for one whose only correct implementation lives behind VGI's separate
+  windowed-aggregate RPC family (e.g. `vgi_window_median` — always returns `NULL`) — see *Aggregate
+  functions* above for the full root cause. A dynamic return type, more than 4 arguments,
+  settings/secrets, and `aggregate_destructor`-driven state cleanup are the named, deferred
+  remainder — see that section's own scope list.
 - **Write support**, **multi-branch tables** (`catalog_table_scan_branches_get`),
   **transactions**, **views** — VGI supports all four; none are wired up here
   (write support matches vgi-java's own worker-SDK scope, which is read-only
@@ -987,11 +1070,14 @@ the same boundary on static predicate pushdown).
   attach-options mechanism) has no way to receive any from this connector
   today. `vgi.catalog-name` is the only per-attach parameter this connector
   threads through.
-- **Per-query settings and secrets for table functions.** `table_function_plan`/`init()`
-  still always send `null`/`false` for `settings`/`secrets`/`resolved_secrets_provided` —
-  this gap is now closed for *scalar* functions only (session properties / extra
-  credentials — see *Scalar functions* above), not yet for table functions, which would
-  need the equivalent wiring on the `plan()`/`init()` call sites instead.
+- **Per-query settings and secrets for callable `TABLE(...)` producer functions
+  (`VgiTableFunction`).** `VgiTableFunction#analyze` still always sends `null`/`null`/`false` for
+  `settings`/`secrets`/`resolved_secrets_provided` on its own `bind()` call — this gap is now
+  closed for scalar functions, classic table-in-out functions, AND declarative tables' backing
+  scan functions (session properties / extra credentials — see *Scalar functions*, *Table-in-out
+  functions — CLASSIC*, and *Splits* above), but a function called directly as
+  `TABLE(catalog.schema.fn(...))` still needs the equivalent wiring on `VgiTableFunction`'s own
+  bind call site.
 
 ## License
 

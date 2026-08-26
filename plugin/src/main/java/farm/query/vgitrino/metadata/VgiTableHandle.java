@@ -2,8 +2,11 @@
 
 package farm.query.vgitrino.metadata;
 
+import farm.query.vgi.protocol.FunctionRequiredSecret;
 import io.trino.spi.connector.ConnectorTableHandle;
 import io.trino.spi.predicate.TupleDomain;
+
+import java.util.List;
 
 /**
  * A bound VGI table: which schema/table, and the scan function + arguments
@@ -35,6 +38,14 @@ import io.trino.spi.predicate.TupleDomain;
  *        (non-time-travel) read — see {@code VgiTimeTravel}
  * @param atValue the resolved AT clause's value, or {@code null} exactly when
  *        {@code atUnit} is {@code null} (VGI requires both or neither)
+ * @param requiredSettings the backing scan function's {@code required_settings}
+ *        names, resolved at {@code getTableHandle} time via {@code
+ *        farm.query.vgitrino.function.VgiTableScanFunctions} (never {@code
+ *        null} — empty when the scan function declares none, or isn't
+ *        otherwise discoverable as a {@code TABLE_FUNCTION})
+ * @param requiredSecrets the backing scan function's {@code required_secrets},
+ *        same source and same never-{@code null} convention as {@code
+ *        requiredSettings}
  */
 public record VgiTableHandle(
         String schemaName,
@@ -45,5 +56,7 @@ public record VgiTableHandle(
         Long cardinalityEstimate,
         TupleDomain<VgiColumnHandle> constraint,
         String atUnit,
-        String atValue) implements ConnectorTableHandle {
+        String atValue,
+        List<String> requiredSettings,
+        List<FunctionRequiredSecret> requiredSecrets) implements ConnectorTableHandle {
 }

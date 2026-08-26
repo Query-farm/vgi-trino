@@ -532,13 +532,29 @@ public final class VgiScalarFunctions {
     /** One cached {@code bind()} result: replayable at {@code init()} time on any connection. */
     record BindEntry(byte[] bindCallBytes, byte[] outputSchemaBytes, byte[] opaqueData) {}
 
-    private record CacheKey(FunctionId functionId, List<Object> constArgValues,
+    /**
+     * @param argumentTypes the call site's bound argument types ({@code CallConfig.argumentTypes()},
+     *        in signature order) — REQUIRED, not merely descriptive: a variable-arity function
+     *        (e.g. {@code geo_centroid_struct}) shares one {@link FunctionId} across every distinct
+     *        arity a query calls it with, and none of its arguments are {@code vgi_const}, so
+     *        {@code constArgValues} is always empty for every arity. Without {@code argumentTypes}
+     *        in the key, a 2-point call within the same session as an already-cached 1-point call
+     *        would reuse the 1-point bind's {@code bindCallBytes} (whose {@code input_schema}
+     *        declares a single {@code points} field) against a 2-column {@code points_0}/{@code
+     *        points_1} exchange batch — confirmed the hard way against the real fixture: {@code
+     *        scalar/geo_centroid.test} calls {@code geo_centroid_struct} at arity 1, then 2, then 3
+     *        within one session, and the second call crashed {@code init()} with a real worker-side
+     *        {@code TypeError: Input schema mismatch: expected points: struct<...>, got points_0:
+     *        struct<...>, points_1: struct<...>} — not a hypothetical.
+     */
+    private record CacheKey(FunctionId functionId, List<Type> argumentTypes, List<Object> constArgValues,
             Map<String, String> resolvedSettings, Map<String, String> resolvedSecretFields) {}
 
     /**
-     * Caches {@code bind()} results keyed by {@code (function, observed const-argument values,
-     * resolved settings, resolved secret fields)}, so a query whose "constant" argument really is
-     * constant across every row pays exactly one {@code bind()} RPC no matter how many rows are
+     * Caches {@code bind()} results keyed by {@code (function, bound argument types, observed
+     * const-argument values, resolved settings, resolved secret fields)}, so a query whose
+     * "constant" argument really is constant across every row pays exactly one {@code bind()} RPC
+     * no matter how many rows are
      * processed — every {@code init()}+{@code exchange()} after the first replays the same cached
      * {@code bind_call} bytes on whatever connection happens to be free.
      *
@@ -599,7 +615,8 @@ public final class VgiScalarFunctions {
                 ConnectorSession session) {
             Map<String, String> resolvedSettings = resolveSettings(cfg.entry().requiredSettings(), session);
             Map<String, String> resolvedSecretFields = resolveSecretFields(cfg.entry().requiredSecrets(), session);
-            CacheKey key = new CacheKey(cfg.entry().functionId(), constValues, resolvedSettings, resolvedSecretFields);
+            CacheKey key = new CacheKey(cfg.entry().functionId(), cfg.argumentTypes(), constValues,
+                    resolvedSettings, resolvedSecretFields);
             BindEntry cached = map.get(key);
             if (cached != null) return cached;
             BindEntry fresh = client.withConnection(
@@ -635,15 +652,17 @@ public final class VgiScalarFunctions {
         /**
          * {@code required_settings} names with a non-null current session-property value.
          *
-         * <p>Package-private, not private: {@code VgiTableInOutTableFunction} reuses this verbatim
-         * for a classic table-in-out function's own {@code required_settings} — the wire shape and
-         * resolution rule are identical to a scalar function's (confirmed against the real
-         * fixture's {@code filter_by_setting}), and {@code analyze()} already receives a real {@code
-         * ConnectorSession} directly (unlike a scalar function's {@code FunctionProvider}, which
-         * needed this whole {@code BindCache} to get one at all), so no bind-cache equivalent is
-         * needed on that side — just this same resolution logic, called once per {@code analyze()}.
+         * <p>Public, not private: {@code VgiTableInOutTableFunction} (same package) and {@code
+         * VgiSplitManager} (a different package, {@code farm.query.vgitrino.split} — a declarative
+         * table's backing scan function's {@code required_settings} resolve here too, see its own
+         * javadoc) both reuse this verbatim — the wire shape and resolution rule are identical to a
+         * scalar function's (confirmed against the real fixture's {@code filter_by_setting}), and
+         * both call sites already receive a real {@code ConnectorSession} directly (unlike a scalar
+         * function's {@code FunctionProvider}, which needed this whole {@code BindCache} to get one
+         * at all), so no bind-cache equivalent is needed on either side — just this same resolution
+         * logic, called once per {@code analyze()}/{@code getSplits()}.
          */
-        static Map<String, String> resolveSettings(List<String> requiredSettings, ConnectorSession session) {
+        public static Map<String, String> resolveSettings(List<String> requiredSettings, ConnectorSession session) {
             if (requiredSettings.isEmpty()) return Map.of();
             Map<String, String> resolved = new LinkedHashMap<>();
             for (String name : requiredSettings) {
@@ -657,8 +676,9 @@ public final class VgiScalarFunctions {
          * {@code required_secrets} fields found in {@code ConnectorIdentity.getExtraCredentials()}
          * — see the class javadoc for the {@code vgi_secret.<secretKey>.<fieldName>} convention.
          * Flattened as {@code "<secretKey>.<fieldName>" -> value} (rather than a nested map) so it
-         * can sit directly in {@link CacheKey}, itself a plain record. Package-private for the same
-         * reason as {@link #resolveSettings} — reused verbatim by {@code VgiTableInOutTableFunction}.
+         * can sit directly in {@link CacheKey}, itself a plain record. Public for the same reason
+         * as {@link #resolveSettings} — reused verbatim by {@code VgiTableInOutTableFunction} and
+         * {@code VgiSplitManager}.
          *
          * <p>Gated on {@code requiredSecrets} being non-empty, same as {@link #resolveSettings} —
          * a function whose {@code on_bind} resolves a secret dynamically with no static {@code
@@ -668,7 +688,7 @@ public final class VgiScalarFunctions {
          * never guesses which credentials a function needs), not an oversight; see the README for
          * the honest accounting of which real fixtures this leaves out of reach.
          */
-        static Map<String, String> resolveSecretFields(List<FunctionRequiredSecret> requiredSecrets,
+        public static Map<String, String> resolveSecretFields(List<FunctionRequiredSecret> requiredSecrets,
                 ConnectorSession session) {
             if (requiredSecrets.isEmpty()) return Map.of();
             Map<String, String> credentials = session.getIdentity().getExtraCredentials();
@@ -688,9 +708,9 @@ public final class VgiScalarFunctions {
 
         /**
          * Un-flattens {@link #resolveSecretFields}'s map back into one struct-valued setting per
-         * secret. Package-private for the same reason as {@link #resolveSettings}.
+         * secret. Public for the same reason as {@link #resolveSettings}.
          */
-        static byte[] encodeSecrets(Map<String, String> resolvedSecretFields) {
+        public static byte[] encodeSecrets(Map<String, String> resolvedSecretFields) {
             if (resolvedSecretFields.isEmpty()) return null;
             Map<String, Map<String, Object>> bySecret = new LinkedHashMap<>();
             for (Map.Entry<String, String> field : resolvedSecretFields.entrySet()) {

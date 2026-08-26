@@ -123,6 +123,59 @@ import static io.trino.spi.type.TypeTemplates.typeVariable;
  * (Arrow field names must stay unique; VGI dispatches a vararg group by column position, not
  * name). A non-trailing vararg argument is skipped at discovery, same validity rule as scalars.
  *
+ * <h2>Windowed usage ({@code OVER (...)}) — a real correctness ceiling, not just a performance one</h2>
+ *
+ * <p>No VGI aggregate declares a {@code combineFunction} or a {@code windowAccumulator} override
+ * (see above), so Trino's engine falls back to its generic per-frame-recompute strategy for {@code
+ * OVER (...)} usage: {@code AggregationWindowFunctionSupplier}/{@code AggregateWindowFunction} (in
+ * {@code io.trino.operator.window}) discard and rebuild the whole {@link AggregateState} for every
+ * frame that isn't a pure growing extension of the previous one — a fresh {@code aggregate_bind},
+ * every buffered row re-sent via {@code aggregate_update}, a fresh {@code aggregate_finalize}, once
+ * per OUTPUT row. Confirmed by reading that engine code directly (not assumed): {@code
+ * AggregateWindowFunction.buildNewFrame} only ever takes its incremental-update branch when {@code
+ * hasRemoveInput} is true, which requires {@code AggregationImplementation.getWindowAccumulator()}
+ * to be present — something only a hand-compiled {@link io.trino.spi.function.WindowAccumulator}
+ * class can supply, never
+ * a dynamically-discovered {@link AccumulatorStateFactory} like this one's. This connector doesn't
+ * attempt one; every window frame this connector sees is a full rebuild.
+ *
+ * <p>This recompute-per-frame strategy IS a Trino-SPI-legitimate, correct way to answer {@code
+ * OVER (...)} for a non-decomposable aggregate — and it genuinely works, today, for any VGI
+ * aggregate whose {@code update}/{@code finalize} implement real "compute the aggregate over
+ * whatever rows you're handed" semantics (confirmed directly: {@code vgi_sum} used with both a
+ * sliding frame, {@code ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING}, and a growing one, {@code ROWS
+ * BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW}, produces correct results — see {@code
+ * VgiAggregateFunctionsTest}). <b>It does not, and structurally cannot, work for a VGI aggregate
+ * whose only correct implementation lives behind VGI's separate windowed-aggregate RPC family</b>
+ * ({@code aggregate_window_init}/{@code aggregate_window}/{@code aggregate_window_batch}/{@code
+ * aggregate_window_destructor} — ship the partition once, then evaluate one output row's frame at a
+ * time via explicit subframe ranges; see {@code vgi-python}'s {@code protocol.py}). The real
+ * fixture {@code vgi_window_median} is exactly this case: its {@code update}/{@code finalize} are a
+ * deliberate no-op (matching how DuckDB's own C++ extension dispatches — it always prefers the
+ * {@code window()} callback for {@code OVER (...)} and only falls back to {@code
+ * update}/{@code combine}/{@code finalize} for non-window aggregation), so recomputing via {@code
+ * aggregate_bind}/{@code aggregate_update}/{@code aggregate_finalize} for every frame — the only
+ * thing this connector can do — reliably returns {@code NULL} for every row, never the real median.
+ *
+ * <p>Two independent facts make this a genuine ceiling rather than an unfinished feature of this
+ * connector: (1) the {@code aggregate_window_init}/{@code aggregate_window} RPC family is entirely
+ * absent from the {@code farm.query:vgi} Java SDK this connector depends on — no {@code
+ * AggregateWindow*} protocol types and no {@code aggregate_window*} method on {@code VgiService},
+ * confirmed directly against the SDK jar (and against a from-source checkout of {@code vgi-java},
+ * so this isn't merely an unpublished-release lag). (2) Even with those RPCs available, Trino's own
+ * engine (see {@code LocalExecutionPlanner}, the two call sites that branch on {@code
+ * FunctionKind.AGGREGATE}) hardcodes every {@code FunctionKind.AGGREGATE}-resolved function's {@code
+ * OVER (...)} usage to go through {@code AggregationImplementation} — {@link
+ * io.trino.spi.function.FunctionProvider#getWindowFunctionSupplier} is never consulted for an
+ * aggregate-kind function, only for a genuinely {@code FunctionKind.WINDOW}-registered one (rank,
+ * lag, and similar) — so there is no engine-level hook by which this connector could route an
+ * aggregate's window usage through a different RPC family even once the SDK gap above is closed.
+ * {@code supports_window}/{@code streaming_partitioned} (real {@link FunctionInfo} metadata fields)
+ * are read by neither DuckDB's extension nor this connector's discovery today — there would be
+ * nothing to key off even if there were an engine hook, since the flag can't distinguish a function
+ * like {@code vgi_window_sum} (real fallback, works today) from one like {@code vgi_window_median}
+ * (stub fallback, always {@code NULL}); both set it identically.
+ *
  * <h2>Deferred, named explicitly (v1 scope)</h2>
  *
  * <ul>
@@ -131,11 +184,6 @@ import static io.trino.spi.type.TypeTemplates.typeVariable;
  *       vararg argument is itself any-typed. A dynamic (bind-time-computed) return type is skipped
  *       for the identical reason it's skipped for scalars: Trino resolves a function's return type
  *       from its static {@link Signature} before any RPC happens.</li>
- *   <li>Windowed usage ({@code supports_window}/{@code streaming_partitioned}) — {@code OVER} still
- *       works via Trino's own automatic window-accumulator fallback (full recompute per frame, not
- *       the optimized incremental {@code WindowAccumulator} path — see {@code
- *       AggregationImplementation.Builder#windowAccumulator}), so this is a performance ceiling, not
- *       a correctness gap.</li>
  *   <li>An argument count above {@link #MAX_ARITY} — {@link #inputHandle} only has hand-written
  *       {@code MethodHandle}s for 0..{@value #MAX_ARITY} arguments (Trino's {@code
  *       AccumulatorCompiler} expects an exact, statically-typed {@code (State, ValueBlock, int,

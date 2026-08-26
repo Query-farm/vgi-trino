@@ -31,6 +31,40 @@ final class SqlLogicTestRunnerSyntaxRewriteTest {
     }
 
     @Test
+    void wrapsATableInOutFunctionsSubqueryArgumentInTableToo() {
+        assertEquals(
+                "SELECT * FROM TABLE(vgi_example.main.echo(TABLE(SELECT 1 AS a, 2 AS b)))",
+                SqlLogicTestRunner.rewriteDuckDbOnlySyntax(
+                        "SELECT * FROM vgi_example.main.echo((SELECT 1 AS a, 2 AS b))", CATALOG));
+    }
+
+    @Test
+    void wrapsOnlyTheSubqueryArgumentLeavingAPlainScalarArgumentAlone() {
+        assertEquals(
+                "SELECT * FROM TABLE(vgi_example.main.repeat_inputs(3, TABLE(SELECT 1 AS a)))",
+                SqlLogicTestRunner.rewriteDuckDbOnlySyntax(
+                        "SELECT * FROM vgi_example.main.repeat_inputs(3, (SELECT 1 AS a))", CATALOG));
+    }
+
+    @Test
+    void wrapsANestedSubqueryArgumentWithoutBreakingOnItsOwnParens() {
+        assertEquals(
+                "SELECT * FROM TABLE(vgi_example.main.echo(TABLE(SELECT * FROM (VALUES (1, 'a')) t(x, y))))",
+                SqlLogicTestRunner.rewriteDuckDbOnlySyntax(
+                        "SELECT * FROM vgi_example.main.echo((SELECT * FROM (VALUES (1, 'a')) t(x, y)))", CATALOG));
+    }
+
+    @Test
+    void doesNotWrapAParenthesizedScalarExpressionArgument() {
+        // Not every parenthesized argument is a subquery — (1 + 2) is a plain scalar expression and
+        // must be left alone, not mistaken for a bare-subquery TableInput argument.
+        assertEquals(
+                "SELECT * FROM TABLE(vgi_example.main.repeat_inputs((1 + 2), TABLE(SELECT 1 AS a)))",
+                SqlLogicTestRunner.rewriteDuckDbOnlySyntax(
+                        "SELECT * FROM vgi_example.main.repeat_inputs((1 + 2), (SELECT 1 AS a))", CATALOG));
+    }
+
+    @Test
     void wrapsABareTableFunctionCallAfterJoin() {
         assertEquals(
                 "SELECT * FROM t JOIN TABLE(vgi_example.main.sequence(10)) ON true",
