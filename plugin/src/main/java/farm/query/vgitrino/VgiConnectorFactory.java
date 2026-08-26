@@ -7,6 +7,7 @@ import farm.query.vgitrino.function.VgiAggregateFunctions;
 import farm.query.vgitrino.function.VgiScalarFunctions;
 import farm.query.vgitrino.function.VgiTableFunctions;
 import farm.query.vgitrino.function.VgiTableInOutFunctions;
+import farm.query.vgitrino.function.VgiTableInOutTableFunction;
 import farm.query.vgitrino.function.VgiTableInOutTableFunctions;
 import io.trino.spi.connector.Connector;
 import io.trino.spi.connector.ConnectorContext;
@@ -45,9 +46,21 @@ public final class VgiConnectorFactory implements ConnectorFactory {
         // discover() calls already partition disjointly on FunctionInfo.input_from_args and whether a
         // TableInput argument is present (see each class's own javadoc).
         tableFunctions.addAll(VgiTableInOutFunctions.discover(client));
-        tableFunctions.addAll(VgiTableInOutTableFunctions.discover(client));
+        Set<ConnectorTableFunction> tableInOutTableFunctions = VgiTableInOutTableFunctions.discover(client);
+        tableFunctions.addAll(tableInOutTableFunctions);
         VgiScalarFunctions.Registry scalarFunctions = VgiScalarFunctions.discover(client);
         VgiAggregateFunctions.Registry aggregateFunctions = VgiAggregateFunctions.discover(client);
-        return new VgiConnector(client, vgiConfig, tableFunctions, scalarFunctions, aggregateFunctions);
+        // A classic table-in-out function's required_settings names need to reach
+        // VgiConnector.getSessionProperties() too, exactly like a scalar function's — collected here
+        // since VgiTableInOutTableFunctions.discover returns a bare Set<ConnectorTableFunction>, not a
+        // Registry with its own metadata surface the way scalar/aggregate functions have.
+        Set<String> tableInOutRequiredSettingNames = new HashSet<>();
+        for (ConnectorTableFunction function : tableInOutTableFunctions) {
+            if (function instanceof VgiTableInOutTableFunction t) {
+                tableInOutRequiredSettingNames.addAll(t.requiredSettingNames());
+            }
+        }
+        return new VgiConnector(client, vgiConfig, tableFunctions, scalarFunctions, aggregateFunctions,
+                tableInOutRequiredSettingNames);
     }
 }

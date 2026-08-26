@@ -2,6 +2,7 @@
 
 package farm.query.vgitrino.function;
 
+import farm.query.vgi.protocol.GlobalInitResponse;
 import farm.query.vgi.protocol.InitRequest;
 import farm.query.vgirpc.AnnotatedBatch;
 import farm.query.vgirpc.ClientStreamSession;
@@ -34,10 +35,28 @@ import java.util.concurrent.CompletableFuture;
  * session fed incrementally, unlike {@link VgiTableInOutSplitProcessor}'s
  * single-shot literal-call exchange.
  *
- * <p>Every VGI classic table-in-out function this connector registers has NO
- * finalize phase (see {@code VgiTableInOutTableFunctions#discover}'s v1
- * scope note) — so the whole call is exactly this one-phase write/read loop;
- * there is no second {@code init(phase=FINALIZE)} turn to drive.
+ * <h2>Finalize phase</h2>
+ *
+ * <p>If {@link VgiTableInOutTableFunctionHandle#hasFinalize()}, true
+ * end-of-input does NOT release the connection — it closes the INPUT-phase
+ * stream (which itself closes the input writer and drains any leftover
+ * output), then issues a SECOND, separate {@code init(phase=FINALIZE)} call
+ * on the SAME connection, and drains ITS answer in producer mode ({@code
+ * tick()} in a loop) until true end-of-stream, handing each non-empty batch
+ * back as its own {@link TableFunctionProcessorState.Processed#produced}
+ * result — {@code finish()} can legitimately return several separate output
+ * batches (confirmed against the real fixture worker's {@code
+ * multi_batch_finish}), each requiring its own {@code tick()} round trip, not
+ * just multiple rows in one batch.
+ *
+ * <p>The FINALIZE call MUST carry the INPUT phase's own {@code execution_id}
+ * (never a fresh/null one) — confirmed against the real reference client and
+ * worker: VGI's server-side state store ({@code BoundStorage}) is keyed by
+ * {@code execution_id}, not by the connection or worker process, so a fresh
+ * id would silently correlate to an empty accumulator instead of throwing.
+ * {@link #redeem} captures it off the INPUT-phase stream's header (a real
+ * {@link GlobalInitResponse}, per the real service interface's {@code
+ * @StreamHeader(GlobalInitResponse.class)} declaration on {@code init}).
  *
  * <h2>A genuine, undocumented-elsewhere SPI gap: no close hook</h2>
  *
@@ -65,6 +84,8 @@ public final class VgiTableInOutDataProcessor implements TableFunctionDataProces
     private final CompletableFuture<VgiWorkerClient.Attached> redemption;
 
     private ClientStreamSession<?> session;
+    private GlobalInitResponse inputHeader;
+    private boolean finalizeStarted;
     private boolean finished;
     private boolean connectionHealthy = true;
 
@@ -91,16 +112,17 @@ public final class VgiTableInOutDataProcessor implements TableFunctionDataProces
                     null,           // pushdown_filters
                     null,           // join_keys
                     "INPUT",        // phase
-                    null,           // execution_id — worker mints one
+                    null,           // execution_id — worker mints one; captured below for FINALIZE
                     null,           // init_opaque_data
                     null, null, null, null,     // order-by hint
                     null, null,                 // tablesample hint
                     null,           // finalize_state_id
-                    null,           // substream_id
+                    null,           // substream_id — only matters for HTTP multi-backend fan-out
                     null,           // split_tokens — no split enumeration for a data-driven call
                     null);          // row_limit
             RpcStream<? extends StreamState> stream = a.service().init(initRequest, null);
             this.session = (ClientStreamSession<?>) stream;
+            this.inputHeader = (GlobalInitResponse) stream.header();
             ok = true;
             return a;
         } finally {
@@ -118,11 +140,17 @@ public final class VgiTableInOutDataProcessor implements TableFunctionDataProces
         VgiWorkerClient.Attached connection = redemption.join();
 
         if (input == null) {
-            // True end-of-input: no finalize phase to continue into (v1 scope) — signal EOS and
-            // release. close() drains any trailing output, which is a no-op here since a no-finalize
-            // worker has nothing left to say once every input batch has been answered.
-            finishAndRelease(connection);
-            return TableFunctionProcessorState.Finished.FINISHED;
+            // True end-of-input. Every subsequent call also arrives with input==null (per the real
+            // SPI's own contract: "if all sources are fully processed, the argument is null") — so
+            // once finalizeStarted is true, every later call here just continues draining it.
+            if (!handle.hasFinalize()) {
+                finishAndRelease(connection);
+                return TableFunctionProcessorState.Finished.FINISHED;
+            }
+            if (!finalizeStarted) {
+                startFinalize(connection);
+            }
+            return drainFinalizeOnce(connection);
         }
         // VGI structurally forbids more than one TableInput argument (see VgiArgSpec.tableArg's
         // javadoc), so there is always exactly one source here.
@@ -146,6 +174,60 @@ public final class VgiTableInOutDataProcessor implements TableFunctionDataProces
             // already closed the session itself in this case (see its own javadoc).
             finished = true;
             client.release(connection, false);
+            return TableFunctionProcessorState.Finished.FINISHED;
+        } catch (RuntimeException e) {
+            finished = true;
+            connectionHealthy = false;
+            client.release(connection, false);
+            throw e;
+        }
+    }
+
+    /**
+     * Ends the INPUT-phase stream and opens the FINALIZE-phase one on the SAME connection, carrying
+     * the INPUT phase's own {@code execution_id}/{@code opaque_data} forward — see this class's own
+     * javadoc for why that carry-forward is load-bearing, not optional.
+     */
+    private void startFinalize(VgiWorkerClient.Attached connection) {
+        try {
+            session.close(); // idempotent; ends the input writer and drains any leftover INPUT output
+            InitRequest finalizeInit = new InitRequest(
+                    handle.bindCall(),
+                    handle.outputSchema(),
+                    handle.bindOpaqueData(),
+                    null, null, null,
+                    "FINALIZE",
+                    inputHeader.execution_id(),
+                    inputHeader.opaque_data(),
+                    null, null, null, null,
+                    null, null,
+                    null,           // finalize_state_id — only for the (separate) buffered-table path
+                    null,           // substream_id
+                    null,
+                    null);
+            RpcStream<? extends StreamState> finalizeStream = connection.service().init(finalizeInit, null);
+            this.session = (ClientStreamSession<?>) finalizeStream;
+            this.finalizeStarted = true;
+        } catch (RuntimeException e) {
+            finished = true;
+            connectionHealthy = false;
+            client.release(connection, false);
+            throw e;
+        }
+    }
+
+    /** One {@code tick()} of the FINALIZE-phase producer stream — {@code finish()} may legally take
+     *  several of these to drain fully (see this class's own javadoc). */
+    private TableFunctionProcessorState drainFinalizeOnce(VgiWorkerClient.Attached connection) {
+        try {
+            AnnotatedBatch out = session.tick();
+            int rowCount = out.root().getRowCount();
+            if (rowCount == 0) {
+                return TableFunctionProcessorState.Processed.usedInput();
+            }
+            return TableFunctionProcessorState.Processed.produced(toPage(out.root(), rowCount));
+        } catch (NoSuchElementException endOfStream) {
+            finishAndRelease(connection);
             return TableFunctionProcessorState.Finished.FINISHED;
         } catch (RuntimeException e) {
             finished = true;

@@ -574,15 +574,40 @@ notification and the borrowed connection leaks until GC — a real ceiling of th
 SPI, not something `VgiTableInOutDataProcessor` can fix; every other connection this connector
 borrows has a real release path, this is the one documented exception.
 
-**v1 scope**: only a function with NO finalize phase registers at all
-(`VgiTableInOutTableFunctions#discover` skips `has_finalize=true` explicitly) — VGI's
-cross-batch-accumulation shape (`SubstreamPartialSumFunction`/`MultiBatchFinishFunction`) needs
-a second `init(phase=FINALIZE)` turn on the same connection/`execution_id` after input
-end-of-stream, which isn't implemented yet; `filter_by_setting`/`secret_in_out` (need
-settings/secrets wiring for this call shape) are similarly out of scope for now. Otherwise
-mirrors the other table-function classes' constraints (varargs/`any`-typed non-table arguments
-skipped, overloaded names skipped, more than one `TableInput` argument rejected defensively
-— VGI's own validation already prevents registering one).
+**Finalize phase.** A `has_finalize=true` function (`SubstreamPartialSumFunction`/
+`MultiBatchFinishFunction`-style cross-batch accumulation) registers too. On true
+end-of-input, `VgiTableInOutDataProcessor` closes the INPUT-phase stream, then issues a
+SECOND, separate `init(phase=FINALIZE)` call on the SAME connection, then drains its answer
+in producer mode (`tick()` in a loop) — `finish()` can legitimately return several separate
+output batches (confirmed against the real fixture's `multi_batch_finish`, built specifically
+to catch a broken multi-batch continuation), each needing its own `tick()` round trip, not
+just multiple rows in one batch. The one genuinely load-bearing detail, confirmed by reading
+the real reference client and worker directly rather than assumed: the FINALIZE call MUST
+carry the INPUT phase's own `execution_id` (read off the INPUT-phase stream's header, a real
+`GlobalInitResponse` — the service interface declares `@StreamHeader(GlobalInitResponse.class)`
+on `init`) — VGI's server-side state store is keyed by `execution_id`, not by the connection or
+worker process, so passing a fresh/`null` one would silently correlate to an empty accumulator
+instead of throwing.
+
+**Settings and secrets.** `required_settings`/`required_secrets` (the real fixture's
+`filter_by_setting`/`secret_in_out`) resolve in `analyze()` exactly like a scalar function's —
+reusing `VgiScalarFunctions.BindCache#resolveSettings`/`#resolveSecretFields` verbatim, since
+`analyze()` already receives a real `ConnectorSession` directly (a scalar function's
+`FunctionProvider` does not, which is the entire reason `BindCache` exists there — no
+bind-cache equivalent is needed on this side at all). `secret_in_out` specifically is NOT
+reachable even so: its `on_bind` resolves a secret fully dynamically, with no static
+`Secret()`/`Meta.required_secrets` declaration, so `FunctionInfo.required_secrets` is
+genuinely empty for it — this connector's secret-forwarding stays gated on `required_secrets`
+being non-empty (a deliberate, security-relevant gate: never guess which credentials a
+function needs), so nothing is forwarded to it even if the caller's `--extra-credential`
+supplied it.
+
+**v1 scope otherwise**: mirrors the other table-function classes' constraints (varargs/
+`any`-typed non-table arguments skipped, overloaded names skipped, more than one `TableInput`
+argument rejected defensively — VGI's own validation already prevents registering one).
+`SumAllColumnsFunction`/`SumAllColumnsSimpleDistributed` stay out of reach regardless of
+finalize support — they're really a `TableBufferingFunction`, a third, distinct VGI kind with
+its own `TABLE_BUFFERING`/`TABLE_BUFFERING_FINALIZE` phases, not `INPUT`/`FINALIZE`.
 
 ### Predicate pushdown
 

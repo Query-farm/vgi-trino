@@ -20,6 +20,7 @@ import io.trino.spi.function.table.ConnectorTableFunction;
 import io.trino.spi.session.PropertyMetadata;
 import io.trino.spi.transaction.IsolationLevel;
 
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Optional;
 import java.util.Set;
@@ -42,6 +43,7 @@ public final class VgiConnector implements Connector {
     private final VgiScalarFunctions.Registry scalarFunctions;
     private final VgiScalarFunctions.BindCache scalarBindCache;
     private final VgiAggregateFunctions.Registry aggregateFunctions;
+    private final Set<String> tableInOutRequiredSettingNames;
 
     /**
      * @param client the pooled connection to this catalog's VGI worker,
@@ -51,15 +53,20 @@ public final class VgiConnector implements Connector {
      *        functions (see {@link farm.query.vgitrino.function.VgiTableFunctions#discover})
      * @param scalarFunctions this catalog's discovered scalar functions (see {@link VgiScalarFunctions#discover})
      * @param aggregateFunctions this catalog's discovered aggregate functions (see {@link VgiAggregateFunctions#discover})
+     * @param tableInOutRequiredSettingNames the union of every discovered classic table-in-out
+     *        function's {@code required_settings} names (see {@link
+     *        farm.query.vgitrino.function.VgiTableInOutTableFunction#requiredSettingNames})
      */
     public VgiConnector(VgiWorkerClient client, VgiConfig config, Set<ConnectorTableFunction> tableFunctions,
-            VgiScalarFunctions.Registry scalarFunctions, VgiAggregateFunctions.Registry aggregateFunctions) {
+            VgiScalarFunctions.Registry scalarFunctions, VgiAggregateFunctions.Registry aggregateFunctions,
+            Set<String> tableInOutRequiredSettingNames) {
         this.client = client;
         this.config = config;
         this.tableFunctions = tableFunctions;
         this.scalarFunctions = scalarFunctions;
         this.scalarBindCache = new VgiScalarFunctions.BindCache();
         this.aggregateFunctions = aggregateFunctions;
+        this.tableInOutRequiredSettingNames = tableInOutRequiredSettingNames;
     }
 
     @Override
@@ -90,15 +97,17 @@ public final class VgiConnector implements Connector {
 
     /**
      * One nullable, unhidden string session property per distinct {@code required_settings} name
-     * across every discovered scalar function — {@code SET SESSION <catalog>.<name> = '<value>'}
-     * is how a query supplies a VGI setting a function needs (see {@code
-     * VgiScalarFunctions.BindCache}'s own note on why session-scoped values, not connector-startup
-     * ones, are the right Trino analog for VGI's per-call settings).
+     * across every discovered scalar OR classic table-in-out function — {@code SET SESSION
+     * <catalog>.<name> = '<value>'} is how a query supplies a VGI setting a function needs (see
+     * {@code VgiScalarFunctions.BindCache}'s own note on why session-scoped values, not
+     * connector-startup ones, are the right Trino analog for VGI's per-call settings).
      */
     @Override
     public List<PropertyMetadata<?>> getSessionProperties() {
-        return scalarFunctions.requiredSettingNames().stream()
-                .map(name -> PropertyMetadata.stringProperty(name, "VGI scalar-function setting '" + name + "'",
+        Set<String> names = new LinkedHashSet<>(scalarFunctions.requiredSettingNames());
+        names.addAll(tableInOutRequiredSettingNames);
+        return names.stream()
+                .map(name -> PropertyMetadata.stringProperty(name, "VGI function setting '" + name + "'",
                         null, false))
                 .collect(Collectors.toList());
     }

@@ -26,16 +26,21 @@ import java.util.Set;
  * repeat_inputs}/{@code filter_by_setting} — and builds a {@link
  * VgiTableInOutTableFunction} per one this connector can support.
  *
- * <h2>v1 scope</h2>
+ * <h2>Finalize-phase and settings/secrets support</h2>
  *
- * <p>Only a function with NO finalize phase registers at all — {@code
- * has_finalize=true} (VGI's {@code SubstreamPartialSumFunction}/{@code
- * MultiBatchFinishFunction}-style cross-batch accumulation) needs a second
- * {@code init(phase=FINALIZE)} turn on the SAME connection/{@code
- * execution_id} after input end-of-stream, which {@link
- * VgiTableInOutDataProcessor} does not implement yet — skipped, not
- * registered wrong, exactly like every other out-of-scope shape in this
- * connector.
+ * <p>A {@code has_finalize=true} function (VGI's {@code
+ * SubstreamPartialSumFunction}/{@code MultiBatchFinishFunction}-style
+ * cross-batch accumulation) registers too — {@link VgiTableInOutDataProcessor}
+ * drives its second {@code init(phase=FINALIZE)} turn (carrying the INPUT
+ * phase's own {@code execution_id}/{@code opaque_data}) on the same
+ * connection after input end-of-stream. {@code required_settings}/{@code
+ * required_secrets} (the real fixture's {@code filter_by_setting}/{@code
+ * secret_in_out}) resolve exactly like a scalar function's — see {@link
+ * VgiTableInOutTableFunction#analyze}, which reuses {@link
+ * VgiScalarFunctions.BindCache#resolveSettings}/{@link
+ * VgiScalarFunctions.BindCache#resolveSecretFields} verbatim, since {@code
+ * analyze()} already receives a real {@code ConnectorSession} directly (no
+ * bind-cache equivalent needed on this side at all).
  *
  * @see VgiTableInOutTableFunction
  */
@@ -56,7 +61,6 @@ public final class VgiTableInOutTableFunctions {
      *       TableInput} argument at all — those are {@link
      *       VgiTableInOutFunctions#discover}'s and {@link
      *       VgiTableFunctions#discover}'s jobs respectively;</li>
-     *   <li>{@code has_finalize=true} — see this class's own v1-scope note;</li>
      *   <li>a function with an unsupported non-table argument (varargs, {@code
      *       any}-typed) — see {@link VgiArgSpec#decode};</li>
      *   <li>more than one {@code TableInput} argument — VGI's own {@code
@@ -83,13 +87,6 @@ public final class VgiTableInOutTableFunctions {
                 for (byte[] item : functions.items()) {
                     FunctionInfo info = RecordCodec.deserializeFromBytes(item, FunctionInfo.class);
                     if (info.input_from_args()) continue; // blended — VgiTableInOutFunctions handles it
-                    String context = schemaName + "." + info.name();
-                    if (info.has_finalize()) {
-                        LOG.warn("VGI table-in-out function %s: skipping registration — has_finalize=true "
-                                + "needs a second init(phase=FINALIZE) turn this connector doesn't implement yet",
-                                context);
-                        continue;
-                    }
                     byKey.computeIfAbsent(schemaName + "." + info.name(), k -> new ArrayList<>()).add(info);
                 }
             }
@@ -107,7 +104,11 @@ public final class VgiTableInOutTableFunctions {
                             + "arguments (VGI itself only ever registers one)", context, tableArgCount);
                     continue;
                 }
-                out.add(new VgiTableInOutTableFunction(client, info.schema_name(), info.name(), argSpecs));
+                List<String> requiredSettings = info.required_settings() == null ? List.of() : info.required_settings();
+                List<farm.query.vgi.protocol.FunctionRequiredSecret> requiredSecrets =
+                        info.required_secrets() == null ? List.of() : info.required_secrets();
+                out.add(new VgiTableInOutTableFunction(client, info.schema_name(), info.name(), argSpecs,
+                        info.has_finalize(), requiredSettings, requiredSecrets));
             }
             return out;
         });

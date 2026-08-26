@@ -3,8 +3,10 @@
 package farm.query.vgitrino.function;
 
 import farm.query.vgi.client.ArgumentsEncoder;
+import farm.query.vgi.client.SettingsEncoder;
 import farm.query.vgi.protocol.BindRequest;
 import farm.query.vgi.protocol.BindResponse;
+import farm.query.vgi.protocol.FunctionRequiredSecret;
 import farm.query.vgirpc.marshal.RecordCodec;
 import farm.query.vgitrino.client.VgiWorkerClient;
 import farm.query.vgitrino.types.ArrowSchemaCodec;
@@ -90,11 +92,26 @@ import java.util.Map;
  * the closest honest match). No {@code passThroughColumns()} either — a VGI
  * worker computes and emits real output values itself (echo, filter,
  * repeat), never Trino's index-based pass-through splicing.
+ *
+ * <p>{@code required_settings}/{@code required_secrets} (e.g. {@code
+ * filter_by_setting}'s {@code threshold}) resolve here, in {@link #analyze},
+ * exactly like a scalar function's — reusing {@link
+ * VgiScalarFunctions.BindCache#resolveSettings}/{@link
+ * VgiScalarFunctions.BindCache#resolveSecretFields} verbatim, since {@code
+ * analyze()} already receives a real {@link ConnectorSession} directly (a
+ * scalar function's {@code FunctionProvider} does not, which is the entire
+ * reason {@code BindCache} exists there — no such cache is needed here).
+ * {@code has_finalize=true} functions register too — {@link
+ * VgiTableInOutDataProcessor} drives the second {@code
+ * init(phase=FINALIZE)} turn.
  */
 public final class VgiTableInOutTableFunction extends AbstractConnectorTableFunction {
 
     private final VgiWorkerClient client;
     private final List<VgiArgSpec> argSpecs;
+    private final boolean hasFinalize;
+    private final List<String> requiredSettings;
+    private final List<FunctionRequiredSecret> requiredSecrets;
 
     /**
      * @param client the pooled connection to this catalog's VGI worker
@@ -103,13 +120,31 @@ public final class VgiTableInOutTableFunction extends AbstractConnectorTableFunc
      * @param argSpecs the function's decoded, supported arguments, in
      *        declaration order — exactly one of which has {@link
      *        VgiArgSpec#tableArg()} set
+     * @param hasFinalize whether this function has a finalize phase (see
+     *        {@link VgiTableInOutTableFunctionHandle#hasFinalize})
+     * @param requiredSettings {@code FunctionInfo.required_settings} verbatim
+     * @param requiredSecrets {@code FunctionInfo.required_secrets} verbatim
      */
     public VgiTableInOutTableFunction(VgiWorkerClient client, String schemaName, String functionName,
-            List<VgiArgSpec> argSpecs) {
+            List<VgiArgSpec> argSpecs, boolean hasFinalize, List<String> requiredSettings,
+            List<FunctionRequiredSecret> requiredSecrets) {
         super(schemaName, functionName, toArgumentSpecifications(argSpecs),
                 ReturnTypeSpecification.GenericTable.GENERIC_TABLE);
         this.client = client;
         this.argSpecs = argSpecs;
+        this.hasFinalize = hasFinalize;
+        this.requiredSettings = requiredSettings;
+        this.requiredSecrets = requiredSecrets;
+    }
+
+    /**
+     * @return this function's {@code required_settings} names — what {@link
+     *         VgiConnector#getSessionProperties()} unions across every
+     *         discovered function (scalar and classic table-in-out alike) to
+     *         declare as this catalog's Trino session properties
+     */
+    public List<String> requiredSettingNames() {
+        return requiredSettings;
     }
 
     private static List<ArgumentSpecification> toArgumentSpecifications(List<VgiArgSpec> argSpecs) {
@@ -157,16 +192,24 @@ public final class VgiTableInOutTableFunction extends AbstractConnectorTableFunc
             }
 
             byte[] inputSchemaBytes = ArrowSchemaCodec.serializeSchema(inputSchema);
+
+            Map<String, String> resolvedSettings =
+                    VgiScalarFunctions.BindCache.resolveSettings(requiredSettings, session);
+            Map<String, String> resolvedSecretFields =
+                    VgiScalarFunctions.BindCache.resolveSecretFields(requiredSecrets, session);
+            byte[] settingsBytes = resolvedSettings.isEmpty() ? null : SettingsEncoder.of(resolvedSettings);
+            byte[] secretsBytes = VgiScalarFunctions.BindCache.encodeSecrets(resolvedSecretFields);
+
             BindRequest bindRequest = new BindRequest(
                     getName(),
                     scalarEncoder.encode(),
                     "TABLE",
                     inputSchemaBytes,   // the TableInput argument's required-columns row shape
-                    null,           // settings
-                    null,           // secrets
+                    settingsBytes,
+                    secretsBytes,
                     a.handle(),     // attach_opaque_data
                     null,           // transaction_opaque_data
-                    false,          // resolved_secrets_provided
+                    secretsBytes != null, // resolved_secrets_provided — see BindCache's own caveat
                     null, null,     // at_unit / at_value — no time travel for table-in-out
                     null, null,     // copy_from / copy_to
                     getSchema());
@@ -182,7 +225,7 @@ public final class VgiTableInOutTableFunction extends AbstractConnectorTableFunc
             }
 
             VgiTableInOutTableFunctionHandle handle = new VgiTableInOutTableFunctionHandle(
-                    serializedBindCall, bound.opaque_data(), bound.output_schema(), inputSchemaBytes);
+                    serializedBindCall, bound.opaque_data(), bound.output_schema(), inputSchemaBytes, hasFinalize);
 
             // VGI's classic table-in-out has no partial-projection concept of its own — the whole
             // TableInput schema is always required (see this class's own javadoc).

@@ -597,8 +597,8 @@ public final class VgiScalarFunctions {
 
         BindEntry getOrBind(VgiWorkerClient client, CallConfig cfg, List<Object> constValues,
                 ConnectorSession session) {
-            Map<String, String> resolvedSettings = resolveSettings(cfg.entry(), session);
-            Map<String, String> resolvedSecretFields = resolveSecretFields(cfg.entry(), session);
+            Map<String, String> resolvedSettings = resolveSettings(cfg.entry().requiredSettings(), session);
+            Map<String, String> resolvedSecretFields = resolveSecretFields(cfg.entry().requiredSecrets(), session);
             CacheKey key = new CacheKey(cfg.entry().functionId(), constValues, resolvedSettings, resolvedSecretFields);
             BindEntry cached = map.get(key);
             if (cached != null) return cached;
@@ -632,11 +632,21 @@ public final class VgiScalarFunctions {
             return new BindEntry(bindCallBytes, bound.output_schema(), bound.opaque_data());
         }
 
-        /** {@code required_settings} names with a non-null current session-property value. */
-        private static Map<String, String> resolveSettings(Entry entry, ConnectorSession session) {
-            if (entry.requiredSettings().isEmpty()) return Map.of();
+        /**
+         * {@code required_settings} names with a non-null current session-property value.
+         *
+         * <p>Package-private, not private: {@code VgiTableInOutTableFunction} reuses this verbatim
+         * for a classic table-in-out function's own {@code required_settings} — the wire shape and
+         * resolution rule are identical to a scalar function's (confirmed against the real
+         * fixture's {@code filter_by_setting}), and {@code analyze()} already receives a real {@code
+         * ConnectorSession} directly (unlike a scalar function's {@code FunctionProvider}, which
+         * needed this whole {@code BindCache} to get one at all), so no bind-cache equivalent is
+         * needed on that side — just this same resolution logic, called once per {@code analyze()}.
+         */
+        static Map<String, String> resolveSettings(List<String> requiredSettings, ConnectorSession session) {
+            if (requiredSettings.isEmpty()) return Map.of();
             Map<String, String> resolved = new LinkedHashMap<>();
-            for (String name : entry.requiredSettings()) {
+            for (String name : requiredSettings) {
                 String value = session.getProperty(name, String.class);
                 if (value != null) resolved.put(name, value);
             }
@@ -647,13 +657,23 @@ public final class VgiScalarFunctions {
          * {@code required_secrets} fields found in {@code ConnectorIdentity.getExtraCredentials()}
          * — see the class javadoc for the {@code vgi_secret.<secretKey>.<fieldName>} convention.
          * Flattened as {@code "<secretKey>.<fieldName>" -> value} (rather than a nested map) so it
-         * can sit directly in {@link CacheKey}, itself a plain record.
+         * can sit directly in {@link CacheKey}, itself a plain record. Package-private for the same
+         * reason as {@link #resolveSettings} — reused verbatim by {@code VgiTableInOutTableFunction}.
+         *
+         * <p>Gated on {@code requiredSecrets} being non-empty, same as {@link #resolveSettings} —
+         * a function whose {@code on_bind} resolves a secret dynamically with no static {@code
+         * Secret()}/{@code Meta.required_secrets} declaration (the real fixture's {@code
+         * secret_in_out}) never has anything forwarded here, even if the caller's {@code
+         * --extra-credential} supplied it — a deliberate, security-relevant gate (this connector
+         * never guesses which credentials a function needs), not an oversight; see the README for
+         * the honest accounting of which real fixtures this leaves out of reach.
          */
-        private static Map<String, String> resolveSecretFields(Entry entry, ConnectorSession session) {
-            if (entry.requiredSecrets().isEmpty()) return Map.of();
+        static Map<String, String> resolveSecretFields(List<FunctionRequiredSecret> requiredSecrets,
+                ConnectorSession session) {
+            if (requiredSecrets.isEmpty()) return Map.of();
             Map<String, String> credentials = session.getIdentity().getExtraCredentials();
             Map<String, String> resolved = new LinkedHashMap<>();
-            for (FunctionRequiredSecret required : entry.requiredSecrets()) {
+            for (FunctionRequiredSecret required : requiredSecrets) {
                 String secretKey = required.secret_name() != null ? required.secret_name() : required.secret_type();
                 String prefix = SECRET_CREDENTIAL_PREFIX + secretKey + ".";
                 for (Map.Entry<String, String> credential : credentials.entrySet()) {
@@ -666,8 +686,11 @@ public final class VgiScalarFunctions {
             return resolved;
         }
 
-        /** Un-flattens {@link #resolveSecretFields}'s map back into one struct-valued setting per secret. */
-        private static byte[] encodeSecrets(Map<String, String> resolvedSecretFields) {
+        /**
+         * Un-flattens {@link #resolveSecretFields}'s map back into one struct-valued setting per
+         * secret. Package-private for the same reason as {@link #resolveSettings}.
+         */
+        static byte[] encodeSecrets(Map<String, String> resolvedSecretFields) {
             if (resolvedSecretFields.isEmpty()) return null;
             Map<String, Map<String, Object>> bySecret = new LinkedHashMap<>();
             for (Map.Entry<String, String> field : resolvedSecretFields.entrySet()) {

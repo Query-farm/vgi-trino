@@ -24,8 +24,14 @@ import io.trino.spi.function.table.ConnectorTableFunctionHandle;
  *        same schema bytes already embedded in {@code bindCall.input_schema},
  *        carried separately so the processor doesn't need to re-parse the
  *        whole {@code BindRequest} just to recover it
+ * @param hasFinalize whether this function has a finalize phase — after true
+ *        end-of-input, {@code VgiTableInOutDataProcessor} must issue a SECOND
+ *        {@code init(phase=FINALIZE)} call (carrying the INPUT phase's own
+ *        {@code execution_id}/{@code opaque_data}, read off its stream
+ *        header) on the SAME connection, then drain it in producer mode,
+ *        rather than simply closing and releasing the connection
  */
 public record VgiTableInOutTableFunctionHandle(
-        byte[] bindCall, byte[] bindOpaqueData, byte[] outputSchema, byte[] inputSchema)
+        byte[] bindCall, byte[] bindOpaqueData, byte[] outputSchema, byte[] inputSchema, boolean hasFinalize)
         implements ConnectorTableFunctionHandle {
 }
