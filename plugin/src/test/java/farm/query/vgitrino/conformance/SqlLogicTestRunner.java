@@ -96,64 +96,107 @@ final class SqlLogicTestRunner {
         }
 
         for (int idx = 0; idx < retainedRecords.size(); idx++) {
-            SqlLogicTestFile.Record record = retainedRecords.get(idx);
-            String trinoSql = castRewritten.get(idx);
-
-            try {
-                switch (record.kind()) {
-                    case QUERY -> {
-                        MaterializedResult result = runner.execute(session, trinoSql);
-                        List<Type> types = result.getTypes();
-                        List<List<String>> actual = new ArrayList<>();
-                        for (MaterializedRow row : result.getMaterializedRows()) {
-                            List<String> cells = new ArrayList<>(row.getFieldCount());
-                            for (int i = 0; i < row.getFieldCount(); i++) {
-                                cells.add(formatCell(types.get(i), row.getField(i)));
-                            }
-                            actual.add(cells);
-                        }
-                        List<List<String>> expected = record.expectedRows();
-                        // A query with no ORDER BY has no guaranteed row order at all (standard
-                        // SQL semantics, not a connector correctness question) — DuckDB's and
-                        // Trino's own (both equally valid, but different) execution orders will
-                        // disagree on an unordered GROUP BY, confirmed against a real sample
-                        // (table/partition_columns.test: identical rows, different order). Compare
-                        // as a sorted multiset rather than positionally in that case; an explicit
-                        // ORDER BY still gets a real, order-sensitive comparison.
-                        if (!trinoSql.toUpperCase(Locale.ROOT).contains("ORDER BY")) {
-                            actual = sortedCopy(actual);
-                            expected = sortedCopy(expected);
-                        }
-                        if (!rowsMatch(actual, expected)) {
-                            failures.add("QUERY mismatch for:\n" + trinoSql
-                                    + "\nexpected: " + record.expectedRows()
-                                    + "\nactual:   " + actual);
-                        } else {
-                            executed++;
-                        }
-                    }
-                    case STATEMENT_OK -> {
-                        runner.execute(session, trinoSql);
-                        executed++;
-                    }
-                    case STATEMENT_ERROR -> {
-                        try {
-                            runner.execute(session, trinoSql);
-                            failures.add("expected an error for:\n" + trinoSql);
-                        } catch (RuntimeException e) {
-                            // A DuckDB-specific error-message substring isn't
-                            // expected to match Trino's own wording — the
-                            // meaningful assertion here is just "it failed".
-                            executed++;
-                        }
-                    }
-                    default -> { }
-                }
-            } catch (RuntimeException e) {
-                failures.add("unexpected failure for:\n" + trinoSql + "\n" + e);
-            }
+            executed += executeAndCompare(runner, session, retainedRecords.get(idx), castRewritten.get(idx), failures);
         }
         return new Result(executed, skipped, List.copyOf(failures));
+    }
+
+    /**
+     * Runs a hand-written, genuinely Trino-native {@code .trino.test} file — no DuckDB-syntax
+     * rewriting at all (no catalog rename, no {@code TABLE(...)} wrap, no cast rewriting), since
+     * unlike the real corpus's {@code .test} files, this file's SQL is already valid Trino SQL by
+     * construction. See {@code VgiTrinoAdaptationsTest}'s own javadoc for what these files are for
+     * and when to add one.
+     *
+     * @param runner the query runner to execute against
+     * @param session the session to execute under (selects the Trino catalog/schema)
+     * @param testFile the hand-written {@code .trino.test} file to replay
+     */
+    static Result runNative(DistributedQueryRunner runner, Session session, Path testFile) throws IOException {
+        List<SqlLogicTestFile.Record> records = SqlLogicTestFile.parse(testFile);
+        int executed = 0;
+        List<String> failures = new ArrayList<>();
+        for (SqlLogicTestFile.Record record : records) {
+            if (record.kind() != SqlLogicTestFile.Kind.QUERY
+                    && record.kind() != SqlLogicTestFile.Kind.STATEMENT_OK
+                    && record.kind() != SqlLogicTestFile.Kind.STATEMENT_ERROR) {
+                continue;
+            }
+            String sql = String.join("\n", record.sql()).strip();
+            if (sql.isBlank()) continue;
+            String trinoSql = sql.endsWith(";") ? sql.substring(0, sql.length() - 1) : sql;
+            executed += executeAndCompare(runner, session, record, trinoSql, failures);
+        }
+        return new Result(executed, 0, List.copyOf(failures));
+    }
+
+    /**
+     * Execute one record's already-fully-resolved Trino SQL and compare against its expected
+     * outcome, appending to {@code failures} on a mismatch — the one piece {@link #run} (rewritten
+     * DuckDB SQL) and {@link #runNative} (already-Trino-native SQL) both need identically; they
+     * differ only in how {@code trinoSql} got built.
+     *
+     * @return 1 if this record counts as executed (matched/succeeded/failed-as-expected), 0 if a
+     *         failure was appended instead
+     */
+    private static int executeAndCompare(DistributedQueryRunner runner, Session session,
+            SqlLogicTestFile.Record record, String trinoSql, List<String> failures) {
+        try {
+            switch (record.kind()) {
+                case QUERY -> {
+                    MaterializedResult result = runner.execute(session, trinoSql);
+                    List<Type> types = result.getTypes();
+                    List<List<String>> actual = new ArrayList<>();
+                    for (MaterializedRow row : result.getMaterializedRows()) {
+                        List<String> cells = new ArrayList<>(row.getFieldCount());
+                        for (int i = 0; i < row.getFieldCount(); i++) {
+                            cells.add(formatCell(types.get(i), row.getField(i)));
+                        }
+                        actual.add(cells);
+                    }
+                    List<List<String>> expected = record.expectedRows();
+                    // A query with no ORDER BY has no guaranteed row order at all (standard SQL
+                    // semantics, not a connector correctness question) — DuckDB's and Trino's own
+                    // (both equally valid, but different) execution orders will disagree on an
+                    // unordered GROUP BY, confirmed against a real sample
+                    // (table/partition_columns.test: identical rows, different order). Compare as
+                    // a sorted multiset rather than positionally in that case; an explicit ORDER
+                    // BY still gets a real, order-sensitive comparison.
+                    if (!trinoSql.toUpperCase(Locale.ROOT).contains("ORDER BY")) {
+                        actual = sortedCopy(actual);
+                        expected = sortedCopy(expected);
+                    }
+                    if (!rowsMatch(actual, expected)) {
+                        failures.add("QUERY mismatch for:\n" + trinoSql
+                                + "\nexpected: " + record.expectedRows()
+                                + "\nactual:   " + actual);
+                        return 0;
+                    }
+                    return 1;
+                }
+                case STATEMENT_OK -> {
+                    runner.execute(session, trinoSql);
+                    return 1;
+                }
+                case STATEMENT_ERROR -> {
+                    try {
+                        runner.execute(session, trinoSql);
+                        failures.add("expected an error for:\n" + trinoSql);
+                        return 0;
+                    } catch (RuntimeException e) {
+                        // A DuckDB-specific error-message substring isn't expected to match
+                        // Trino's own wording — the meaningful assertion here is just "it failed".
+                        return 1;
+                    }
+                }
+                default -> {
+                    return 0;
+                }
+            }
+        } catch (RuntimeException e) {
+            failures.add("unexpected failure for:\n" + trinoSql + "\n" + e);
+            return 0;
+        }
     }
 
     /**

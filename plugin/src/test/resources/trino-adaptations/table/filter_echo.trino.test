@@ -1,0 +1,171 @@
+# Trino adaptation of table/filter_echo.test
+# (upstream: ~/Development/vgi/test/sql/integration/table/filter_echo.test)
+#
+# The upstream DuckDB test verifies BOTH (a) filter-pushdown correctness — the worker echoes back
+# what predicate it received via a `pushed_filters` column — and (b) that filtering still produces
+# the correct row set. (a) can never be exercised through Trino: a PTF-sourced split source is
+# always built with TupleDomain.all() (ConnectorTableFunctionHandle carries no filter, and
+# TableFunctionProcessorProvider.getSplitProcessor takes none either) — a confirmed Trino SPI
+# ceiling, not a connector bug (see the README's "Predicate pushdown" scope note). So every
+# pushed_filters value below is "(none)", always, by construction — asserted only to document the
+# ceiling, not because its value is interesting. What IS worth verifying, and what this file
+# actually tests, is (b): that WHERE filtering against a VGI table function still produces the
+# correct rows, since Trino's own engine re-applies every filter regardless of what pushdown
+# information reached the connector.
+#
+# No ATTACH needed — the harness already attaches vgi_example before running any adaptation file.
+
+query III
+SELECT * FROM TABLE(vgi_example.main.filter_echo(5)) ORDER BY n
+----
+0	row_0	(none)
+1	row_1	(none)
+2	row_2	(none)
+3	row_3	(none)
+4	row_4	(none)
+
+query III
+SELECT * FROM TABLE(vgi_example.main.filter_echo(10)) WHERE n = 5
+----
+5	row_5	(none)
+
+query I
+SELECT COUNT(*) FROM TABLE(vgi_example.main.filter_echo(10)) WHERE n != 5
+----
+9
+
+query III
+SELECT * FROM TABLE(vgi_example.main.filter_echo(10)) WHERE n > 7 ORDER BY n
+----
+8	row_8	(none)
+9	row_9	(none)
+
+query III
+SELECT * FROM TABLE(vgi_example.main.filter_echo(10)) WHERE n >= 8 ORDER BY n
+----
+8	row_8	(none)
+9	row_9	(none)
+
+query III
+SELECT * FROM TABLE(vgi_example.main.filter_echo(10)) WHERE n < 3 ORDER BY n
+----
+0	row_0	(none)
+1	row_1	(none)
+2	row_2	(none)
+
+query III
+SELECT * FROM TABLE(vgi_example.main.filter_echo(10)) WHERE n <= 2 ORDER BY n
+----
+0	row_0	(none)
+1	row_1	(none)
+2	row_2	(none)
+
+query III
+SELECT * FROM TABLE(vgi_example.main.filter_echo(10)) WHERE n IN (1, 3, 7) ORDER BY n
+----
+1	row_1	(none)
+3	row_3	(none)
+7	row_7	(none)
+
+query I
+SELECT COUNT(*) FROM TABLE(vgi_example.main.filter_echo(100)) WHERE n IN (0, 10, 20, 30, 40, 50, 60, 70, 80, 90)
+----
+10
+
+query I
+SELECT COUNT(*) FROM TABLE(vgi_example.main.filter_echo(10)) WHERE n IS NULL
+----
+0
+
+query I
+SELECT COUNT(*) FROM TABLE(vgi_example.main.filter_echo(5)) WHERE n IS NOT NULL
+----
+5
+
+query III
+SELECT * FROM TABLE(vgi_example.main.filter_echo(10)) WHERE n >= 3 AND n < 7 ORDER BY n
+----
+3	row_3	(none)
+4	row_4	(none)
+5	row_5	(none)
+6	row_6	(none)
+
+query III
+SELECT * FROM TABLE(vgi_example.main.filter_echo(10)) WHERE n BETWEEN 3 AND 7 ORDER BY n
+----
+3	row_3	(none)
+4	row_4	(none)
+5	row_5	(none)
+6	row_6	(none)
+7	row_7	(none)
+
+query III
+SELECT * FROM TABLE(vgi_example.main.filter_echo(10)) WHERE n = 1 OR n = 9 ORDER BY n
+----
+1	row_1	(none)
+9	row_9	(none)
+
+query III
+SELECT * FROM TABLE(vgi_example.main.filter_echo(10)) WHERE NOT n >= 5 ORDER BY n
+----
+0	row_0	(none)
+1	row_1	(none)
+2	row_2	(none)
+3	row_3	(none)
+4	row_4	(none)
+
+query III
+SELECT * FROM TABLE(vgi_example.main.filter_echo(10)) WHERE n >= 3 AND s = 'row_5'
+----
+5	row_5	(none)
+
+query III
+SELECT * FROM TABLE(vgi_example.main.filter_echo(10)) WHERE n >= 2 AND n < 8 AND s = 'row_5'
+----
+5	row_5	(none)
+
+query III
+SELECT * FROM TABLE(vgi_example.main.filter_echo(10)) WHERE s = 'row_5'
+----
+5	row_5	(none)
+
+query III
+SELECT * FROM TABLE(vgi_example.main.filter_echo(10)) WHERE s IN ('row_1', 'row_5') ORDER BY n
+----
+1	row_1	(none)
+5	row_5	(none)
+
+query I
+SELECT COUNT(*) FROM TABLE(vgi_example.main.filter_echo(10)) WHERE n > 100
+----
+0
+
+query I
+SELECT n FROM TABLE(vgi_example.main.filter_echo(10)) WHERE s = 'row_5'
+----
+5
+
+query I
+SELECT COUNT(*) FROM TABLE(vgi_example.main.filter_echo(100)) WHERE n >= 50
+----
+50
+
+query I
+SELECT SUM(n) FROM TABLE(vgi_example.main.filter_echo(10)) WHERE n > 5
+----
+30
+
+query II
+SELECT MIN(n), MAX(n) FROM TABLE(vgi_example.main.filter_echo(100)) WHERE n >= 20 AND n < 80
+----
+20	79
+
+query I
+SELECT COUNT(*) FROM TABLE(vgi_example.main.filter_echo(10000)) WHERE n = 5000
+----
+1
+
+query I
+SELECT COUNT(*) FROM TABLE(vgi_example.main.filter_echo(10000)) WHERE n >= 9990
+----
+10

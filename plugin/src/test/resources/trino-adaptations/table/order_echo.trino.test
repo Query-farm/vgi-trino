@@ -1,0 +1,115 @@
+# Trino adaptation of table/order_pushdown.test
+# (upstream: ~/Development/vgi/test/sql/integration/table/order_pushdown.test)
+#
+# Same ceiling as filter_echo.trino.test, for ORDER BY/LIMIT/OFFSET instead of WHERE: a
+# PTF-sourced split source has no order/limit pushdown hook at all, so order_column/
+# order_direction/null_order/order_limit are always "(none)"/"(none)"/"(none)"/-1 through this
+# connector, regardless of what ORDER BY/LIMIT/OFFSET the query actually uses — asserted below
+# only to document that, not because the value varies. What's actually being tested is that
+# Trino's own engine-level sort/limit/offset produce the correct rows and order regardless of
+# whether that information ever reached the worker.
+#
+# No ATTACH needed — the harness already attaches vgi_example before running any adaptation file.
+
+query ITTTII
+SELECT * FROM TABLE(vgi_example.main.order_echo(3)) ORDER BY n
+----
+0	row_0	(none)	(none)	(none)	-1
+1	row_1	(none)	(none)	(none)	-1
+2	row_2	(none)	(none)	(none)	-1
+
+query ITTTII
+SELECT * FROM TABLE(vgi_example.main.order_echo(100)) ORDER BY n LIMIT 3
+----
+0	row_0	(none)	(none)	(none)	-1
+1	row_1	(none)	(none)	(none)	-1
+2	row_2	(none)	(none)	(none)	-1
+
+query ITTTII
+SELECT * FROM TABLE(vgi_example.main.order_echo(100)) ORDER BY n DESC LIMIT 2
+----
+99	row_99	(none)	(none)	(none)	-1
+98	row_98	(none)	(none)	(none)	-1
+
+query ITTTII
+SELECT * FROM TABLE(vgi_example.main.order_echo(100)) ORDER BY n OFFSET 2 LIMIT 3
+----
+2	row_2	(none)	(none)	(none)	-1
+3	row_3	(none)	(none)	(none)	-1
+4	row_4	(none)	(none)	(none)	-1
+
+query ITTTII
+SELECT * FROM TABLE(vgi_example.main.order_echo(5)) ORDER BY s LIMIT 2
+----
+0	row_0	(none)	(none)	(none)	-1
+1	row_1	(none)	(none)	(none)	-1
+
+query ITTTII
+SELECT * FROM TABLE(vgi_example.main.order_echo(100)) ORDER BY n ASC NULLS LAST LIMIT 2
+----
+0	row_0	(none)	(none)	(none)	-1
+1	row_1	(none)	(none)	(none)	-1
+
+query ITTTII
+SELECT * FROM TABLE(vgi_example.main.order_echo(100)) ORDER BY n DESC NULLS LAST LIMIT 2
+----
+99	row_99	(none)	(none)	(none)	-1
+98	row_98	(none)	(none)	(none)	-1
+
+query ITTTII
+SELECT * FROM TABLE(vgi_example.main.order_echo(100)) ORDER BY n ASC NULLS FIRST LIMIT 3
+----
+0	row_0	(none)	(none)	(none)	-1
+1	row_1	(none)	(none)	(none)	-1
+2	row_2	(none)	(none)	(none)	-1
+
+query ITTTII
+SELECT * FROM TABLE(vgi_example.main.order_echo(100)) ORDER BY n DESC NULLS FIRST LIMIT 3
+----
+99	row_99	(none)	(none)	(none)	-1
+98	row_98	(none)	(none)	(none)	-1
+97	row_97	(none)	(none)	(none)	-1
+
+query I
+SELECT COUNT(*) FROM (SELECT n FROM TABLE(vgi_example.main.order_echo(10)) ORDER BY n NULLS FIRST)
+----
+10
+
+query ITTTII
+SELECT * FROM TABLE(vgi_example.main.order_echo(5)) LIMIT 2
+----
+0	row_0	(none)	(none)	(none)	-1
+1	row_1	(none)	(none)	(none)	-1
+
+query ITTTII
+SELECT * FROM TABLE(vgi_example.main.order_echo(3)) ORDER BY n
+----
+0	row_0	(none)	(none)	(none)	-1
+1	row_1	(none)	(none)	(none)	-1
+2	row_2	(none)	(none)	(none)	-1
+
+query ITTTII
+SELECT * FROM TABLE(vgi_example.main.order_echo(100)) WHERE n < 10 ORDER BY n LIMIT 3
+----
+0	row_0	(none)	(none)	(none)	-1
+1	row_1	(none)	(none)	(none)	-1
+2	row_2	(none)	(none)	(none)	-1
+
+query ITTTII
+SELECT * FROM TABLE(vgi_example.main.order_echo(100)) ORDER BY n, s LIMIT 2
+----
+0	row_0	(none)	(none)	(none)	-1
+1	row_1	(none)	(none)	(none)	-1
+
+query ITTTII
+SELECT * FROM TABLE(vgi_example.main.order_echo(5)) ORDER BY n + 1 LIMIT 2
+----
+0	row_0	(none)	(none)	(none)	-1
+1	row_1	(none)	(none)	(none)	-1
+
+query ITI
+SELECT n, order_column, order_limit FROM TABLE(vgi_example.main.order_echo(100)) ORDER BY n LIMIT 3
+----
+0	(none)	-1
+1	(none)	-1
+2	(none)	-1

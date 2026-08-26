@@ -121,18 +121,35 @@ schema entirely — fixed by passing no schema hint and letting the worker's
 own dispatcher search by name, matching vgi-python's own schema-less `Client`
 fallback.
 
-As of this writing, the full-corpus census (327 files) reports 447 records
-executed, 1315 skipped as known-non-portable (DuckDB-only introspection —
-`duckdb_tables()`, `CALL enable_logging`, DuckDB's own `EXPLAIN (FORMAT
-JSON)` shape, `QUALIFY` — with no Trino equivalent at all), and 3712 still
-failing. Of those failures the overwhelming majority (~93%) are still
-`PARSE_ERROR` — DuckDB SQL surface neither this harness's textual rewrites
-nor sqlglot cover (further syntax differences beyond the four handled
-above, or DuckDB scalar-function aliases like `len()` vs Trino's `length()`)
-— with smaller, more directly actionable buckets for genuine query-result
-mismatches and unregistered functions/features (most visibly, aggregate
-functions like `vgi_sum`/`vgi_avg`/`vgi_count`, which this connector doesn't
-implement yet — see *Scope* below).
+As of this writing, the full-corpus census (327 files) reports 803 records
+executed, 1906 skipped as known-non-portable (DuckDB-only introspection —
+`duckdb_tables()`/`vgi_catalogs()`/etc., a second unattached ATTACH-alias
+per test file, the dynamic-code-injection feature, `CALL enable_logging`,
+DuckDB's own `EXPLAIN` plan shape, `QUALIFY`, and the confirmed PTF
+filter/order/column-pushdown SPI ceiling below — none with a Trino
+equivalent, or a fixable-only-upstream one, at all), and 2765 still failing
+— `PARSE_ERROR` (948), `UNSUPPORTED` (1074 — e.g. `echo`/`constant_columns`,
+whose argument shapes this connector's table-function registration doesn't
+support yet), `OTHER_RUNTIME_ERROR` (681, e.g. write-support-only features
+like `COPY`), `QUERY_MISMATCH` (33), and `EXPECTED_ERROR_DIDNT_HAPPEN` (29).
+
+**Trino-native test adaptations** (`VgiTrinoAdaptationsTest`,
+`plugin/src/test/resources/trino-adaptations/`): hand-written, genuinely
+Trino-native `.trino.test` files (same sqllogictest format, no DuckDB
+syntax at all — no rewriting needed) for the specific real DuckDB tests
+that structurally can't be reached by rewriting the original, but whose
+underlying connector behavior IS already working and IS still testable a
+different way. The clearest case: `filter_echo`/`order_echo` (and
+siblings) verify pushdown by having the worker echo back what
+filter/order/limit info it received — unreachable through Trino at all
+(the PTF SPI ceiling above), but the underlying scan + Trino's own
+engine-level filter/sort/limit still need to produce the *correct rows*
+regardless of whether that information ever reached the worker, which is
+exactly what these adaptations verify instead. Deliberately narrow scope
+— see the class's own javadoc for when a hand-written adaptation is (and
+isn't) worth adding; it gives up the "any new upstream test case is
+covered for free" property the rewrite-based census leans on, so it's
+reserved for cases that property can't reach anyway.
 
 **`splits/*.test` fixture conformance** (`VgiSplitsFixtureConformanceTest`):
 13 of the 20 files in that category hand-ported (not parsed — DuckDB's `:=`
