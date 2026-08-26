@@ -39,6 +39,12 @@ public final class VgiTableFunctions {
      *       name is skipped rather than guessing which one the caller meant.</li>
      * </ul>
      *
+     * <p>A {@code TABLE_FUNCTION} entry with {@code input_from_args=true} is a blended
+     * ("table-in-out") function — a fundamentally different wire shape ({@code
+     * VgiTableInOutFunctions}'s literal-call exchange, not this class's producer-mode
+     * {@code table_function_plan}/split scan) — and is skipped here, not registered wrong;
+     * {@link VgiTableInOutFunctions#discover} handles it instead.
+     *
      * @param client the pooled connection to attach and query
      * @return the callable table functions this connector can support
      */
@@ -57,6 +63,7 @@ public final class VgiTableFunctions {
                         a.handle(), schemaName, "TABLE_FUNCTION", null, null);
                 for (byte[] item : functions.items()) {
                     FunctionInfo info = RecordCodec.deserializeFromBytes(item, FunctionInfo.class);
+                    if (info.input_from_args()) continue; // blended — VgiTableInOutFunctions handles it
                     byKey.computeIfAbsent(schemaName + "." + info.name(), k -> new ArrayList<>()).add(info);
                 }
             }

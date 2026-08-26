@@ -8,6 +8,7 @@ import farm.query.vgirpc.marshal.RecordCodec;
 import farm.query.vgitrino.VgiConfig;
 import farm.query.vgitrino.client.VgiWorkerClient;
 import farm.query.vgitrino.function.VgiTableFunctionHandle;
+import farm.query.vgitrino.function.VgiTableInOutFunctionHandle;
 import farm.query.vgitrino.metadata.VgiColumnHandle;
 import farm.query.vgitrino.metadata.VgiTableHandle;
 import farm.query.vgitrino.types.ArrowSchemaCodec;
@@ -18,6 +19,7 @@ import io.trino.spi.connector.ConnectorSplitManager;
 import io.trino.spi.connector.ConnectorSplitSource;
 import io.trino.spi.connector.ConnectorTableHandle;
 import io.trino.spi.connector.ConnectorTransactionHandle;
+import io.trino.spi.connector.FixedSplitSource;
 import io.trino.spi.function.table.ConnectorTableFunctionHandle;
 import io.trino.spi.predicate.TupleDomain;
 import org.apache.arrow.vector.types.pojo.Schema;
@@ -110,13 +112,24 @@ public final class VgiSplitManager implements ConnectorSplitManager {
 
     /**
      * Splits for a {@code TABLE(catalog.schema.fn(...))} call: the bind
-     * already happened in {@link farm.query.vgitrino.function.VgiTableFunction#analyze},
-     * so this just hands its result straight to a {@link VgiSplitSource} —
-     * no extra RPC round trip here.
+     * already happened in {@link farm.query.vgitrino.function.VgiTableFunction#analyze}
+     * (or, for a table-in-out literal call, {@link
+     * farm.query.vgitrino.function.VgiTableInOutFunction#analyze}), so this
+     * just hands its result straight to a {@link VgiSplitSource} — no extra
+     * RPC round trip here.
+     *
+     * <p>A table-in-out literal call has no {@code table_function_plan}
+     * pagination concept at all — one bind, one exchange turn, no splits to
+     * enumerate — so it gets a trivial single-split {@link FixedSplitSource}
+     * instead of a {@link VgiSplitSource}; see {@link
+     * farm.query.vgitrino.split.VgiTableInOutSplit}'s own javadoc.
      */
     @Override
     public ConnectorSplitSource getSplits(
             ConnectorTransactionHandle transaction, ConnectorSession session, ConnectorTableFunctionHandle handle) {
+        if (handle instanceof VgiTableInOutFunctionHandle h) {
+            return new FixedSplitSource(new VgiTableInOutSplit(h));
+        }
         VgiTableFunctionHandle functionHandle = (VgiTableFunctionHandle) handle;
         // No predicate or dynamic-filter pushdown for table functions in v1:
         // Trino's ConnectorTableFunction SPI (483) has no Constraint/DynamicFilter

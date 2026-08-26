@@ -479,6 +479,60 @@ wrong/partial signature, and a name VGI itself overloads (multiple
 one registration per name, unlike VGI's own arity/type-resolved dispatch) is
 skipped too rather than guessing which overload a caller meant.
 
+### Table-in-out ("blended") functions — literal call shape
+
+VGI's `RowTransformFunction` ("blended") kind serves three call shapes from one
+registration: literal (constant arguments, e.g. `geo_encode(52.0, 13.0)`), per-row
+column (`FROM t, geo_encode(t.lat, t.lon)`), and `LATERAL`. Only the literal shape is
+implemented here. Verified directly against the real Trino table-function SPI
+(`ScalarArgumentSpecification`/`TableArgumentSpecification`/`DescriptorArgumentSpecification`
+— zero "correlated"/"lateral" hooks anywhere in `io.trino.spi.function.table`): every
+argument is resolved exactly once, at `analyze()`/bind time, with no mechanism for "this
+scalar argument's value comes from each row of an outer table" — so the column and
+`LATERAL` shapes are a confirmed SPI ceiling, not a scope choice. Call it as `SELECT *
+FROM TABLE(catalog.schema.name(args))` — Trino's grammar requires the explicit
+`TABLE(...)` wrapper even though every argument is a plain scalar; a bare
+`catalog.schema.name(args)` in a `FROM` clause is a parse error.
+
+**Wire shape, and how it differs from a regular table function.** A blended literal call
+shares the exact same `bind()`/`init()`/exchange primitives a regular VGI table function
+and scalar function already use — there's no separate RPC verb — but the interaction
+pattern is the opposite of a producer scan: the POSITIONAL arguments themselves ARE the
+one input row (no `table_function_plan`, no pagination, no splits), sent as
+`BindRequest.input_schema` (the row's declared shape, at bind time) plus a real one-row
+Arrow batch written during `init(phase=INPUT)`'s single exchange turn. Because a blended
+function is guaranteed to have no finalize phase (the wire itself rejects
+`input_from_args=true` combined with `has_finalize=true` at `bind()`), that one exchange
+turn is the whole answer — legally 0, 1, or many output rows (`VgiTableInOutSplitProcessor`
+copies the answer out of the reader-owned batch, then closes the exchange session; it
+never loops a tick the way a producer-mode scan does). Named arguments (VGI's
+`vgi_arg=named` convention, e.g. `geo_encode`'s optional `precision`) stay on
+`BindRequest.arguments` exactly like a regular table function's arguments — only
+positional arguments become row-batch columns; VGI's own `resolve_metadata` already
+rejects a positional `vgi_const` argument for exactly this reason (indistinguishable from
+a real input column).
+
+Because `ScalarArgument.getValue()` is only available at `analyze()`/bind time (the same
+fact `VgiTableFunction#analyze` already relies on for a regular table function's bind-time
+constants), the literal row's real values are resolved eagerly there and serialized
+(schema AND data, via `ArrowSchemaCodec.serializeBatch`) into `VgiTableInOutFunctionHandle`
+— a table function's bound handle is what actually survives the coordinator/worker
+boundary, not any live Java object kept in the `ConnectorTableFunction` instance. Since
+there's no split enumeration at all, `VgiSplitManager`'s table-function `getSplits`
+overload hands a literal call's handle a trivial single-element `FixedSplitSource`
+(`VgiTableInOutSplit`) instead of a paginated `VgiSplitSource`, and
+`VgiFunctionProvider.getTableFunctionProcessorProvider` branches on the split's runtime
+type to dispatch to `VgiTableInOutSplitProcessor` instead of the regular
+`VgiTableFunctionSplitProcessor`.
+
+**v1 scope**: mirrors `VgiTableFunctions`' own constraints — a varargs positional argument
+(`row_sum(*values)`) or an `any`-typed one is skipped at discovery (the same pre-existing
+gap regular table functions have, not a new one), an overloaded name (VGI resolves
+`geo_encode`'s 2-arg and 3-arg registrations by arity; Trino's PTF model allows only one
+registration per name) is skipped entirely rather than guessing, and a blended function
+with zero positional arguments is rejected defensively (VGI's own `resolve_metadata`
+already prevents registering one, so this should never be observed in practice).
+
 ### Predicate pushdown
 
 `VgiMetadata.applyFilter` intersects Trino's `Constraint.getSummary()`

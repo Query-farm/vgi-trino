@@ -4,6 +4,7 @@ package farm.query.vgitrino.function;
 
 import farm.query.vgitrino.client.VgiWorkerClient;
 import farm.query.vgitrino.split.VgiSplit;
+import farm.query.vgitrino.split.VgiTableInOutSplit;
 import io.trino.spi.connector.ConnectorSession;
 import io.trino.spi.connector.ConnectorSplit;
 import io.trino.spi.connector.ConnectorTableCredentials;
@@ -65,6 +66,9 @@ public final class VgiFunctionProvider implements FunctionProvider {
                     ConnectorTableFunctionHandle functionHandle,
                     Optional<ConnectorTableCredentials> credentials,
                     ConnectorSplit split) {
+                if (split instanceof VgiTableInOutSplit s) {
+                    return new VgiTableInOutSplitProcessor(client, s.handle());
+                }
                 VgiTableFunctionHandle h = (VgiTableFunctionHandle) functionHandle;
                 return new VgiTableFunctionSplitProcessor(client, (VgiSplit) split, h.outputSchema());
             }
