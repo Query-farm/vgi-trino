@@ -85,7 +85,7 @@ public final class VgiMetadata implements ConnectorMetadata {
     public List<String> listSchemaNames(ConnectorSession session) {
         return client.withConnection(a -> {
             List<String> names = new ArrayList<>();
-            for (byte[] item : a.service().catalog_schemas(a.handle(), null).items()) {
+            for (byte[] item : a.service().catalog_schemas(a.handle(), null, null).items()) {
                 names.add(RecordCodec.deserializeFromBytes(item, SchemaInfo.class).name());
             }
             return names;
@@ -100,14 +100,14 @@ public final class VgiMetadata implements ConnectorMetadata {
                 schemas = List.of(schemaNameFilter.get());
             } else {
                 schemas = new ArrayList<>();
-                for (byte[] item : a.service().catalog_schemas(a.handle(), null).items()) {
+                for (byte[] item : a.service().catalog_schemas(a.handle(), null, null).items()) {
                     schemas.add(RecordCodec.deserializeFromBytes(item, SchemaInfo.class).name());
                 }
             }
             List<SchemaTableName> out = new ArrayList<>();
             for (String schema : schemas) {
                 ItemsResponse tables = a.service().catalog_schema_contents_tables(
-                        a.handle(), schema, null, null);
+                        a.handle(), List.of(schema), null, null);
                 for (byte[] item : tables.items()) {
                     TableInfo info = TableInfoDecoder.decode(item);
                     out.add(new SchemaTableName(info.schema_name(), info.name()));
@@ -128,12 +128,12 @@ public final class VgiMetadata implements ConnectorMetadata {
         String atValue = at.map(VgiTimeTravel.AtClause::atValue).orElse(null);
         return client.withConnection(a -> {
             ItemsResponse tableResp = a.service().catalog_table_get(
-                    a.handle(), tableName.getSchemaName(), tableName.getTableName(), atUnit, atValue, null, null);
+                    a.handle(), List.of(tableName.getSchemaName()), tableName.getTableName(), atUnit, atValue, null, null);
             if (tableResp.items().isEmpty()) return null;
             TableInfo info = TableInfoDecoder.decode(tableResp.items().get(0));
 
             TableScanFunctionGetResponse scan = a.service().catalog_table_scan_function_get(
-                    a.handle(), tableName.getSchemaName(), tableName.getTableName(), atUnit, atValue, null, null);
+                    a.handle(), List.of(tableName.getSchemaName()), tableName.getTableName(), atUnit, atValue, null, null);
             byte[] bindArguments = ScanFunctionArguments.toBindArguments(scan.arguments());
 
             // catalog_table_scan_function_get's own response carries no required_settings/
@@ -202,7 +202,7 @@ public final class VgiMetadata implements ConnectorMetadata {
         // unconditionally rather than gating it on row count being known.
         List<farm.query.vgi.catalog.ColumnStatistics> columnStats = client.withConnection(a ->
                 ColumnStatisticsDecoder.decode(a.service().catalog_table_column_statistics_get(
-                        a.handle(), handle.schemaName(), handle.tableName(), null, null)));
+                        a.handle(), List.of(handle.schemaName()), handle.tableName(), null, null)));
         if (handle.cardinalityEstimate() == null && columnStats.isEmpty()) {
             return TableStatistics.empty();
         }

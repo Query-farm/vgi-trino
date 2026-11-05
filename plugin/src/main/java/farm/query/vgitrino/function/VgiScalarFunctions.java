@@ -245,7 +245,7 @@ public final class VgiScalarFunctions {
     public static Registry discover(VgiWorkerClient client) {
         return client.withConnection(a -> {
             List<String> schemas = new ArrayList<>();
-            for (byte[] item : a.service().catalog_schemas(a.handle(), null).items()) {
+            for (byte[] item : a.service().catalog_schemas(a.handle(), null, null).items()) {
                 schemas.add(RecordCodec.deserializeFromBytes(item, SchemaInfo.class).name());
             }
             Map<FunctionId, Entry> byId = new LinkedHashMap<>();
@@ -253,7 +253,7 @@ public final class VgiScalarFunctions {
             Map<String, Integer> overloadCounters = new HashMap<>();
             for (String schemaName : schemas) {
                 ItemsResponse functions = a.service().catalog_schema_contents_functions(
-                        a.handle(), schemaName, "SCALAR_FUNCTION", null, null);
+                        a.handle(), List.of(schemaName), "SCALAR_FUNCTION", null, null);
                 for (byte[] item : functions.items()) {
                     FunctionInfo info = RecordCodec.deserializeFromBytes(item, FunctionInfo.class);
                     Entry entry = tryBuildEntry(schemaName, info, overloadCounters);

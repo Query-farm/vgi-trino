@@ -79,13 +79,13 @@ public final class VgiTableBufferingFunctions {
     public static Set<ConnectorTableFunction> discover(VgiWorkerClient client) {
         return client.withConnection(a -> {
             List<String> schemas = new ArrayList<>();
-            for (byte[] item : a.service().catalog_schemas(a.handle(), null).items()) {
+            for (byte[] item : a.service().catalog_schemas(a.handle(), null, null).items()) {
                 schemas.add(RecordCodec.deserializeFromBytes(item, SchemaInfo.class).name());
             }
             Map<String, List<FunctionInfo>> byKey = new LinkedHashMap<>();
             for (String schemaName : schemas) {
                 ItemsResponse functions = a.service().catalog_schema_contents_functions(
-                        a.handle(), schemaName, "TABLE_FUNCTION", null, null);
+                        a.handle(), List.of(schemaName), "TABLE_FUNCTION", null, null);
                 for (byte[] item : functions.items()) {
                     FunctionInfo info = RecordCodec.deserializeFromBytes(item, FunctionInfo.class);
                     if (!TABLE_BUFFERING_FUNCTION_TYPE.equalsIgnoreCase(info.function_type())) continue;

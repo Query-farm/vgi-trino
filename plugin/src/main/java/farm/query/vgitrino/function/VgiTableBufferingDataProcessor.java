@@ -149,7 +149,7 @@ public final class VgiTableBufferingDataProcessor implements TableFunctionDataPr
             byte[] executionIdSnapshot = executionId;
             TableBufferingProcessResponse response = client.withConnection(a -> a.service().table_buffering_process(
                     new TableBufferingProcessRequest(handle.functionName(), executionIdSnapshot, batchBytes,
-                            a.handle(), null, batchIndex, handle.schemaName()),
+                            a.handle(), null, batchIndex, List.of(handle.schemaName())),
                     null));
             stateIds.add(response.state_id());
         }
@@ -196,7 +196,7 @@ public final class VgiTableBufferingDataProcessor implements TableFunctionDataPr
         byte[] executionIdSnapshot = executionId;
         TableBufferingCombineResponse response = client.withConnection(a -> a.service().table_buffering_combine(
                 new TableBufferingCombineRequest(handle.functionName(), executionIdSnapshot, List.copyOf(stateIds),
-                        a.handle(), null, handle.schemaName()),
+                        a.handle(), null, List.of(handle.schemaName())),
                 null));
         return response.finalize_state_ids();
     }
@@ -299,7 +299,7 @@ public final class VgiTableBufferingDataProcessor implements TableFunctionDataPr
             byte[] executionIdSnapshot = executionId;
             client.withConnection(a -> a.service().table_buffering_destructor(
                     new TableBufferingDestructorRequest(handle.functionName(), executionIdSnapshot, a.handle(),
-                            null, handle.schemaName()),
+                            null, List.of(handle.schemaName())),
                     null));
         } catch (RuntimeException e) {
             // Best-effort — the worker's own cleanup_old_entries GC is the long-term backstop.

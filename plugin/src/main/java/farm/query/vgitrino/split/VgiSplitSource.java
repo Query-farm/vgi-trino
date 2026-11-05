@@ -17,6 +17,7 @@ import io.trino.spi.predicate.TupleDomain;
 import org.apache.arrow.vector.types.pojo.Schema;
 
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
 
@@ -85,6 +86,9 @@ public final class VgiSplitSource implements ConnectorSplitSource {
     private byte[] cursor;
     private volatile boolean finished;
     private int pagesFetched;
+    private boolean distributionInitialized;
+    private byte[] keyGrouping;
+    private byte[] rangePartitioning;
 
     /** The fullest (static ∩ dynamic-so-far) predicate already sent to the worker, across calls. */
     private TupleDomain<VgiColumnHandle> lastCommunicatedPredicate = TupleDomain.all();
@@ -192,10 +196,12 @@ public final class VgiSplitSource implements ConnectorSplitSource {
 
         PlanResponse response = client.withConnection(a ->
                 a.service().table_function_plan(RecordCodec.serializeToBytes(request), null));
+        validatePlanDistribution(response);
 
         List<ConnectorSplit> out = new ArrayList<>(response.splits().size());
         for (byte[] blob : response.splits()) {
             ScanSplit split = RecordCodec.deserializeFromBytes(blob, ScanSplit.class);
+            validateSplitDistribution(response, split);
             if (split.token().length == 0) {
                 // The not-split-capable sentinel: exactly one such split, standing
                 // for the whole scan. Stop here regardless of next_cursors.
@@ -221,6 +227,53 @@ public final class VgiSplitSource implements ConnectorSplitSource {
             cursor = nextCursors.get(0);
         }
         return out;
+    }
+
+    /**
+     * Distribution is plan-wide, not page-local. Trino receives it during split enumeration,
+     * after table-property planning has finished, so this connector cannot honestly turn it into
+     * a {@code ConnectorTablePartitioning} claim. It still enforces the protocol contract rather
+     * than silently accepting page drift that could make another client mis-plan the same worker.
+     */
+    private void validatePlanDistribution(PlanResponse response) {
+        if (!distributionInitialized) {
+            distributionInitialized = true;
+            keyGrouping = copy(response.key_grouping());
+            rangePartitioning = copy(response.range_partitioning());
+            return;
+        }
+        if (!Arrays.equals(keyGrouping, response.key_grouping())
+                || !Arrays.equals(rangePartitioning, response.range_partitioning())) {
+            throw new RuntimeException("table_function_plan changed protocol-3.1 distribution metadata between pages");
+        }
+    }
+
+    static void validateSplitDistribution(PlanResponse response, ScanSplit split) {
+        boolean sentinel = split.token().length == 0;
+        boolean hasKeyGrouping = response.key_grouping() != null;
+        boolean hasRangePartitioning = response.range_partitioning() != null;
+
+        if (sentinel && (hasKeyGrouping || hasRangePartitioning
+                || split.key_value() != null || split.range_index() != null)) {
+            throw new RuntimeException("the unsplit sentinel cannot carry protocol-3.1 distribution metadata");
+        }
+        if (hasKeyGrouping != (split.key_value() != null)) {
+            throw new RuntimeException(hasKeyGrouping
+                    ? "key_grouping requires key_value on every split"
+                    : "split key_value requires plan-level key_grouping");
+        }
+        if (hasRangePartitioning != (split.range_index() != null)) {
+            throw new RuntimeException(hasRangePartitioning
+                    ? "range_partitioning requires range_index on every split"
+                    : "split range_index requires plan-level range_partitioning");
+        }
+        if (split.range_index() != null && split.range_index() < 0) {
+            throw new RuntimeException("split range_index must be non-negative");
+        }
+    }
+
+    private static byte[] copy(byte[] value) {
+        return value == null ? null : value.clone();
     }
 
     private static List<String> resolveAddresses(PlanResponse response, ScanSplit split) {

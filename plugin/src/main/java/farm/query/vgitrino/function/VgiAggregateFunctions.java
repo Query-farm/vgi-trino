@@ -275,7 +275,7 @@ public final class VgiAggregateFunctions {
     public static Registry discover(VgiWorkerClient client) {
         return client.withConnection(a -> {
             List<String> schemas = new ArrayList<>();
-            for (byte[] item : a.service().catalog_schemas(a.handle(), null).items()) {
+            for (byte[] item : a.service().catalog_schemas(a.handle(), null, null).items()) {
                 schemas.add(RecordCodec.deserializeFromBytes(item, SchemaInfo.class).name());
             }
             Map<FunctionId, Entry> byId = new LinkedHashMap<>();
@@ -283,7 +283,7 @@ public final class VgiAggregateFunctions {
             Map<String, Integer> overloadCounters = new HashMap<>();
             for (String schemaName : schemas) {
                 ItemsResponse functions = a.service().catalog_schema_contents_functions(
-                        a.handle(), schemaName, "AGGREGATE_FUNCTION", null, null);
+                        a.handle(), List.of(schemaName), "AGGREGATE_FUNCTION", null, null);
                 for (byte[] item : functions.items()) {
                     FunctionInfo info = RecordCodec.deserializeFromBytes(item, FunctionInfo.class);
                     Entry entry = tryBuildEntry(schemaName, info, overloadCounters);
@@ -515,7 +515,7 @@ public final class VgiAggregateFunctions {
             byte[] inputSchemaBytes = ArrowSchemaCodec.serializeSchema(config.bindInputSchema());
             AggregateBindResponse response = client.withConnection(a -> a.service().aggregate_bind(
                     new AggregateBindRequest(config.entry().functionName(), argumentsBytes, inputSchemaBytes,
-                            null, null, a.handle(), config.entry().schemaName())));
+                            null, null, a.handle(), config.entry().schemaName()), null));
             this.executionId = response.execution_id();
             this.outputSchemaBytes = response.output_schema();
             this.bound = true;
@@ -567,7 +567,8 @@ public final class VgiAggregateFunctions {
             pending.setRowCount(pendingRows);
             byte[] batchBytes = ArrowBatchCodec.serialize(pending);
             client.withConnection(a -> a.service().aggregate_update(new AggregateUpdateRequest(
-                    config.entry().functionName(), executionId, batchBytes, a.handle(), config.entry().schemaName())));
+                    config.entry().functionName(), executionId, batchBytes, a.handle(),
+                    List.of(config.entry().schemaName())), null));
             pendingRows = 0;
             for (FieldVector v : pending.getFieldVectors()) v.reset();
         }
@@ -594,7 +595,7 @@ public final class VgiAggregateFunctions {
                 byte[] gidBytes = ArrowBatchCodec.serialize(gidRoot);
                 AggregateFinalizeResponse resp = client.withConnection(a -> a.service().aggregate_finalize(
                         new AggregateFinalizeRequest(config.entry().functionName(), executionId, gidBytes,
-                                outputSchemaBytes, a.handle(), config.entry().schemaName())));
+                                outputSchemaBytes, a.handle(), List.of(config.entry().schemaName())), null));
                 return ArrowBatchCodec.withReadBatch(resp.result_batch(), Allocators.root(), root -> {
                     if (root == null || root.getRowCount() == 0) return null;
                     return VgiTypeMapping.readValue(config.returnType(), root.getVector(0), 0);

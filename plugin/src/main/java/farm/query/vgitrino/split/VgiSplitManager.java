@@ -119,7 +119,7 @@ public final class VgiSplitManager implements ConnectorSplitManager {
                     // main.rowid_sequence). null lets the worker's dispatcher
                     // search every schema by name, which is exactly the
                     // fallback vgi-python's own schema-less Client uses.
-                    null);
+                    (List<String>) null);
             BindResponse bound = a.service().bind(bindRequest, null);
 
             // Two-phase secret negotiation: a scan function that resolves a secret DYNAMICALLY
@@ -172,7 +172,7 @@ public final class VgiSplitManager implements ConnectorSplitManager {
                         bindRequest.attach_opaque_data(), bindRequest.transaction_opaque_data(),
                         true, // resolved_secrets_provided — this IS the second, resolved pass
                         bindRequest.at_unit(), bindRequest.at_value(),
-                        bindRequest.copy_from(), bindRequest.copy_to(), bindRequest.schema_name());
+                        bindRequest.copy_from(), bindRequest.copy_to(), bindRequest.schema_path());
                 bound = a.service().bind(retryRequest, null);
                 bindRequest = retryRequest;
             }
