@@ -2,7 +2,9 @@
 
 package farm.query.vgitrino.client;
 
+import farm.query.vgi.CatalogProfiles;
 import farm.query.vgi.VgiService;
+import farm.query.vgi.protocol.CatalogCapabilities;
 import farm.query.vgi.protocol.CatalogAttachRequest;
 import farm.query.vgi.protocol.CatalogAttachResult;
 import farm.query.vgirpc.RpcConnection;
@@ -66,6 +68,20 @@ import java.util.function.Function;
  * retried in a loop that could itself hang {@link #release}.
  */
 public final class VgiWorkerClient implements AutoCloseable {
+
+    /**
+     * Catalog metadata profiles this connector can receive. The constraint
+     * records and their DuckDB scalar-expression payloads are needed to list a
+     * catalog containing CHECK constraints even though Trino does not yet turn
+     * those records into connector-enforced DDL behavior.
+     */
+    private static final byte[] CLIENT_CAPABILITIES = CatalogProfiles.clientOffer(
+            "trino",
+            new CatalogCapabilities(
+                    List.of(
+                            CatalogProfiles.CONSTRAINT_RECORDS_READ,
+                            CatalogProfiles.SCALAR_EXPRESSION_READ),
+                    List.of(), List.of(), List.of()));
 
     /**
      * One pooled, attached connection.
@@ -360,7 +376,7 @@ public final class VgiWorkerClient implements AutoCloseable {
         RpcConnection connection = new RpcConnection(transport);
         VgiService service = connection.proxy(VgiService.class);
         CatalogAttachResult attach = service.catalog_attach(
-                CatalogAttachRequest.of(config.catalogName(), null, null, null), null);
+                new CatalogAttachRequest(config.catalogName(), null, null, null, CLIENT_CAPABILITIES), null);
         return new Attached(connection, service, attach);
     }
 
@@ -390,7 +406,7 @@ public final class VgiWorkerClient implements AutoCloseable {
         try {
             VgiService service = connection.proxy(VgiService.class);
             CatalogAttachResult attach = service.catalog_attach(
-                    CatalogAttachRequest.of(config.catalogName(), null, null, null), null);
+                    new CatalogAttachRequest(config.catalogName(), null, null, null, CLIENT_CAPABILITIES), null);
             Attached a = new Attached(connection, service, attach);
             ok = true;
             return a;

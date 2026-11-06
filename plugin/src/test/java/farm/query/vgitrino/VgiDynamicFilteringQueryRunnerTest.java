@@ -12,7 +12,6 @@ import farm.query.vgi.protocol.BindResponse;
 import farm.query.vgi.protocol.ScanSplit;
 import farm.query.vgi.pushdown.FilterApplier;
 import farm.query.vgi.pushdown.PushdownFilters;
-import farm.query.vgi.pushdown.PushdownFiltersDecoder;
 import farm.query.vgi.table.PlanRequest;
 import farm.query.vgi.table.PlanResult;
 import farm.query.vgi.table.TableBindParams;
@@ -144,7 +143,7 @@ final class VgiDynamicFilteringQueryRunnerTest {
             if (payloads != null) for (byte[] p : payloads) ranges.add(decode(p));
             PushdownFilters decoded = params.pushdownFilters() == null || params.pushdownFilters().length == 0
                     ? PushdownFilters.empty()
-                    : PushdownFiltersDecoder.decode(params.pushdownFilters(), params.joinKeys());
+                    : params.decodeFilters();
             return new SeqState(ranges, params.filters(), decoded.formatInline());
         }
 
