@@ -24,7 +24,7 @@ dependencies {
     // Protocol 3.1 distribution records are consumed by VgiSplitSource. The
     // composite build supplies the in-development SDK; this version is the
     // minimum published fallback expected to carry the same wire surface.
-    implementation("farm.query:vgi:0.44.0")
+    implementation("farm.query:vgi:0.46.0")
 
     // jackson-module-blackbird: Trino's OWN task-update wire protocol carries
     // this connector's ConnectorSplit/ConnectorTableHandle/etc. as polymorphic
