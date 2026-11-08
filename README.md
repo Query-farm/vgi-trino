@@ -260,11 +260,12 @@ VgiPlugin -> VgiConnectorFactory -> VgiConnector
       \-- VgiWorkerClient: a pool of independently catalog_attach'd connections
 ```
 
-Depends on `farm.query:vgi` (the VGI Java client SDK) built from source via a
-Gradle composite build against a sibling `../../vgi-java` checkout, since this
-connector needs client-side additions (`TableFunctionPlanRequest`, the
-`max_splits_per_response` plumbing) that repo only just gained. Falls back to
-the published Maven Central artifact once a release with them ships.
+Depends on `farm.query:vgi` 0.47.0 (the VGI Java client SDK), which speaks VGI
+protocol `vgi.v3` 3.2. Peers match on exact major+minor, so this connector
+rejects 3.1 workers and needs workers built on a 3.2 SDK. A sibling
+`../../vgi-java` checkout (or `VGI_JAVA_DIR`) is used instead via a Gradle
+composite build when present; otherwise the published Maven Central artifact is
+used.
 
 ### Splits
 
@@ -1218,7 +1219,11 @@ the same boundary on static predicate pushdown).
 - **Write support**, **multi-branch tables** (`catalog_table_scan_branches_get`),
   **transactions**, **views** — VGI supports all four; none are wired up here
   (write support matches vgi-java's own worker-SDK scope, which is read-only
-  today). Time travel *was* on this list — see *Time travel* below for why it
+  today). Because branches aren't resolved, protocol 3.2 `scan_planning =
+  "filtered"` tables (whose scan always goes through
+  `catalog_table_scan_branches_get`) list and describe from their declared
+  columns but fail a scan with `NOT_SUPPORTED`, and branch `row_count`/
+  `column_statistics` are unused. Time travel *was* on this list — see *Time travel* below for why it
   turned out to be a real, buildable feature rather than a genuine gap, once
   actually checked instead of assumed.
 - **Custom ATTACH-time options.** `VgiWorkerClient.openAndAttach()` always

@@ -20,7 +20,9 @@ import java.util.List;
  * @param schemaName the VGI schema this table lives in
  * @param tableName the table name
  * @param scanFunctionName the table function {@code catalog_table_scan_function_get}
- *        named to actually perform the scan
+ *        named to actually perform the scan, or {@code null} for a metadata-only
+ *        handle on a protocol 3.2 {@code scan_planning = "filtered"} table, which
+ *        lists and describes but cannot be scanned (see {@code VgiSplitManager})
  * @param scanFunctionArguments the scan function's bound arguments, already
  *        re-encoded as {@code BindRequest.arguments} bytes (see
  *        {@code farm.query.vgi.client.ScanFunctionArguments#toBindArguments})

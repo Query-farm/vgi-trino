@@ -21,10 +21,10 @@ dependencies {
     // the protocol records, and the client.* pushdown/projection encoders. Built
     // from source via the composite build in ../settings.gradle.kts so this
     // module sees the table_function_plan client additions.
-    // Protocol 3.1 distribution records are consumed by VgiSplitSource. The
-    // composite build supplies the in-development SDK; this version is the
+    // Protocol vgi.v3 3.2 (exact major+minor match: 3.1 workers are rejected).
+    // The composite build supplies the in-development SDK; this version is the
     // minimum published fallback expected to carry the same wire surface.
-    implementation("farm.query:vgi:0.46.0")
+    implementation("farm.query:vgi:0.47.0")
 
     // jackson-module-blackbird: Trino's OWN task-update wire protocol carries
     // this connector's ConnectorSplit/ConnectorTableHandle/etc. as polymorphic

@@ -132,6 +132,17 @@ public final class VgiMetadata implements ConnectorMetadata {
             if (tableResp.items().isEmpty()) return null;
             TableInfo info = TableInfoDecoder.decode(tableResp.items().get(0));
 
+            if (TableInfo.SCAN_PLANNING_FILTERED.equals(info.scan_planning())) {
+                // Protocol 3.2: a "filtered" table's scan is resolved per query through
+                // catalog_table_scan_branches_get, never catalog_table_scan_function_get, and
+                // this connector doesn't implement branch resolution (see the README's Scope
+                // section). Return a metadata-only handle (scanFunctionName == null) so the
+                // table still lists and describes; VgiSplitManager refuses to scan it.
+                return new VgiTableHandle(info.schema_name(), info.name(),
+                        null, new byte[0], info.columns(), info.cardinality_estimate(),
+                        TupleDomain.all(), atUnit, atValue, List.of(), List.of());
+            }
+
             TableScanFunctionGetResponse scan = a.service().catalog_table_scan_function_get(
                     a.handle(), List.of(tableName.getSchemaName()), tableName.getTableName(), atUnit, atValue, null, null);
             byte[] bindArguments = ScanFunctionArguments.toBindArguments(scan.arguments());

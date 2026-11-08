@@ -15,6 +15,7 @@ import farm.query.vgitrino.function.VgiTableInOutFunctionHandle;
 import farm.query.vgitrino.metadata.VgiColumnHandle;
 import farm.query.vgitrino.metadata.VgiTableHandle;
 import farm.query.vgitrino.types.ArrowSchemaCodec;
+import io.trino.spi.TrinoException;
 import io.trino.spi.connector.ColumnHandle;
 import io.trino.spi.connector.Constraint;
 import io.trino.spi.connector.ConnectorSession;
@@ -32,6 +33,8 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+
+import static io.trino.spi.StandardErrorCode.NOT_SUPPORTED;
 
 /**
  * Binds a table's scan function once, then hands off to a {@link VgiSplitSource}
@@ -86,6 +89,13 @@ public final class VgiSplitManager implements ConnectorSplitManager {
                 .toList();
         List<Integer> projectionIds = projectedColumns.isEmpty()
                 ? null : projectedColumns.stream().map(VgiColumnHandle::ordinal).toList();
+        if (handle.scanFunctionName() == null) {
+            // Metadata-only handle for a protocol 3.2 scan_planning="filtered" table (see
+            // VgiMetadata#getTableHandle): its scan needs catalog_table_scan_branches_get.
+            throw new TrinoException(NOT_SUPPORTED, "VGI table " + handle.schemaName() + "."
+                    + handle.tableName() + " uses scan_planning='filtered' (resolved through"
+                    + " catalog_table_scan_branches_get), which the VGI Trino connector does not support");
+        }
         Schema fullSchema = ArrowSchemaCodec.deserializeSchema(handle.outputSchema());
         return client.withConnection(a -> {
             // required_settings/required_secrets resolve here exactly like a scalar function's or
